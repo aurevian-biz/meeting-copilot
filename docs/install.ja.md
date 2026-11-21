@@ -21,7 +21,7 @@ git clone https://github.com/<you>/meeting-copilot.git /opt/meeting-copilot
 cd /opt/meeting-copilot
 
 # データ（3.4G のモデル + 後で 22.9G の重み）は外付けディスクに置くことを推奨
-export MC_DATA=/media/ssd/mc-data
+export MC_DATA=/mnt/mc-data
 
 sudo -E bash scripts/install.sh
 ```
@@ -69,7 +69,7 @@ bash scripts/llm-vllm.sh
 ## 3. サービスをインストールする
 
 ```bash
-sudo MC_DATA=/media/ssd/mc-data bash deploy/install-units.sh
+sudo MC_DATA=/mnt/mc-data bash deploy/install-units.sh
 sudo systemctl start voice-bench      # 8095 音声アシスタント
 sudo systemctl start caption-bench    # 8096 会議字幕
 ```

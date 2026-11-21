@@ -31,7 +31,7 @@
 ```bash
 git clone https://github.com/<you>/meeting-copilot.git /opt/meeting-copilot
 cd /opt/meeting-copilot
-export MC_DATA=/media/ssd/mc-data          # 模型与权重放外置盘
+export MC_DATA=/mnt/mc-data          # 模型与权重放外置盘
 sudo -E bash scripts/install.sh             # 依赖 + venv + 3.4G 模型
 
 bash scripts/llm-magnitude.sh               # 生成 35B 用的独立 dockerd 配置

@@ -21,7 +21,7 @@ git clone https://github.com/<you>/meeting-copilot.git /opt/meeting-copilot
 cd /opt/meeting-copilot
 
 # data (3.4G model + 22.9G of weights later) belongs on the external drive
-export MC_DATA=/media/ssd/mc-data
+export MC_DATA=/mnt/mc-data
 
 sudo -E bash scripts/install.sh
 ```
@@ -69,7 +69,7 @@ For the details (why a 35B MoE is the better deal, why the prefix cache never hi
 ## 3. Install the services
 
 ```bash
-sudo MC_DATA=/media/ssd/mc-data bash deploy/install-units.sh
+sudo MC_DATA=/mnt/mc-data bash deploy/install-units.sh
 sudo systemctl start voice-bench      # 8095 voice assistant
 sudo systemctl start caption-bench    # 8096 meeting captions
 ```

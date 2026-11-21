@@ -6,7 +6,7 @@
 The install script puts models under the data directory. If you keep models on an external disk (recommended:
 ASR 3.2G, TTS 137M, TensorRT engines and meeting corpora should not eat the root disk), one env var is enough:
 
-    export MC_DATA=/media/ssd/meeting-copilot-data
+    export MC_DATA=/mnt/mc-data
 
 Layout (defaults in parentheses):
 

@@ -35,7 +35,7 @@ On a Jetson AGX Orin 64GB (JetPack 7.2) with an HDMI capture card and USB headse
 ```bash
 git clone https://github.com/<you>/meeting-copilot.git /opt/meeting-copilot
 cd /opt/meeting-copilot
-export MC_DATA=/media/ssd/mc-data          # models + weights on an external SSD
+export MC_DATA=/mnt/mc-data          # models + weights on an external SSD
 sudo -E bash scripts/install.sh             # deps + venv + 3.4G of models
 
 bash scripts/llm-magnitude.sh               # dedicated dockerd config for 35B

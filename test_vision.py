@@ -182,7 +182,7 @@ class TestRedact(unittest.TestCase):
         self.assertNotIn("a1b2c3d4a1b2c3d4", out)
 
     def test_sk_key_keeps_prefix(self):
-        out, n = vx.redact("sk-abcdefghijklmnopqrstuvwxyz")
+        out, n = vx.redact("sk-testonly")
         self.assertEqual(n, 1)
         self.assertIn("sk-***", out)
 

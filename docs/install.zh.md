@@ -22,7 +22,7 @@ git clone https://github.com/<you>/meeting-copilot.git /opt/meeting-copilot
 cd /opt/meeting-copilot
 
 # 数据（3.4G 模型 + 之后的 22.9G 权重）建议放外置盘
-export MC_DATA=/media/ssd/mc-data
+export MC_DATA=/mnt/mc-data
 
 sudo -E bash scripts/install.sh
 ```
@@ -75,7 +75,7 @@ bash scripts/llm-vllm.sh
 ## 3. 装服务
 
 ```bash
-sudo MC_DATA=/media/ssd/mc-data bash deploy/install-units.sh
+sudo MC_DATA=/mnt/mc-data bash deploy/install-units.sh
 sudo systemctl start voice-bench      # 8095 语音助手
 sudo systemctl start caption-bench    # 8096 会议字幕
 ```

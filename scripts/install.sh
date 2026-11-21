@@ -5,7 +5,7 @@
 # One-shot install: system deps -> venv -> Python deps -> directories -> self-check.
 # Usage:
 #   sudo bash scripts/install.sh            # code lives in /opt/meeting-copilot, data too
-#   MC_DATA=/media/ssd/mc-data sudo -E bash scripts/install.sh   # data on an external disk
+#   MC_DATA=/mnt/mc-data sudo -E bash scripts/install.sh   # data on an external disk
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

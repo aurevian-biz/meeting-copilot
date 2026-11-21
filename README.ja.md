@@ -32,7 +32,7 @@ JetPack を焼いた Jetson AGX Orin（64GB）に、HDMI キャプチャカー�
 ```bash
 git clone https://github.com/<you>/meeting-copilot.git /opt/meeting-copilot
 cd /opt/meeting-copilot
-export MC_DATA=/media/ssd/mc-data          # モデル・重みは外付け SSD 推奨
+export MC_DATA=/mnt/mc-data          # モデル・重みは外付け SSD 推奨
 sudo -E bash scripts/install.sh             # 依存 + venv + モデル 3.4G
 
 bash scripts/llm-magnitude.sh               # 35B-A3B 用の dockerd 設定
