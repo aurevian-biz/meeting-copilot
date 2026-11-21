@@ -7,8 +7,8 @@ Wants=network-online.target
 [Service]
 Type=notify
 # 独立 data-root / exec-root / socket，iptables 关、bridge 无，只跑 magnitude 容器。
-# daemon.json 由 scripts/llm-magnitude.sh 生成；数据盘换位置就改下面这一行。
-ExecStart=/usr/bin/dockerd --config-file /opt/meeting-copilot/data/magnitude-data/daemon.json
+# daemon.json 由 scripts/llm-magnitude.sh 生成；__DATA__ 由 install-units.sh 替换。
+ExecStart=/usr/bin/dockerd --config-file __DATA__/magnitude-data/daemon.json
 ExecReload=/bin/kill -s HUP $MAINPID
 TimeoutStartSec=180
 Restart=on-failure

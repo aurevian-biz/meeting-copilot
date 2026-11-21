@@ -12,9 +12,9 @@ EnvironmentFile=-/etc/meeting-copilot/env
 ExecStart=/usr/local/bin/magnitude-up.sh
 TimeoutStartSec=600
 # 停的时候把模型卸掉释放内存，再停容器；不删容器，下次 start 很快
-# 注意：这里不写 ${MC_DATA}。systemd 只做变量替换、不认 shell 的 ${VAR:-默认}，
-# 所以路径写死成安装脚本创建的标准位置；数据盘换地方就改这一行。
-ExecStop=/bin/bash -c 'DOCKER_HOST=unix:///opt/meeting-copilot/data/magnitude-data/docker.sock /usr/bin/docker stop magnitude-bench || true'
+# 注意：这里不写 ${MC_DATA}。systemd 只做变量替换、不认 shell 的 ${VAR:-默认}；
+# 所以由 install-units.sh 把 __DATA__ 替换成真实数据根。
+ExecStop=/bin/bash -c 'DOCKER_HOST=unix://__DATA__/magnitude-data/docker.sock /usr/bin/docker stop magnitude-bench || true'
 
 [Install]
 WantedBy=multi-user.target

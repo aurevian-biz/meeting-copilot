@@ -2,10 +2,11 @@
 # 安装四个 systemd unit，并把本机相关的占位符填掉。
 #
 #   sudo MC_DATA=/opt/meeting-copilot/data bash deploy/install-units.sh
+#   # 或者：export MC_DATA=... 后用 sudo -E bash deploy/install-units.sh
 #
 # 会做三件事：
 #   1. 生成 /etc/meeting-copilot/env（权限 0640）：模型地址、API key、音频出口
-#   2. 把 unit 里的 __HOME__ / __USER__ / __UID__ 换成真实值
+#   2. 把 unit 里的 __HOME__ / __USER__ / __UID__ / __DATA__ 换成真实值
 #   3. systemctl daemon-reload + enable（不自动 start，免得半夜把 35B 拉起来）
 set -euo pipefail
 
@@ -53,6 +54,7 @@ for f in caption-bench voice-bench magnitude magnitude-dockerd; do
     sed -e "s|__HOME__|$MC_HOME|g" \
         -e "s|__USER__|$RUN_USER|g" \
         -e "s|__UID__|$RUN_UID|g" \
+        -e "s|__DATA__|$MC_DATA|g" \
         -e "s|__GH_REPO__|$GH_REPO|g" \
         "$HERE/$f.service" > "/etc/systemd/system/$f.service"
     echo "装好 /etc/systemd/system/$f.service"
