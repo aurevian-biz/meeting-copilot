@@ -1,4 +1,4 @@
-# 模型与数据（3.4G，一律本地下载，不进仓库）
+# Models and data (3.4G + weights; always downloaded locally, never committed)
 data/
 asr-models/
 tts-models/
@@ -10,7 +10,7 @@ models/
 *.wav
 *.mp3
 
-# 运行产物
+# Runtime artefacts
 logs/
 work-voice/
 health.json
@@ -24,11 +24,11 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# 本机配置（含 API key）
+# Local configuration (contains the API key)
 conf/*.env
 .env
 
-# 编辑器
+# Editors
 .vscode/
 .idea/
 .DS_Store

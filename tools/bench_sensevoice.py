@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""bench_sensevoice.py —— 用 sherpa-onnx 的 SenseVoice 在 CPU 上跑同一段音频。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-为什么要它：faster-whisper 在 Orin 上 RTF 是 0.92（small）到 2.2（turbo），
-双工要求「说完到出结果」在 1 秒内，换算 RTF 要 <0.5，CPU 上的 whisper 达不到。
-SenseVoice 是专为实时场景设计的非自回归模型，一次前向出完整结果，通常是 0.1 量级。
+"""bench_sensevoice.py -- run the same clip on CPU with sherpa-onnx's SenseVoice.
 
-用法：
+Why this exists: faster-whisper has RTF from 0.92 (small) to 2.2 (turbo) on Orin,
+while duplex demands "end of speech to result" within 1 second, i.e. RTF <0.5, which whisper on CPU cannot reach.
+SenseVoice is a non-autoregressive model built for real-time use; one forward pass yields the whole result, typically in the 0.1 range.
+
+Usage:
     python bench_sensevoice.py --wav a.wav --segments 18.43-21.72,41.95-45.51
-    python bench_sensevoice.py --wav a.wav --whole          # 不切分，整段送进去
+    python bench_sensevoice.py --wav a.wav --whole          # no segmentation, feed the whole clip
 """
 from __future__ import annotations
 
@@ -45,7 +48,7 @@ def build_recognizer(model_dir: str, threads: int):
         model=str(model),
         tokens=str(d / "tokens.txt"),
         num_threads=threads,
-        use_itn=True,      # 数字/标点归一化，对字幕和对话都有用
+        use_itn=True,      # number/punctuation normalisation, useful for both captions and dialogue
         language="ja",
         debug=False,
     )

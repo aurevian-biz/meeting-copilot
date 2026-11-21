@@ -1,8 +1,11 @@
 #!/bin/bash
-# 下载全部离线模型到 $MC_DATA（默认 /opt/meeting-copilot/data），可重复执行。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+# Download all offline models into $MC_DATA (default /opt/meeting-copilot/data); safe to re-run.
 #
-# 为什么要单独一个脚本：一共 3.4G，其中 SenseVoice 1.0G、KWS 30M、Piper 78M+64M。
-# 都放在外置盘上，根盘别动（JetPack 根盘通常只剩几个 G）。
+# Why a separate script: 3.4G in total — SenseVoice 1.0G, KWS 30M, Piper 78M+64M.
+# Keep them all on the external disk and leave the root disk alone (JetPack root often has only a few GB left).
 set -euo pipefail
 
 MC_DATA="${MC_DATA:-/opt/meeting-copilot/data}"

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""查 sherpa-onnx 的 provider 能力：是否带 CUDA / TensorRT EP。"""
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+"""Inspect sherpa-onnx provider capabilities: whether the CUDA / TensorRT EP is present."""
 import inspect
 import json
 import subprocess
@@ -15,7 +18,7 @@ try:
     print("version:", getattr(sherpa_onnx, "__version__", "?"))
     so = sherpa_onnx.__file__
     print("so:", so)
-    # 编译选项
+    # Build options
     try:
         print("build:", sherpa_onnx.get_build_info() if hasattr(sherpa_onnx, "get_build_info") else "n/a")
     except Exception as e:  # noqa: BLE001

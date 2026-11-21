@@ -1,10 +1,13 @@
 #!/bin/bash
-# 给 Magnitude 单独起一个 dockerd（独立 data-root / socket，不碰系统主 daemon）。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+# Run a dedicated dockerd for Magnitude (own data-root / socket, leaves the system daemon alone).
 #
-# 为什么不让主 daemon 跑：Magnitude 要挂 --runtime nvidia、要独占 22.9G 权重的
-# data-root，还要能在停服务时把内存真正放掉。独立 daemon 的好处是「拔掉它不影响
-# 机器上其他容器」，代价是多一个 systemd unit。不想要这套就直接用主 daemon：
-# 把 deploy/magnitude-up.sh 里的 DOCKER_HOST 去掉即可。
+# Why not the main daemon: Magnitude needs --runtime nvidia, needs a data-root for 22.9G of
+# weights, and must truly release memory on stop. The separate daemon means "tearing it down
+# doesn't disturb other containers"; the cost is one extra systemd unit. To skip it, use the
+# main daemon instead: remove DOCKER_HOST from deploy/magnitude-up.sh.
 set -euo pipefail
 
 MC_DATA="${MC_DATA:-/opt/meeting-copilot/data}"

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""屏幕提示对译文的 A/B：同一批真实段，译文不带/带屏幕词表各跑一遍。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-要回答两个问题，缺一不可：
-  1. **代价**：多塞 N 个字符，首字涨多少毫秒（35B MoE 上 prefill 按 token 计费）
-  2. **效果**：译文到底变了没有？变了之后是修对了还是变脏了？
+"""A/B of screen hints against the translation: the same batch of real segments, translated once without and once with the screen term hints.
 
-只测代价不测效果是自欺——屏幕词表如果一句都不影响输出，那它只是白花钱。
-只测效果不测代价也不行——字幕的首字预算是毫秒级的。
+Two questions must both be answered:
+  1. **cost**: stuff in N extra characters and how many milliseconds does the first token gain (prefill is billed per token on 35B MoE)
+  2. **effect**: did the translation change at all? And when it changed, was it fixed or made dirty?
 
-用法（在 Jetson 上）：
+Measuring only cost is self-deception -- if the screen term hints never influence a single line, they are pure waste.
+Measuring only the effect is no good either -- the caption first-token budget is in milliseconds.
+
+Usage (on the Jetson):
   curl -s localhost:8096/api/poll > /tmp/poll.json
   curl -s -X POST localhost:8095/api/look > /tmp/ocr.json
   ../asr-venv/bin/python tools/screen_hint_ab.py --poll /tmp/poll.json \\
@@ -29,8 +32,8 @@ import urllib.request
 sys.path.insert(0, "/opt/meeting-copilot")
 import caption_server as cs  # noqa: E402
 
-# 我们自己字幕页面上的字。采集卡拍的是「演示者的屏幕」，页面常常就开在上面，
-# 不滤掉就会把上一句的中文译文当屏幕内容喂回模型 —— 自我循环，越译越偏。
+# Text from our own caption page. The capture card films "the presenter's screen", and the page is often open right there;
+# without filtering it, the previous line's Chinese translation is fed back to the model as screen content -- a feedback loop that drifts further with every line.
 UI_WORDS = (
     "会议字幕", "设备", "已识别", "延迟", "首字", "译完", "双语", "正在听",
     "停止", "清屏", "正在说", "运行中", "搜索", "创建", "Chrome", "YouTube",
@@ -48,14 +51,14 @@ def ocr_lines(ocr: dict) -> list[str]:
 
 
 def filter_lines(lines: list[str], recent: list[str]) -> list[str]:
-    """丢掉页面 UI 与「已经是我们自己的译文」的行。"""
+    """Drop the page UI and the lines that are already our own translation."""
     out = []
     for ln in lines:
         if len(ln) < 3:
             continue
         if any(w in ln for w in UI_WORDS):
             continue
-        # 与最近任一条译文/原文有 8 字以上共同子串 → 认为是从我们页面抄来的
+        # 8+ characters in common with the latest translation/source -> assumed copied from our own page
         junk = False
         for r in recent:
             r = re.sub(r"\s+", "", r)
@@ -74,10 +77,10 @@ def filter_lines(lines: list[str], recent: list[str]) -> list[str]:
 
 
 def build_hint(lines: list[str], max_chars: int) -> str:
-    """把屏幕文字压成一段提示。按「信息密度」挑，不按原文顺序堆。
+    """Squeeze the screen text into one hint block. Picked by "information density", not stacked in source order.
 
-    优先级：带拉丁字母/数字的行（专有名词、型号）> 含片假名的行 > 其余。
-    这些才是 ASR 最容易听错、又最能被屏幕纠正的东西。
+    Priority: lines with Latin letters/digits (proper nouns, model numbers) > lines with katakana > the rest.
+    Those are exactly what ASR mishears most and what the screen can best correct.
     """
     scored = []
     for ln in lines:
@@ -153,7 +156,7 @@ def main() -> None:
     items = []
     for l in lines:
         if not (l.get("trans") or "").strip():
-            continue          # 没译出来的段不参与，避免把「空」当基线
+            continue          # segments without a translation do not take part, so "empty" is not treated as a baseline
         items.append(l)
     items = items[-args.limit:]
     print(f"\n参与对比的段：{len(items)} 条")
@@ -169,7 +172,7 @@ def main() -> None:
 
     rows: dict[str, list[dict]] = {n: [] for n, _ in arms}
     for r in range(args.rounds):
-        for name, _c in arms:      # 每臂连续跑完：交替会让前缀缓存反复失效
+        for name, _c in arms:      # run each arm to completion: interleaving keeps invalidating the prefix cache
             for i, l in enumerate(items):
                 idx = lines.index(l)
                 prev = [lines[j] for j in range(max(0, idx - args.ctx_lines), idx)]
@@ -194,7 +197,7 @@ def main() -> None:
               f"{int(statistics.median([x['prompt_n'] or 0 for x in rs])):>10}"
               f"{int(statistics.median([x['prompt_ms'] or 0 for x in rs])):>11}")
 
-    # 效果：与 none 逐句比对
+    # Effect: compare line by line against none
     base_by = {(x["round"], x["i"]): x for x in rows["none"]}
     print("\n########## 效果（每臂 vs none，同一轮同一句）")
     for name, _c in arms[1:]:

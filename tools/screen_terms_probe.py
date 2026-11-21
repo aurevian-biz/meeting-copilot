@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""屏幕词表能不能对上 ASR 的错字？——先量命中率与误报，再决定要不要做功能。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-思路：屏幕上的专有名词（人名/机构/型号/数字）如果有，而 ASR 把它听成了同音异字，
-那么**两者的读音会高度相似、写法不同**。所以：
+"""Can the screen term hints match the ASR's misrecognitions? -- measure the hit rate and false positives first, then decide whether the feature is worth building.
 
-  1. 从 OCR 抽候选词（拉丁/数字/片假名/汉字串），滤掉我们自己页面与已有译文
-  2. 每个候选词取读音（pyopenjtalk）
-  3. 每段 ASR 文本切成词素，取 1~4 个词素的读音窗口
-  4. 读音编辑距离 ≤1 且写法不同 → 命中候选
+Idea: if a proper noun on screen (person/institution/model number/digit) gets heard by ASR as a homophone,
+then **the two readings are highly similar while the spellings differ**. So:
 
-命中率低或误报多，就说明「注入屏幕词表」这条路在本场景不成立，
-别再花时间做提示词工程（实测代价 250~320ms/句，见 tools/screen_hint_ab.py）。
+  1. Extract candidate terms from the OCR (Latin/digits/katakana/kanji runs), filtering out our own page and the existing translation
+  2. Take the reading of each candidate (pyopenjtalk)
+  3. Chop each ASR segment into morphemes and take reading windows of 1-4 morphemes
+  4. Reading edit distance <=1 with a different spelling -> candidate hit
+
+A low hit rate or many false positives means the "inject screen term hints" route does not hold in this scenario,
+so stop spending time on prompt engineering (measured cost 250-320ms per sentence, see tools/screen_hint_ab.py).
 """
 from __future__ import annotations
 
@@ -64,7 +67,7 @@ def main() -> None:
     for l in lines[-30:]:
         recent += [l.get("text") or "", l.get("trans") or ""]
 
-    # ---------- 抽屏幕候选词 ----------
+    # ---------- extract screen candidates ----------
     raw = [x.strip() for x in ocr_text.splitlines() if x.strip()]
     kept = []
     for ln in raw:
@@ -96,7 +99,7 @@ def main() -> None:
     for w, rd in list(cands.items())[:24]:
         print(f"   {w:<16} {rd}")
 
-    # ---------- 逐段撞 ----------
+    # ---------- match segment by segment ----------
     print("\n########## 命中检查")
     t_all = time.time()
     n_seg = hits = 0
@@ -110,7 +113,7 @@ def main() -> None:
         nodes = pyopenjtalk.run_frontend(text)
         fe_ms = int((time.time() - t0) * 1000)
         toks = [(n["string"], kata2hira(n["read"] or "")) for n in nodes]
-        # 合并窗口：1~4 个词素
+        # merge window: 1-4 morphemes
         wins = []
         for i in range(len(toks)):
             surf, rd = "", ""

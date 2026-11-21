@@ -1,33 +1,42 @@
 #!/usr/bin/env python3
-"""voice_server.py —— 浏览器可操作的语音对话测试台。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-一条命令起服务，浏览器打开就能对着插在 Jetson 上的 H340 说话，链路是：
+"""voice_server.py — a browser-driven voice conversation test bench.
 
-    点击 → arecord（VAD 自动收尾）→ SenseVoice → vLLM → Piper → 浏览器播放
+Start the service with one command, open the page in a browser, and talk into the
+H340 microphone plugged into the Jetson. The pipeline is:
 
-三个设计取舍，都是刻意的：
+    click → arecord (VAD auto-stop) → SenseVoice → vLLM → Piper → browser playback
 
-1. **录音在服务器端，不在浏览器**。麦克风插在 Jetson 上；如果让浏览器录音，
-   测的就是你笔记本的麦克风，与真机无关。浏览器只负责触发和播放。
+Three design trade-offs, all deliberate:
 
-2. **录音靠 VAD 收尾，不定长**。固定录 5 秒会有「说完了还得等」的体验，
-   而等满 5 秒这件事本身会掩盖真实延迟。这里用能量 VAD 判断你说完没有，
-   停顿 0.75 秒即收尾，同时保留 12 秒硬上限。
+1. **Recording lives on the server, not in the browser.** The microphone is
+   plugged into the Jetson; if the browser did the recording, you would be
+   testing your laptop's microphone, which says nothing about the real device.
+   The browser only triggers and plays back.
 
-3. **按句合成、逐句回传**。整段合成要等 LLM 全部生成完，感知延迟等于总和。
-   这里 LLM 一吐出完整句子就合成该句并推给浏览器，浏览器边收边播，
-   首句听感延迟接近「首字延迟 + 首句合成」。
+2. **Recording stops on VAD, not at a fixed length.** A fixed 5-second recording
+   feels like "I stopped talking but still have to wait", and that wait itself
+   masks the real latency. An energy VAD decides when you are done: 0.75 s of
+   silence ends the turn, with a 12 s hard cap.
 
-用法：
+3. **Synthesize per sentence, stream sentence by sentence.** Synthesizing the
+   whole reply means waiting for the LLM to finish, so perceived latency equals
+   the sum of everything. Here the LLM emits a complete sentence and we
+   synthesize and push it right away; the browser plays as it receives, so the
+   perceived first-sentence latency approaches "first token + first sentence".
+
+Usage:
     ./asr-venv/bin/python voice_server.py --port 8095
-    浏览器打开 http://127.0.0.1:8095
+    then open http://127.0.0.1:8095
 
-    # LLM 还没起时也能测（ASR→TTS 回声，验证链路）
+    # works before the LLM is up too (ASR→TTS echo, to verify the pipeline)
     ./asr-venv/bin/python voice_server.py --port 8095 --no-llm
 """
-# 注意：这里刻意不使用 `from __future__ import annotations`。
-# FastAPI 会在模块全局命名空间里解析注解，而 Request 是在 build_app 内导入的局部名字；
-# 一旦注解被字符串化，`request: Request` 就会被误判成查询参数并报 422。
+# Note: `from __future__ import annotations` is deliberately avoided here.
+# FastAPI resolves annotations in module globals, but Request is a local name imported
+# inside build_app; stringified annotations turn `request: Request` into a query param (422).
 
 import argparse
 import asyncio
@@ -53,9 +62,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import voice_probe as vp  # noqa: E402
-import vision as vx  # noqa: E402  取帧 + OCR：「看一眼屏幕」
+import vision as vx  # noqa: E402  frame grab + OCR: "take a look at the screen"
 
-import paths  # noqa: E402  目录约定：MC_DATA 可覆盖，见 paths.py
+import paths  # noqa: E402  directory conventions: MC_DATA overrides, see paths.py
 
 DATA = paths.DATA
 DEFAULT_ASR_DIR = paths.SENSEVOICE_DIR
@@ -70,24 +79,28 @@ TURN_LOG = WORK / "turns.jsonl"
 SR = 16000
 FRAME_S = 0.02
 
-# 假名 / 汉字，用来给合成选音色
+# Kana / CJK ideographs, used to pick a TTS voice
 KANA = re.compile(r"[\u3040-\u309F\u30A0-\u30FF]")
 CJK = re.compile(r"[\u4E00-\u9FFF]")
 
 
-# ------------------------------------------------------------------ 录音
+# ------------------------------------------------------------------ recording
 class RecordError(RuntimeError):
     pass
 
 
 class VoiceRecorder:
-    """录音并按 Silero VAD 自动判停。
+    """Record and stop automatically via Silero VAD.
 
-    为什么不用能量门限：早期版本用「本底 + 余量」的绝对阈值，实测两种失败都出现过。
-      - 增益高时：本底被语音污染，门限抬到 −20dB，语音被自己判成静音（只截到 0.81s）
-      - 环境嘈杂时：噪声本身就在门限之上，永远判不出「说完了」，每次都撞 12 秒上限
-    Silero VAD 是基于 512 样本窗的语音概率模型，对增益、稳态噪声都不敏感，
-    而且它自己维护「说完多久算一段」，不需要我们再调两个时间常数。
+    Why not an energy threshold: the early version used an absolute "noise floor +
+    headroom" threshold, and both failure modes showed up in practice.
+      - With high gain: speech leaked into the noise floor, the threshold rose to
+        -20 dB, and speech was judged silence (only 0.81 s captured)
+      - In a noisy room: the noise itself sits above the threshold, "done talking"
+        is never detected, and every turn hits the 12 s cap
+    Silero VAD is a speech-probability model over 512-sample windows; it is
+    insensitive to gain and stationary noise, and it tracks "how long a silence
+    ends a segment" itself, so we do not have to tune two time constants.
     """
 
     def __init__(self, device: str, vad_model: str, max_s: float = 15.0,
@@ -115,11 +128,12 @@ class VoiceRecorder:
         return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=30)
 
     def record(self, source: "queue.Queue | None" = None) -> tuple[np.ndarray, int, dict]:
-        """录一段并 VAD 判停。
+        """Record one segment and stop on VAD.
 
-        source=None：自己起 arecord（点按钮模式）。
-        source=队列：从常驻 AudioHub 取帧（唤醒模式）。ALSA 设备同一时刻只能被
-        一个进程占用，唤醒线程已经在读了，这里不能再开第二个 arecord。
+        source=None: spawn our own arecord (button mode).
+        source=queue: pull frames from the resident AudioHub (wake-word mode). ALSA
+        devices can only be held by one process at a time, and the wake thread is
+        already reading, so a second arecord cannot be opened here.
         """
         vad = self._make_vad()
         frame_len = int(SR * FRAME_S)
@@ -154,7 +168,8 @@ class VoiceRecorder:
                 vad.accept_waveform((frame.astype(np.float32) / vp.FULL_SCALE))
                 if vad.is_speech_detected() and speech_at is None:
                     speech_at = now
-                # 检测器在有语音段「说完」后才把段吐出来，这正好是我们要的收尾信号
+                # The detector emits a segment only after speech has "ended", which
+                # is exactly the end-of-turn signal we want
                 if not vad.empty():
                     seg = vad.front
                     seg_samples = np.asarray(seg.samples, dtype=np.float32)
@@ -174,7 +189,7 @@ class VoiceRecorder:
                     proc.kill()
 
         if seg_samples is None:
-            # 撞到硬上限或提前中断：把已缓冲的段冲出来
+            # Hit the hard cap or aborted early: flush whatever is still buffered
             try:
                 vad.flush()
                 if not vad.empty():
@@ -201,16 +216,20 @@ class VoiceRecorder:
         return audio, SR, info
 
 
-# ------------------------------------------------------------------ 常驻采集
+# ------------------------------------------------------------------ capture hub
 class AudioHub:
-    """一个 arecord 进程，多路消费者。
+    """One arecord process, many consumers.
 
-    为什么需要它：唤醒要求麦克风一直开着，而 ALSA 设备同一时刻只能被一个进程占。
-    原来 record() 每次自己起 arecord，唤醒线程和录音就会互相抢设备。
-    这里让一个线程独占设备、把定长帧分发给订阅者；订阅时先补最近 0.3–0.6 秒的帧，
-    这样「小八你好，今天天气怎么样」连说时，唤醒词之后的字不会丢。
+    Why this exists: wake-word detection needs the microphone open all the time,
+    and an ALSA device can be held by only one process at a time. When record()
+    spawned its own arecord on every call, the wake thread and the recorder kept
+    fighting over the device. Here a single thread owns the device and hands
+    fixed-size frames to subscribers; on subscribe we first top up with the last
+    0.3–0.6 s of frames, so when someone says "hey assistant, what's the weather
+    today" in one breath, the words after the wake word are not lost.
 
-    arecord 异常退出（设备被占用、睡眠唤醒）时自动重开，errors 计数供 health 观察。
+    If arecord exits unexpectedly (device busy, resume from sleep) it is reopened
+    automatically, and the errors counter is there for health to observe.
     """
 
     def __init__(self, device: str, frame_s: float = FRAME_S, pre_s: float = 0.6):
@@ -239,7 +258,7 @@ class AudioHub:
 
     @property
     def rate_s(self) -> float:
-        """最近一次收到帧距今的秒数，用来判断采集是否还活着。"""
+        """Seconds since the last frame arrived, used to tell whether capture is alive."""
         return round(time.time() - self.last_frame_at, 1) if self.last_frame_at else -1.0
 
     def _run(self) -> None:
@@ -278,7 +297,7 @@ class AudioHub:
             try:
                 q.put_nowait(frame)
             except queue.Full:
-                # 慢消费者：丢最旧的一帧，绝不让采集线程阻塞
+                # Slow consumer: drop the oldest frame, never block the capture thread
                 try:
                     q.get_nowait()
                     q.put_nowait(frame)
@@ -286,11 +305,13 @@ class AudioHub:
                     pass
 
     def subscribe(self, pre_s: float = 0.3, pre_frames=None) -> queue.Queue:
-        """订阅音频帧。
+        """Subscribe to audio frames.
 
-        pre_frames：显式指定「历史帧」，代替从环形缓冲里取。打断交接要用它——
-        打断检测线程已经读走了一段人声，交给录音时必须原样带上，否则那句话的
-        开头几个字就被吃掉了（环形缓冲只有 0.6 秒，补不回来）。
+        pre_frames: explicitly pass the "history frames" instead of taking them
+        from the ring buffer. The barge-in handover needs this — the barge monitor
+        has already consumed part of the speech, and the recorder must receive it
+        verbatim, otherwise the first few words of that utterance are eaten (the
+        ring buffer only holds 0.6 s, so they cannot be recovered).
         """
         q: queue.Queue = queue.Queue(maxsize=int(30 / FRAME_S))
         with self._lock:
@@ -314,12 +335,13 @@ class AudioHub:
                 self._subs.remove(q)
 
 
-# ------------------------------------------------------------------ 唤醒词
+# ------------------------------------------------------------------ wake word
 class Kws:
-    """关键词唤醒：sherpa-onnx zipformer-KWS，中文拼音建模，纯 CPU。
+    """Keyword wake word: sherpa-onnx zipformer-KWS, pinyin-modeled, CPU only.
 
-    实测 RTF 0.03（8 秒音频 0.26 秒算完），Jetson 上占单核约 3%，
-    和 ASR/TTS 抢核可以忽略。关键词是运行时生成的，改词不用重训模型。
+    Measured RTF 0.03 (8 s of audio decoded in 0.26 s), about 3% of one core on
+    the Jetson, so competing with ASR/TTS for cores is negligible. Keywords are
+    generated at runtime, so changing the phrase needs no retraining.
     """
 
     def __init__(self, model_dir: Path, word: str, keywords_file: Path,
@@ -345,7 +367,7 @@ class Kws:
             keywords_threshold=threshold, provider="cpu")
 
     def wait(self, q: queue.Queue, stop: threading.Event | None = None) -> str | None:
-        """阻塞等待唤醒词。返回命中的关键词，stop 置位时返回 None。"""
+        """Block until the wake word is heard. Returns the matched keyword, or None when stop is set."""
         stream = self.spotter.create_stream()
         while not (stop and stop.is_set()):
             try:
@@ -364,7 +386,7 @@ class Kws:
 
 
 class WakeLoop(threading.Thread):
-    """常驻监听：等唤醒词 → 跑一轮对话 → 回到监听。"""
+    """Resident listener: wait for the wake word → run one turn → back to listening."""
 
     def __init__(self, hub: AudioHub, kws: Kws, runner, history: list[dict],
                  push, turn_lock: threading.Lock, has_listener=None):
@@ -375,18 +397,19 @@ class WakeLoop(threading.Thread):
         self.history = history
         self.push = push
         self.turn_lock = turn_lock
-        # 没有页面在听时不跑对话：否则关掉页面后每次唤醒都会白跑一轮、
-        # 白合成一堆 wav，还占着 turn_lock
+        # Do not run a turn when no page is listening: otherwise every wake after the
+        # page is closed burns a pointless turn, synthesizes a pile of wavs, and holds
+        # turn_lock while doing it
         self.has_listener = has_listener or (lambda: True)
         self._stop = threading.Event()
         self.turns = 0
-        self.skipped = 0  # 命中了但没有页面在听
+        self.skipped = 0  # matched, but no page was listening
 
     def stop(self) -> None:
         self._stop.set()
 
     def _emit(self, ev: dict) -> None:
-        # 被打断的那轮不进历史：它是不完整的
+        # An interrupted turn never enters history: it is incomplete
         if (ev["type"] == "done" and not ev.get("interrupted")
                 and ev.get("user") and ev.get("reply")):
             self.history.append({"role": "user", "content": ev["user"]})
@@ -408,8 +431,8 @@ class WakeLoop(threading.Thread):
                 self.skipped += 1
                 print(f"[wake] 命中「{word}」但没有页面在听，跳过", flush=True)
                 continue
-            # 唤醒词之后的音频：pre 只补 0.25 秒，够接上「你好」的尾音又不至于
-            # 把整句唤醒词带进 ASR
+            # Audio after the wake word: pre fills only 0.25 s, enough to catch the
+            # tail of the greeting without dragging the whole wake phrase into ASR
             q2 = self.hub.subscribe(pre_s=0.25)
             try:
                 with self.turn_lock:
@@ -453,18 +476,20 @@ EMOJI = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]")
 
 
 def clean_text(s: str) -> str:
-    """SenseVoice 会在结果里带 <|ja|><|HAPPY|> 这些标签，去掉。"""
+    """SenseVoice decorates its output with tags like <|ja|><|HAPPY|>; strip them."""
     s = re.sub(r"<\|[^|]*\|>", "", s or "")
     s = EMOJI.sub("", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
 def trim_by_vad(audio: np.ndarray, sr: int, hp: float = 150.0) -> tuple[np.ndarray, dict]:
-    """把首尾静音裁掉，只保留语音区。
+    """Trim leading and trailing silence, keeping only the speech region.
 
-    这一步对 SenseVoice 不是可选的：把带长静音的整段音频直接喂进去，会出现
-    重复和错乱（实测 40 秒含两段语音的文件被读成「…確認してくださいこ…確認してださい」）。
-    真实录音路径已经由录音端的 VAD 裁过，这里是给 wav 回放用的同一套处理。
+    This is not optional for SenseVoice: feeding it a whole clip padded with long
+    silences produces repetitions and garbled output (a measured 40 s file with two
+    utterances came back as "…確認してくださいこ…確認してださい").
+    The live recording path is already trimmed by the recorder's VAD; this is the
+    same processing for wav playback.
     """
     x = vp.highpass(audio.astype(np.float64), hp, sr, 2)
     frames = vp.frame_db(x, sr)
@@ -474,7 +499,7 @@ def trim_by_vad(audio: np.ndarray, sr: int, hp: float = 150.0) -> tuple[np.ndarr
     segs = vp.segment_speech(frames, thr, min_speech_s=0.30, min_gap_s=0.45)
     if not segs:
         return audio, {"trimmed": False, "thr_db": round(thr, 1)}
-    # 逐段截取再首尾相接：既去掉静音，也去掉段间长停顿
+    # Cut segment by segment, then splice: removes silence and long inter-segment pauses
     parts = []
     for s in segs:
         a = max(0, int((s.start - 0.15) * sr))
@@ -489,7 +514,7 @@ def trim_by_vad(audio: np.ndarray, sr: int, hp: float = 150.0) -> tuple[np.ndarr
 
 
 def events_since(buf, after: int) -> list:
-    """短轮询用：取出 seq > after 的事件，保持原顺序。"""
+    """For short polling: return events with seq > after, in the original order."""
     return [ev for (sq, ev) in buf if sq > after]
 
 
@@ -503,12 +528,14 @@ def write_wav(path: Path, audio: np.ndarray, sr: int) -> None:
 
 # ------------------------------------------------------------------ TTS
 class Tts:
-    """多音色合成，按句子的文字自动选引擎。
+    """Multi-voice synthesis, picking the engine from each sentence's script.
 
-    为什么必须分引擎：Piper 的日语音色读中文、中文音色读日文都会严重变调
-    （假名被当拼音念，汉字读成另一个字的音）。判定规则很可靠：
-    有平假名/片假名 → 日语；没有假名但有汉字 → 中文。中日混排的场景已确认不存在，
-    所以按句判断就够，不需要按字判断。
+    Why separate engines are required: a Piper Japanese voice reading Chinese, or a
+    Chinese voice reading Japanese, goes badly off-key (kana read as pinyin, kanji
+    read with another character's sound). The rule is reliable: hiragana/katakana
+    → Japanese; no kana but CJK ideographs → Chinese. Mixed CJK/Japanese lines have
+    been confirmed not to occur, so deciding per sentence is enough — no need to
+    decide per character.
     """
 
     def __init__(self, ja_model: Path, zh_model: Path | None = None,
@@ -523,17 +550,18 @@ class Tts:
         self.cfgs["ja"] = SynthesisConfig(speaker_id=speaker) if speaker is not None else None
         if zh_model and Path(zh_model).exists():
             self.voices["zh"] = PiperVoice.load(str(zh_model))
-            self.cfgs["zh"] = None  # 中文音色单说话人，传 speaker_id 会报错
+            self.cfgs["zh"] = None  # Chinese voice is single-speaker; passing speaker_id errors
         self.default = "ja" if "ja" in self.voices else next(iter(self.voices))
         self.load_s = time.time() - t0
 
     def pick(self, text: str, hint: str | None = None) -> str:
-        """选音色。hint 是上一句（或本轮回复语言）用过的音色。
+        """Pick a voice. hint is the voice used by the previous sentence (or this turn's reply language).
 
-        为什么要 hint：一句话可能只有数字或拉丁字母（"1.5"、"OK"、"2026"），
-        既没有假名也没有汉字。以前这种句子会落到 default（日语），于是中文回答里
-        的「3.14」被日本語読み —— 用户听到的就是「数字怎么是日语」。
-        这类句子必须跟随上下文语言，hint 就是上下文。
+        Why hint: a sentence may contain only digits or Latin letters ("1.5", "OK",
+        "2026"), with neither kana nor CJK ideographs. Such sentences used to fall
+        back to default (Japanese), so "3.14" inside a Chinese reply was read in
+        Japanese — users hear "why is the number in Japanese?".
+        These sentences must follow the surrounding language, and hint is that context.
         """
         if KANA.search(text) and "ja" in self.voices:
             return "ja"
@@ -541,11 +569,12 @@ class Tts:
             return "zh"
         if hint in self.voices:
             return hint
-        # 没有上下文时（例如英文首句）用中文：中文模型读英文/数字不会串成日语音
+        # With no context (e.g. an English first sentence) use Chinese: the Chinese
+        # model reads English/digits without slipping into a Japanese accent
         return "zh" if "zh" in self.voices else self.default
 
     def _render(self, lang: str, text: str) -> tuple[bytes, int, int]:
-        """合成到内存。空音素化时 wave 会在 close 时抛错，这里转成 0 帧返回。"""
+        """Synthesize into memory. On empty phonemization wave raises at close; return 0 frames instead."""
         bio = io.BytesIO()
         try:
             with wave.open(bio, "wb") as wf:
@@ -563,7 +592,7 @@ class Tts:
         voices = self.voices
         t0 = time.time()
         data, n, sr = self._render(lang, text)
-        if n == 0:  # 理论上已被 strip_for_tts 拦住，兜底换音色再试一次
+        if n == 0:  # strip_for_tts should already block this; fall back to another voice and retry
             alt = next((k for k in voices if k != lang), None)
             if alt:
                 data, n, sr = self._render(alt, text)
@@ -580,7 +609,7 @@ class Tts:
 
 # ------------------------------------------------------------------ LLM
 class Llm:
-    """OpenAI 兼容流式客户端。用 urllib 而不是 httpx，少一个依赖。"""
+    """OpenAI-compatible streaming client. Uses urllib instead of httpx, one less dependency."""
 
     def __init__(self, base: str, model: str, timeout: float = 30.0,
                  reply_lang: str = "auto", api_key: str = "",
@@ -590,9 +619,10 @@ class Llm:
         self.timeout = timeout
         self.reply_lang = reply_lang
         self.api_key = api_key
-        # Qwen3.5 的 chat template 未定义 enable_thinking 时**默认走思考分支**：
-        # 160 token 全烧在 reasoning 上，content 恒为空，表现就是「每轮等很久却一个字没有」。
-        # 字幕那边踩过一次（README 4.18），这里同理，默认关。
+        # Qwen3.5's chat template **defaults to the thinking branch** when
+        # enable_thinking is undefined: all 160 tokens burn on reasoning, content
+        # stays empty, which looks like "every turn waits forever and says nothing".
+        # The caption side hit this once (README 4.18); same here, off by default.
         self.think = think
         self._probe: bool | None = None
         self._probed_at = 0.0
@@ -607,7 +637,8 @@ class Llm:
             "箇条書き・記号・Markdown・絵文字は使わないでください。"
             "固有名詞や技術用語は正確に。不確かなことは推測せず「確認が必要です」と言ってください。"
         )
-        # 对外保留完整版（含屏幕规则），tools/voice_llm_ab.py 拿它构造带 OCR 的用例
+        # Keep the full version publicly (screen rule included); tools/voice_llm_ab.py
+        # uses it to build cases with OCR
         self.system = self.system_core + self.screen_rule
 
     def _headers(self) -> dict:
@@ -617,19 +648,24 @@ class Llm:
         return h
 
     def _lang_directive(self, text: str) -> str:
-        """把「用什么语言回答」变成硬约束。
+        """Turn "which language to answer in" into a hard constraint.
 
-        只靠 system prompt 里「跟着用户的语言」是不够的：实测前几轮是中文时，
-        用户改说日语，模型仍然用中文回答 —— 它跟的是上下文风格，不是当前这一句。
-        所以每轮都按当前这句的语言追加一条明确指令。
+        Relying on the system prompt's "follow the user's language" is not enough:
+        measured with the first few turns in Chinese, the user switches to Japanese
+        and the model still answers in Chinese — it follows the contextual style,
+        not the current sentence. So each turn appends an explicit directive for the
+        language of this sentence.
 
-        **这条指令必须挂在最后一条 user 消息末尾，不能挂在 system 末尾**（2026-11-21 实测）：
-            reply-lang=zh，两个场景 × 3 次，判据是输出语言
-            system 末尾追加：7B 3/6 中文，35B 0/6 中文（全回日语）
-            user 末尾追加：  7B 6/6 中文，35B 6/6 中文
-        system 通篇是日语，指令挂在最前面/最后面都会被前面的语境压过去；
-        挂在 user 末尾就是紧贴生成位置，两个模型都听。35B 尤其明显——
-        它「太懂语境」，用户说日语、屏幕是日语，它就无视远处的中文指令。
+        **This directive must be attached to the end of the last user message, not
+        to the end of system** (measured 2026-11-21):
+            reply-lang=zh, two scenarios x 3 runs, judged by output language
+            appended to system: 7B 3/6 Chinese, 35B 0/6 Chinese (all Japanese)
+            appended to user:   7B 6/6 Chinese, 35B 6/6 Chinese
+        system is Japanese throughout; a directive at its start or end is overridden
+        by the surrounding context. At the end of user it sits right next to the
+        generation point, and both models obey. 35B is especially clear — it is
+        "too good at context": user speaks Japanese, screen is Japanese, and it
+        ignores a distant Chinese directive.
         """
         lang = self.reply_lang
         if lang in ("auto", "", None):
@@ -646,16 +682,17 @@ class Llm:
         return ""
 
     def available(self, ttl: float = 5.0) -> bool:
-        """带 5 秒缓存的探活。
+        """Liveness probe with a 5-second cache.
 
-        不在启动时一次性决定：vLLM 加载要 90 秒左右，如果本服务比它先起，
-        一次性判断会把 LLM 永久降级成 None，之后即使 vLLM 好了也不会恢复。
+        Not decided once at startup: vLLM takes about 90 s to load, so if this
+        service comes up first, a one-shot decision would permanently downgrade the
+        LLM to None and never recover even after vLLM is ready.
         """
         now = time.time()
         if self._probe is not None and now - self._probed_at < ttl:
             return self._probe
         try:
-            # Magnitude 的 /inference/v1 要 Bearer，vLLM 不校验；带上无害
+            # Magnitude's /inference/v1 requires Bearer; vLLM does not check it; harmless to send
             req = urllib.request.Request(self.base + "/models",
                                          headers=self._headers())
             with urllib.request.urlopen(req, timeout=3) as r:
@@ -666,15 +703,19 @@ class Llm:
         return self._probe
 
     def stream(self, text: str, history: list[dict]):
-        # system 按「这轮到底看没看屏幕」二选一，而不是写一份常驻的。
-        # 为什么：system 里只要出现「[屏幕文字]」这几个字，模型就会引用它 ——
-        # 没看图时也答「屏幕文字中没有显示…」，听起来像在推卸（35B 比 7B 更明显，
-        # 实测加一条「没有屏幕文字时不要提屏幕」的否定指令也压不住）。
-        # 干脆不给它这个词，问题消失。
+        # system is picked per turn depending on whether we actually looked at the
+        # screen, rather than keeping one resident prompt.
+        # Why: as soon as the screen-text marker appears in the system prompt the model
+        # quotes it, and answers "the screen text does not show…" even when we never
+        # looked, which sounds like an excuse (35B more than 7B; a measured negative
+        # directive saying "do not mention the screen when there is no screen text"
+        # did not help either).
+        # Simply not giving it that word makes the problem disappear.
         sysp = self.system if "[屏幕文字]" in text else self.system_core
-        # 语言指令挂两处：system 末尾 + user 末尾。
-        # 只挂 user 时，遇到「system 通篇日语 + 用户说日语」35B 仍回日语（3/3 实测）；
-        # system 里也得有一句，才能压住整体语境。两处都挂最稳。
+        # Attach the language directive twice: end of system + end of user.
+        # With user only, when "system is all Japanese + user speaks Japanese" 35B still
+        # answered in Japanese (3/3 measured); system needs a line too, to override the
+        # overall context. Attaching in both places is the most robust.
         ling = self._lang_directive(text)
         msgs = [{"role": "system", "content": sysp + ling}]
         msgs += history[-6:]
@@ -711,9 +752,10 @@ SENT_END = re.compile(r"(?:(?<!\d)\.(?!\d)|[。．!?！？\n])")
 MD_NOISE = re.compile(r"^[\s*#>`\-]+|[*#`]+")
 
 
-# 真正能发音的字符：假名 / 汉字 / 拉丁字母 / 数字。
-# 只由标点组成的片段（"。" "……" "「」"）交给 Piper 会得到 0 帧音频，
-# wave 模块随后抛 "# channels not specified" —— 那是空音素化的表现，不是音频设备问题。
+# Characters that are actually pronounceable: kana / CJK ideographs / Latin letters / digits.
+# A fragment made only of punctuation ("。" "……" "「」") gives Piper 0 frames of audio,
+# and the wave module then raises "# channels not specified" — the signature of empty
+# phonemization, not an audio-device problem.
 SPEAKABLE = re.compile(r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\u3400-\u4DBF0-9A-Za-z]")
 
 
@@ -728,16 +770,18 @@ def strip_for_tts(s: str) -> str:
     return s if has_speech(s) else ""
 
 
-# ------------------------------------------------------------------ 打断
+# ------------------------------------------------------------------ barge-in
 class SpeakState:
-    """播报时钟：估算「前端还在播」到什么时候。
+    """Playback clock: estimates how long the front end will still be playing.
 
-    为什么需要它：合成本身比播放快一个数量级（RTF 0.1），`TurnRunner.run()`
-    返回时前面几段还在浏览器里排队播。打断如果按「生成结束」判断，用户会在
-    助理还在说话的时候就被当成「已经说完了」，根本没有打断窗口。
+    Why this is needed: synthesis is an order of magnitude faster than playback
+    (RTF 0.1), so when `TurnRunner.run()` returns, the earlier chunks are still
+    queued in the browser. If barge-in were judged by "generation finished", the
+    user would count as "already done talking" while the assistant is still
+    speaking, and there would be no barge-in window at all.
 
-    这里用一条虚拟播放时间线：每发一段音频就把结束时刻往后推 audio_s 秒，
-    队列排空时它自然归零。
+    So we keep a virtual playback timeline: each audio chunk pushes the end time
+    forward by audio_s seconds, and it naturally returns to zero when the queue drains.
     """
 
     def __init__(self):
@@ -757,7 +801,7 @@ class SpeakState:
     def add(self, audio_s: float, text: str) -> None:
         with self._lock:
             now = time.time()
-            # 上一段还没播完就接到它后面，否则从现在开始
+            # Append after the previous chunk if it is still playing, else start from now
             self._until = max(now, self._until) + audio_s
             self._texts.append(text)
             del self._texts[:-6]
@@ -785,19 +829,21 @@ class SpeakState:
 
 
 class LocalSpeaker:
-    """把合成好的 wav 直接播到 Jetson 自己的声卡（耳机）。
+    """Play synthesized wav files straight to the Jetson's own sound card (headphones).
 
-    为什么需要它：播报默认交给浏览器播放，而浏览器是「哪台机器开页面，
-    声音就从哪台出」。耳机插在 Jetson 上却听不见，正是因为页面开在另一台
-    电脑上 —— 麦克风在 Jetson、喇叭在电脑，两端分离。
+    Why this is needed: playback goes to the browser by default, and a browser plays
+    "on whichever machine has the page open". Headphones plugged into the Jetson are
+    silent precisely because the page is open on another computer — microphone on the
+    Jetson, speaker on the laptop, split across two ends.
 
-    这里走 pw-play 而不是 aplay：麦克风被 AudioHub 以 ALSA 独占方式占着，
-    播放走 PipeWire 才不会和它抢设备（USB 声卡的播放/录音是两条独立流）。
+    This uses pw-play rather than aplay: the microphone is held exclusively by AudioHub
+    through ALSA, and playback through PipeWire does not fight it for the device
+    (playback and capture on a USB sound card are two independent streams).
     """
 
     def __init__(self, sink: str | None = None, gain: float = 1.0,
                  enabled: bool = False):
-        self.sink = sink or None       # None = PipeWire 默认输出
+        self.sink = sink or None       # None = PipeWire default output
         self.gain = gain
         self.enabled = enabled
         self.plays = 0
@@ -814,13 +860,13 @@ class LocalSpeaker:
         try:
             self._q.put_nowait((Path(path), self.gain if gain is None else gain))
             return True
-        except queue.Full:          # 队列满说明播报严重滞后，丢新的比积压好
+        except queue.Full:          # Full queue means playback is badly behind; dropping the new one beats piling up
             self.errors += 1
             self.last_error = "播放队列已满"
             return False
 
     def cancel(self) -> None:
-        """打断：清掉待播，并掐掉正在播的那一句。"""
+        """Barge-in: clear the pending queue and cut off the sentence currently playing."""
         while True:
             try:
                 self._q.get_nowait()
@@ -858,7 +904,7 @@ class LocalSpeaker:
                 if p.returncode == 0:
                     self.plays += 1
                 elif p.returncode is not None and p.returncode < 0:
-                    pass                                # 被 terminate（打断），正常
+                    pass                                # terminated (barge-in), expected
                 else:
                     self.errors += 1
                     self.last_error = (err or b"").decode("utf-8", "replace").strip()[:120]
@@ -884,20 +930,23 @@ _ECHO_STRIP = re.compile(r"[\s、。，．,.!?！？…「」『』（）()\-—
 
 
 def looks_like_echo(heard: str, spoken, thresh: float = 0.7) -> bool:
-    """播报期检测到的「人声」是不是扬声器串音。
+    """Is the "speech" detected during playback just speaker bleed?
 
-    外放时麦克风会听到助理自己的声音，不排除就会自激：一播报就被打断，
-    而打断后重新播报又被自己打断。
+    On open speakers the microphone hears the assistant itself, and without
+    excluding that you get a feedback loop: playback is barged in on immediately,
+    and the restarted playback is barged in on again by its own voice.
 
-    判据是**最长公共子串占识别文本的比例**，而不是整句相似度。因为串音窗口
-    只有一两秒，识别出来就是三五个字（"今天天"），拿它和十四字的整句算
-    SequenceMatcher.ratio 得 0.35，永远够不着阈值。但反过来看，"今天天" 有
-    3/3 的字落在播报文本里连成一片，这就非常可疑了。
+    The criterion is **the longest common substring as a share of the recognized
+    text**, not whole-sentence similarity. The bleed window is only a second or two,
+    so recognition yields three to five characters; comparing that against a
+    fourteen-character sentence with SequenceMatcher.ratio gives 0.35 and never
+    reaches the threshold. But the other way round, all 3/3 characters of that
+    fragment fall inside the playback text as one contiguous run — deeply suspicious.
     """
     h = _ECHO_STRIP.sub("", heard or "")
     if len(h) < 2:
-        # 给不出任何统计信息，一律当成人声：宁可多打断一次，
-        # 也不要漏掉「停」「等一下」这种短指令
+        # Too little text for any statistic: always treat it as human speech. Better to
+        # barge in once too often than to miss a short command like "stop" or "hold on"
         return False
     cands = [spoken] if isinstance(spoken, str) else list(spoken or [])
     for c in cands:
@@ -905,7 +954,7 @@ def looks_like_echo(heard: str, spoken, thresh: float = 0.7) -> bool:
         if len(s) < 2:
             continue
         if h in s:
-            return True          # 完整命中，最干脆的情况
+            return True          # full match, the clearest case
         m = difflib.SequenceMatcher(None, h, s).find_longest_match(0, len(h), 0, len(s))
         if m.size >= 3 and m.size >= len(h) * thresh:
             return True
@@ -913,17 +962,21 @@ def looks_like_echo(heard: str, spoken, thresh: float = 0.7) -> bool:
 
 
 class BargeMonitor(threading.Thread):
-    """播报期打断：助理说话说到一半，用户直接插话就停下听。
+    """Barge-in during playback: when the user cuts in mid-sentence, stop and listen.
 
-    判定链三道，任何一道不过就不打断：
-      1) 能量：高于「播报期本底 + margin」。播报期本底含扬声器串音，
-         所以外放时门限会自动抬高，避免自激。
-      2) 语音概率：Silero VAD 判为人声，过滤键盘、椅子、风扇这类瞬态噪声。
-      3) 回声排除：把这一小段送去 ASR，文本与正在播的句子高度重合 = 串音。
-         第 3 道要花约 60ms，所以放在能量+VAD 都通过之后，正常情况不付出代价。
+    Three gates, and any failed gate means no barge-in:
+      1) Energy: above "playback-period noise floor + margin". The playback-period
+         floor includes speaker bleed, so on open speakers the threshold rises
+         automatically, preventing a feedback loop.
+      2) Speech probability: Silero VAD judges it human voice, filtering transient
+         noise such as keyboards, chairs, and fans.
+      3) Echo exclusion: send this short clip to ASR; text that heavily overlaps the
+         sentence being played is bleed. Gate 3 costs about 60 ms, so it runs only
+         after energy and VAD both pass — normally it costs nothing.
 
-    打断后不重新开设备：把已读到的帧原样交给录音，接着从同一条流继续读，
-    用户那句话的开头不会丢。
+    After a barge-in the device is not reopened: the frames already read are handed
+    to the recorder verbatim and reading continues on the same stream, so the start
+    of the user's utterance is not lost.
     """
 
     def __init__(self, hub: AudioHub, asr, speak: SpeakState, runner,
@@ -944,15 +997,16 @@ class BargeMonitor(threading.Thread):
         self.hold_s = hold_s
         self.max_db = max_db
 
-        # 最近 1.2 秒的帧：打断时整段交给 ASR/录音，开头不会被切
+        # Last 1.2 s of frames: on barge-in the whole stretch goes to ASR/recording,
+        # so the start is not cut off
         self.frames: deque = deque(maxlen=int(1.2 / FRAME_S))
         self._stop = threading.Event()
         self.hits = 0
         self.echo_drops = 0
-        self.quiet_floor = -60.0     # 非播报期本底，决定门限
-        self.echo_floor = -60.0      # 播报期电平（含串音），只做诊断
+        self.quiet_floor = -60.0     # non-playback floor, decides the threshold
+        self.echo_floor = -60.0      # playback-period level (incl. bleed), diagnostics only
         self.last_db = -99.0
-        self._cooldown = 0.0         # 判为串音后的静默期，避免每 0.3s 重判一次
+        self._cooldown = 0.0         # silence after a bleed verdict, avoids re-judging every 0.3s
         self._in_play = False
 
     def stop(self) -> None:
@@ -970,18 +1024,21 @@ class BargeMonitor(threading.Thread):
         return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=5)
 
     def threshold(self) -> float:
-        """当前该用的打断门限（dBFS）。
+        """Barge-in threshold to use right now (dBFS).
 
-        只跟「静默期本底」走，**不**参考播报期电平。原因：外放时播报期电平就是
-        扬声器串音，用它抬门限会让真人插话也打不断；而且串音和真人的音量本来就
-        相当，电平上根本分不开。串音交给 ASR 文本比对处理，那才是能分辨的维度。
+        Follows only the "silent-period floor", and **not** the playback-period
+        level. Reason: on open speakers the playback-period level is speaker bleed,
+        and raising the threshold with it would stop a real person from breaking in;
+        bleed and a real voice are comparable in loudness anyway, so level alone
+        cannot separate them. Bleed is handled by ASR text comparison — that is the
+        dimension where they can be told apart.
         """
         return min(max(self.min_db, self.quiet_floor + self.margin), self.max_db)
 
     def run(self) -> None:
         q = self.hub.subscribe(pre_s=0.0)
         vad = self._make_vad()
-        holding = 0.0        # 已连续判为人声的秒数
+        holding = 0.0        # seconds continuously judged as voice
         voiced: list[np.ndarray] = []
 
         while not self._stop.is_set():
@@ -997,7 +1054,7 @@ class BargeMonitor(threading.Thread):
             self.last_db = db
 
             if not self.speak.playing():
-                # 没在播报：只更新本底，不跑 VAD（几乎零开销）
+                # Not playing: only update the floor, skip VAD (near-zero cost)
                 self.quiet_floor = min(db, self.quiet_floor + 0.05)
                 self.quiet_floor = max(self.quiet_floor, -80.0)
                 self.echo_floor = min(db, self.echo_floor + 0.05)
@@ -1008,8 +1065,9 @@ class BargeMonitor(threading.Thread):
                 continue
 
             if not self._in_play:
-                # 刚进入播报：VAD 在非播报期没被喂帧，带着上一轮的残留状态，
-                # 直接复用会让「上一句的尾音」算进这一轮的 holding
+                # Just entered playback: the VAD received no frames outside playback
+                # and carries residue from the previous round; reusing it would count
+                # "the tail of the last sentence" toward this round's holding
                 vad = self._make_vad()
                 self._in_play = True
                 holding = 0.0
@@ -1020,7 +1078,8 @@ class BargeMonitor(threading.Thread):
             hot = db > self.threshold()
 
             if self._cooldown > 0:
-                # 刚判为串音：这段时间不再判定，但仍持续收帧（判别要用完整窗口）
+                # Just judged as bleed: stop judging for a while, but keep collecting
+                # frames (the decision needs the full window)
                 self._cooldown -= FRAME_S
                 holding = 0.0
                 voiced.clear()
@@ -1038,16 +1097,17 @@ class BargeMonitor(threading.Thread):
                 is_echo = self._on_barge()
                 holding = 0.0
                 voiced.clear()
-                vad = self._make_vad()   # 状态清干净，避免同一次语音被连判
+                vad = self._make_vad()   # reset state so the same speech is not judged twice
                 if is_echo:
                     self._cooldown = 1.2
 
         self.hub.unsubscribe(q)
 
     def _on_barge(self) -> bool:
-        """判定并处理一次疑似插话。返回 True 表示判成了串音（需要冷却）。"""
-        # 用最近 0.9 秒而不是那 0.3 秒的 voiced：片段太短 ASR 只吐出两个字，
-        # 与播报文本做相似度毫无意义。窗口长一点，判别才站得住。
+        """Judge and handle one suspected barge-in. Returns True if it was judged bleed (cooldown needed)."""
+        # Use the last 0.9 s rather than the 0.3 s voiced buffer: on such a short clip
+        # ASR emits only two characters, and comparing that with the playback text is
+        # meaningless. A longer window makes the verdict defensible.
         tail = list(self.frames)[-int(0.9 / FRAME_S):]
         clip = np.concatenate(tail) if tail else np.concatenate(self.frames)
         heard = ""
@@ -1064,7 +1124,7 @@ class BargeMonitor(threading.Thread):
         self.hits += 1
         print(f"[barge] 打断：「{heard[:24]}」", flush=True)
         self.speak.cancel()
-        # 本地播报也要立刻掐掉，否则耳机里还在自顾自念
+        # Local playback must be cut off too, or the headphones keep reading to themselves
         spk = getattr(self.runner, "speaker", None)
         if spk is not None:
             spk.cancel()
@@ -1073,7 +1133,8 @@ class BargeMonitor(threading.Thread):
         return False
 
     def _start_turn(self) -> None:
-        # 带上打断检测已经读走的那 1.2 秒，用户那句话的开头不能丢
+        # Carry the 1.2 s the barge monitor has already consumed; the start of the
+        # user's utterance must not be lost
         q = self.hub.subscribe(pre_s=0.0, pre_frames=list(self.frames))
 
         def work():
@@ -1088,7 +1149,8 @@ class BargeMonitor(threading.Thread):
         threading.Thread(target=work, name="barge-turn", daemon=True).start()
 
     def _emit(self, ev: dict) -> None:
-        # 被打断的那轮不进历史：它是不完整的，留着会污染后续上下文
+        # An interrupted turn never enters history: it is incomplete, and keeping it
+        # would pollute the following context
         if ev["type"] == "done" and not ev.get("interrupted"):
             if ev.get("user") and ev.get("reply"):
                 self.history.append({"role": "user", "content": ev["user"]})
@@ -1096,7 +1158,7 @@ class BargeMonitor(threading.Thread):
         self.push(ev)
 
 
-# ------------------------------------------------------------------ 单轮编排
+# ------------------------------------------------------------------ turn orchestration
 class TurnRunner:
     def __init__(self, recorder, asr, tts, llm, audio_dir: Path, hub=None,
                  vision=None, speaker=None):
@@ -1105,13 +1167,13 @@ class TurnRunner:
         self.tts = tts
         self.llm = llm
         self.audio_dir = audio_dir
-        self.hub = hub  # AudioHub；有它就不能再自己开 arecord，否则抢设备
-        self.vision = vision  # Vision；有它才能「看一眼屏幕」
-        # 本轮已确定的音色；None 表示还没说过话，由 pick() 自己判断
+        self.hub = hub  # AudioHub; with it we must not spawn our own arecord, or we fight over the device
+        self.vision = vision  # Vision; only with it can we "take a look at the screen"
+        # Voice fixed for this turn; None means nothing spoken yet, leave it to pick()
         self.speak_lang: str | None = None
-        # 播报时钟：打断检测靠它判断「现在还在说话」
+        # Playback clock: barge-in detection uses it to know "still speaking"
         self.speak = SpeakState()
-        # 本地播报（播到 Jetson 自己的耳机）；None = 只让浏览器播
+        # Local playback (to the Jetson's own headphones); None = browser playback only
         self.speaker = speaker
 
     def run(self, emit, *, wav: str | None = None, text: str | None = None,
@@ -1131,7 +1193,7 @@ class TurnRunner:
         self.speak.begin(turn_id)
 
         try:
-            # 1) 取音频
+            # 1) Get the audio
             if text:
                 user_text = text
                 emit({"type": "asr", "text": user_text, "skipped": True})
@@ -1158,7 +1220,7 @@ class TurnRunner:
                 t0 = time.time()
                 user_text, asr_cost = self.asr.run(audio, sr)
                 if strip_prefix and user_text.startswith(strip_prefix):
-                    # 唤醒词本身的尾音会被一起录进来，去掉它再送给 LLM
+                    # The tail of the wake word itself gets recorded too; strip it before the LLM
                     user_text = user_text[len(strip_prefix):].lstrip("，,。.、 　")
                 timings["asr_s"] = round(time.time() - t0, 2)
                 timings["asr_core_s"] = round(asr_cost, 2)
@@ -1168,10 +1230,11 @@ class TurnRunner:
                     return
                 emit({"type": "asr", "text": user_text, "ms": int(timings["asr_s"] * 1000)})
 
-            # 2) 「看一眼屏幕」：手动按钮，或话里带了「看看屏幕上是什么」这类意图
+            # 2) "Take a look at the screen": manual button, or intent like "what's on screen"
             if (look or vx.is_look_intent(user_text)) and self.vision is not None:
                 emit({"type": "state", "state": "looking"})
-                # 先垫一句。取帧+OCR 实测约 8 秒，不能让人干等着不出声
+                # Say a filler first. Frame grab + OCR takes about 8 s measured; the user
+                # cannot be left waiting in silence
                 self._speak(emit, "我看一下。", 0, turn_id, timings)
                 t_look = time.time()
                 info = self.vision.look(force=True)
@@ -1179,14 +1242,15 @@ class TurnRunner:
                 emit({"type": "look", "info": info, "ms": int(timings["look_s"] * 1000)})
                 ctx = vx.format_context(info)
                 if ctx:
-                    # 屏幕文字放在问题前面：模型先看到「看到什么」，再看到「被问什么」
+                    # Screen text goes before the question: the model sees "what is there"
+                    # first, then "what is asked"
                     user_text = f"{ctx}\n\n{user_text}"
                 else:
-                    # 看不到就必须说看不到，否则模型会照着想象编
+                    # If we cannot see it we must say so, or the model will invent something
                     emit({"type": "error",
                           "message": f"看不到屏幕：{info.get('message') or info.get('reason')}"})
 
-            # 3) LLM 流式 → 按句合成
+            # 3) LLM streaming → per-sentence synthesis
             idx = 0
             buf = ""
             if self.llm is None or not self.llm.available():
@@ -1198,7 +1262,7 @@ class TurnRunner:
                 first = True
                 try:
                     for piece in self.llm.stream(user_text, history):
-                        # 用户插话：立刻停止生成，别把剩下的说完再停
+                        # User barged in: stop generating at once, do not finish the rest
                         if self.speak.cancelled:
                             interrupted = True
                             break
@@ -1224,7 +1288,7 @@ class TurnRunner:
                         buf = reply
                         emit({"type": "delta", "text": reply})
 
-            # 打断后不再补发剩余的尾巴：用户已经不想听了
+            # After a barge-in do not flush the remaining tail: the user no longer wants it
             if strip_for_tts(buf) and not self.speak.cancelled:
                 idx += 1
                 self._speak(emit, buf, idx, turn_id, timings)
@@ -1243,9 +1307,9 @@ class TurnRunner:
 
     def _speak(self, emit, sentence: str, idx: int, turn_id: str, timings: dict) -> None:
         text = strip_for_tts(sentence)
-        if not text:  # 纯标点/空白：合成会得到 0 帧音频，直接跳过
+        if not text:  # pure punctuation/whitespace: synthesis yields 0 frames, skip it
             return
-        if self.speak.cancelled:  # 已经插话了，别再合成
+        if self.speak.cancelled:  # already barged in, stop synthesizing
             return
         out = self.audio_dir / f"{turn_id}_{idx:02d}.wav"
         try:
@@ -1253,17 +1317,18 @@ class TurnRunner:
         except Exception as e:  # noqa: BLE001
             emit({"type": "error", "message": f"合成失败：{e}"})
             return
-        # 记住这句的音色，供下一句的数字/英文片段继承
+        # Remember this sentence's voice so the next digits/English fragment inherits it
         self.speak_lang = meta["voice"]
         if "tts_first_ms" not in timings:
             timings["tts_first_ms"] = int(meta["tts_s"] * 1000)
-        # 本地播报开关：开着就直接播到 Jetson 的耳机，浏览器只显示文字
+        # Local playback switch: when on, play to the Jetson's headphones directly and
+        # the browser only shows text
         local = bool(self.speaker and self.speaker.enabled)
         if local:
             self.speaker.play(out)
         emit({"type": "audio", "url": f"/audio/{out.name}", "idx": idx,
               "text": text, "local": local, **meta})
-        # 推进播报时钟：打断检测按这个时间线判断「还在说话」
+        # Advance the playback clock: barge-in detection reads "still speaking" off it
         self.speak.add(meta["audio_s"], text)
 
     def _log(self, turn_id, user, reply, timings, chunks, interrupted=False) -> None:
@@ -1290,25 +1355,27 @@ def build_app(cfg) -> "object":
                         vision=getattr(cfg, "vision", None),
                         speaker=getattr(cfg, "speaker", None))
     history: list[dict] = []
-    live: set = set()          # (loop, asyncio.Queue) 每个 /api/live 连接一个
-    turn_lock = threading.Lock()  # 唤醒轮与手动轮互斥（跨线程）
+    live: set = set()          # (loop, asyncio.Queue), one per /api/live connection
+    turn_lock = threading.Lock()  # wake turns and manual turns are exclusive (across threads)
     wake_ref: dict = {}
     barge_ref: dict = {}
-    # 事件环形缓冲：短轮询从这里取增量。长连接（/api/live）在浏览器/代理环境下
-    # 可能建不起来——实测就是这种情况，页面一直没连上，唤醒全被判定「没人听」。
+    # Event ring buffer: short polling reads increments from here. Long-lived
+    # connections (/api/live) may fail to establish behind browsers/proxies — that is
+    # exactly what happened in measurement, the page never connected and every wake
+    # was judged "nobody listening".
     EVENTS: deque = deque(maxlen=600)
     seq_counter = itertools.count(1)
     poll_state = {"at": 0.0, "n": 0}
-    visits = {"n": 0, "at": 0.0}  # 页面每次 health 都会 +1
+    visits = {"n": 0, "at": 0.0}  # bumped on every health call from the page
 
     def push(ev: dict) -> None:
-        """记录事件并推给长连接订阅者。"""
+        """Record the event and push it to long-lived subscribers."""
         seq = next(seq_counter)
         EVENTS.append((seq, ev))
         for loop, q in list(live):
             try:
                 loop.call_soon_threadsafe(q.put_nowait, ev)
-            except RuntimeError:  # 事件循环已关闭
+            except RuntimeError:  # event loop already closed
                 live.discard((loop, q))
 
     @app.get("/", response_class=HTMLResponse)
@@ -1371,7 +1438,7 @@ def build_app(cfg) -> "object":
 
     @app.post("/api/look")
     async def look(request: Request):
-        """手动看一眼屏幕：只做取帧 + OCR，不调 LLM。"""
+        """Manually look at the screen once: frame grab + OCR only, no LLM call."""
         try:
             payload = await request.json()
         except Exception:  # noqa: BLE001
@@ -1380,7 +1447,8 @@ def build_app(cfg) -> "object":
         if vis is None:
             raise HTTPException(503, "vision 未启用（启动时加了 --no-vision？）")
         force = bool(payload.get("force"))
-        # 取帧 + OCR 约 8 秒，必须丢线程池，否则整个事件循环（含轮询）都卡住
+        # Frame grab + OCR takes about 8 s, so it must go to a thread pool; otherwise the
+        # whole event loop (polling included) blocks
         info = await asyncio.get_running_loop().run_in_executor(
             None, lambda: vis.look(force=force))
         push({"type": "look", "info": info})
@@ -1388,7 +1456,7 @@ def build_app(cfg) -> "object":
 
     @app.post("/api/say")
     async def say(request: Request):
-        """只合成一句、不调 LLM。用来把「没声音」拆成服务端 / 浏览器两半。"""
+        """Synthesize one sentence only, no LLM call. Splits "no sound" into server / browser halves."""
         try:
             payload = await request.json()
         except Exception:  # noqa: BLE001
@@ -1400,7 +1468,8 @@ def build_app(cfg) -> "object":
                 None, lambda: cfg.tts.synth_to(text, out, hint="zh"))
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "message": f"合成失败：{e}"}
-        # 本地播报开着时，试听也走耳机，这样「试听有没有声」和「实际有没有声」是同一路径
+        # With local playback on, the test also goes to the headphones, so "is the test
+        # audible" and "is the real thing audible" follow the same path
         spk = getattr(cfg, "speaker", None)
         local = bool(spk and spk.enabled)
         if local:
@@ -1409,7 +1478,7 @@ def build_app(cfg) -> "object":
 
     @app.post("/api/route")
     async def route(request: Request):
-        """切换播报出口：local=true 播到 Jetson 的耳机，false 交给浏览器。"""
+        """Switch the playback output: local=true plays to the Jetson's headphones, false goes to the browser."""
         try:
             payload = await request.json()
         except Exception:  # noqa: BLE001
@@ -1420,7 +1489,7 @@ def build_app(cfg) -> "object":
         if "on" in payload or "local" in payload:
             spk.enabled = bool(payload.get("on", payload.get("local")))
             if not spk.enabled:
-                spk.cancel()          # 关掉时把还在排队的掐了，免得切完还念一句
+                spk.cancel()          # on off, cut what is still queued so it does not speak after the switch
         if payload.get("gain") is not None:
             try:
                 spk.gain = max(0.0, min(1.0, float(payload["gain"])))
@@ -1438,7 +1507,7 @@ def build_app(cfg) -> "object":
 
         def work():
             try:
-                with turn_lock:  # 与唤醒轮互斥：同一时刻只跑一轮
+                with turn_lock:  # exclusive with wake turns: only one turn at a time
                     runner.run(emit, wav=payload.get("wav"), text=payload.get("text"),
                                history=list(history), look=bool(payload.get("look")))
             finally:
@@ -1485,11 +1554,12 @@ def build_app(cfg) -> "object":
 
     @app.get("/api/poll")
     async def poll(after: int = 0):
-        """短轮询：返回 seq > after 的所有事件。
+        """Short polling: return every event with seq > after.
 
-        比 EventSource 笨，但没有长连接可被代理/浏览器掐断的问题，
-        400ms 一次的开销可以忽略。after 超过当前最大 seq 时空返回，
-        前端用它来「对齐到今天」，不会重放旧事件。
+        Dumber than EventSource, but it has no long-lived connection for a proxy or
+        browser to cut. One call per 400 ms is negligible cost. When after exceeds the
+        current max seq it returns empty, which the front end uses to "align to now"
+        without replaying old events.
         """
         poll_state["at"] = time.time()
         poll_state["n"] += 1
@@ -1501,10 +1571,11 @@ def build_app(cfg) -> "object":
 
     @app.get("/api/live")
     async def live_stream():
-        """常驻监听的事件流：唤醒 → 识别 → 回答 → 音频，一直不断开。
+        """Resident event stream: wake → transcribe → answer → audio, never disconnecting.
 
-        不用 POST：浏览器端用 EventSource，断线自动重连；15 秒没事件就发心跳，
-        免得中间设备把空闲连接掐掉。
+        Not POST: the browser side uses EventSource and reconnects automatically on
+        drop; after 15 s without events it sends a heartbeat, so intermediate devices
+        do not reap the idle connection.
         """
         if cfg.wake is None:
             raise HTTPException(503, "唤醒未启用（启动参数 --wake-word）")
@@ -1530,10 +1601,11 @@ def build_app(cfg) -> "object":
 
     @app.post("/api/kws_check")
     async def kws_check():
-        """录 3 秒，存成 wav 并跑一次 ASR。
+        """Record 3 s, save it as wav, and run ASR once.
 
-        用来区分「唤醒词没说对/太小」和「KWS 阈值不合适」：ASR 文本对得上，
-        说明声音本身没问题，问题在阈值；文本都不对，是发音或拾音问题。
+        Separates "the wake word was mispronounced / too quiet" from "the KWS threshold
+        is wrong": if the ASR text matches, the sound itself is fine and the threshold
+        is the problem; if the text does not match either, it is pronunciation or capture.
         """
         if cfg.wake is None or cfg.hub is None:
             raise HTTPException(503, "唤醒未启用")
@@ -1570,7 +1642,8 @@ def build_app(cfg) -> "object":
         wake_ref["loop"] = loop_thread
         loop_thread.start()
 
-        # 打断只在常驻模式下可能：手动模式录音设备由 record() 独占，没法旁听
+        # Barge-in is only possible in resident mode: in manual mode record() holds the
+        # capture device exclusively, so it cannot be listened to in parallel
         if getattr(cfg, "barge", False):
             mon = BargeMonitor(cfg.hub, cfg.asr, runner.speak, runner, history, push,
                                turn_lock, str(cfg.vad_model),
@@ -1748,8 +1821,8 @@ function showAudioBar(msg, clickable){
 }
 function hideAudioBar(){ const el = $('#audiobar'); if(el) el.style.display = 'none'; }
 
-// 浏览器对未交互过的页面会拒绝 play()（NotAllowedError）。
-// 旧代码把这个错误静默吞掉了，于是「有文字、没声音」且毫无提示。
+// Browsers refuse play() on pages the user has not interacted with (NotAllowedError).
+// The old code swallowed this error silently, so you got "text but no sound" with no hint.
 function playNext(){
   if(playing || !queue.length) return;
   playing = true;
@@ -1765,7 +1838,7 @@ function playNext(){
     playing = false;
     const name = (err && err.name) || String(err);
     if(name === 'NotAllowedError'){
-      queue.unshift(url);                        // 不丢，解锁后接着播
+      queue.unshift(url);                        // keep it; play after unlock
       showAudioBar('浏览器拦截了自动播放，所以这轮没有声音', true);
       diag('自动播放被拦截（NotAllowedError）');
     } else if(name !== 'AbortError'){
@@ -1775,7 +1848,7 @@ function playNext(){
   });
 }
 
-// 点「声音测试」：服务端合成 → 浏览器播放，一次把两半都验掉
+// Click "sound test": server synthesis → browser playback, verifying both halves at once
 async function testSound(){
   const btn = $('#aud');
   if(btn && btn.disabled) return;
@@ -1790,18 +1863,18 @@ async function testSound(){
       return;
     }
     if(j.local){
-      // 本地播报模式：这句已经在 Jetson 的耳机里出了，浏览器不要重复播
+      // local playback mode: this line already came out of the Jetson headphones, do not replay it here
       hideAudioBar();
       addTiming('声音', '耳机 ' + j.audio_s + 's');
       diag('已在 Jetson 耳机播放：' + j.voice + ' ' + j.audio_s + 's');
       return;
     }
     const a = new Audio(j.url);
-    await a.play();                              // 在点击手势内，不会被拦
+    await a.play();                              // inside the click gesture, so it is not blocked
     hideAudioBar();
     addTiming('声音', '正常 ' + j.audio_s + 's');
     diag('声音测试通过：' + j.voice + ' ' + j.audio_s + 's');
-    playing = false; playNext();                 // 把这轮欠下的音频补上
+    playing = false; playNext();                 // catch up on the audio this turn owed
   }catch(e){
     const name = (e && e.name) || String(e);
     showAudioBar('浏览器拒绝播放：' + name + ' —— 检查标签页是否被静音、系统输出设备是否正确', true);
@@ -1823,7 +1896,7 @@ function setStatus(label, rec){
   $('#talk').classList.toggle('rec', !!rec);
 }
 
-// 唤醒、手动两种入口共用同一个事件渲染
+// Wake and manual entries share the same event rendering
 function onEvent(ev){
   if(ev.type === 'state'){
     if(ev.state === 'listening'){ setStatus('聆听中…', true); }
@@ -1840,11 +1913,11 @@ function onEvent(ev){
     botText += ev.text; $('#bot').textContent = botText;
   } else if(ev.type === 'audio'){
     if(ev.idx === 1) addTiming('首句合成', ev.tts_s + 's');
-    // local=true 表示这句已经由服务端播到 Jetson 的耳机了，浏览器别再放一遍
+    // local=true means the server already played this to the Jetson headphones; do not play it again here
     if(!ev.local){ queue.push(ev.url); playNext(); }
   } else if(ev.type === 'interrupt'){
-    // 服务端听到你插话：立刻掐掉正在播的音频，剩下的不再播
-    resetTurnUI();                      // 同时把 botText 清零，新回答从头拼
+    // The server heard a barge-in: cut the audio now playing, do not play the rest
+    resetTurnUI();                      // also clears botText so the new answer starts from scratch
     setStatus('打断，请继续说…', true);
     diag('打断' + (ev.heard ? '「'+ev.heard.slice(0,12)+'」' : ''));
   } else if(ev.type === 'error'){
@@ -1870,7 +1943,7 @@ function resetTurnUI(){
 }
 
 let actx = null;
-function beep(){  // 唤醒提示音，不依赖音频文件
+function beep(){  // wake chime, no audio file needed
   try{
     actx = actx || new (window.AudioContext || window.webkitAudioContext)();
     const o = actx.createOscillator(), g = actx.createGain();
@@ -1885,7 +1958,7 @@ function beep(){  // 唤醒提示音，不依赖音频文件
 
 let pollTimer = null, lastSeq = 0, pollBusy = false;
 
-// 屏幕 OCR 结果：把识别到的文字摊开展示，耗时不藏着
+// Screen OCR result: lay out the recognized text plainly and do not hide the timing
 function showLook(info, ms){
   const card = $('#lookcard');
   if(!card) return;
@@ -1903,12 +1976,12 @@ function showLook(info, ms){
   body.textContent = info.text || '（没识别到文字）';
 }
 
-// 「看屏幕」按钮：只跑取帧 + OCR，不惊动 LLM
+// "Look at screen" button: runs frame grab + OCR only, does not involve the LLM
 async function lookNow(){
   const btn = $('#look');
   if(btn.disabled) return;
   btn.disabled = true; btn.textContent = '看屏幕…';
-  // 取帧 + OCR 要 6~8 秒，必须立刻给出可见反馈，否则看起来像卡死
+  // Frame grab + OCR takes 6~8 s; give visible feedback at once or it looks hung
   lookPending();
   try{
     const r = await fetch('/api/look', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -1923,7 +1996,7 @@ async function lookNow(){
   }
 }
 
-// 取帧期间的占位状态（语音触发和按钮触发共用）
+// Placeholder state while grabbing frames (shared by voice and button triggers)
 function lookPending(){
   const card = $('#lookcard');
   if(!card) return;
@@ -1937,9 +2010,10 @@ function handleLiveEvent(ev){
   onEvent(ev);
 }
 
-// 用短轮询而不是 EventSource：实测 EventSource 在这个环境里连不上，
-// 服务端 live 连接数一直是 0，唤醒全被当成「没人听」跳过了。
-// 400ms 一次的轮询在任何浏览器/代理下都能工作，代价可以忽略。
+// Short polling instead of EventSource: measured EventSource cannot connect in this
+// environment, the server's live connection count stayed at 0, and every wake was
+// skipped as "nobody listening". 400 ms polling works behind any browser/proxy, at
+// a negligible cost.
 async function startLive(){
   if(es) return;
   if(!wakeWord) await health();
@@ -1950,7 +2024,7 @@ async function startLive(){
   $('#talk').disabled = true;
   setStatus('连接中…', false);
   try{
-    // after 给一个超大值：只取 last，用于对齐到当前，不重放历史事件
+    // after is given a huge value: take only last, to align to now without replaying old events
     const j = await (await fetch('/api/poll?after=999999999999', {cache:'no-store'})).json();
     lastSeq = j.last || 0;
     if(!j.loop) diag('服务端唤醒线程没起来');
@@ -2033,9 +2107,9 @@ $('#talk').onclick = () => runTurn({});
 $('#live').onclick = () => { if(es) stopLive(); else startLive(); };
 $('#look').onclick = () => lookNow();
 $('#aud').onclick = () => testSound();
-$('#audiobar').onclick = () => testSound();   // 横幅本身就是「点这里启用声音」
+$('#audiobar').onclick = () => testSound();   // the banner itself means "click here to enable sound"
 
-// 播报出口：耳机（Jetson 本地播放）/ 浏览器（哪台开页面从哪台出）
+// Playback output: headphones (played locally on the Jetson) / browser (whichever machine has the page)
 let routeOn = null;
 function paintRoute(on){
   routeOn = on;
@@ -2062,7 +2136,7 @@ $('#route').onclick = async () => {
 };
 loadRoute();
 
-// 任何一次点击都算用户交互；之前被拦下的音频顺手补播
+// Any click counts as user interaction; opportunistically resume audio that was blocked earlier
 document.addEventListener('click', () => {
   const bar = $('#audiobar');
   if(bar && bar.style.display === 'block' && queue.length){ playing = false; playNext(); }
@@ -2164,7 +2238,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    # 旧音频清掉，避免累积占盘
+    # Clear old audio so it does not accumulate on disk
     now = time.time()
     for f in AUDIO_DIR.glob("*.wav"):
         try:
@@ -2200,7 +2274,7 @@ def main(argv: list[str] | None = None) -> int:
             kws = Kws(Path(args.wake_dir), args.wake_word, WORK / "wake-keywords.txt",
                       threshold=args.wake_threshold, score=args.wake_score)
             hub = AudioHub(args.device).start()
-            time.sleep(1.2)  # 等采集线程吐第一批帧，否则订阅到空缓冲
+            time.sleep(1.2)  # let the capture thread emit its first frames, or we subscribe to an empty buffer
             if hub.last_frame_at == 0.0:
                 raise RuntimeError(f"采集没起来（{args.device} 被占用？）")
             print(f"      关键词 {kws.keywords_file.name}  "
@@ -2213,7 +2287,7 @@ def main(argv: list[str] | None = None) -> int:
     elif not args.no_wake:
         print(f"      !! 找不到唤醒模型 {args.wake_dir}，跳过", flush=True)
 
-    # 视觉：懒加载 OCR 引擎（首次 look 才 import rapidocr 并建引擎）
+    # Vision: lazy-load the OCR engine (the first look imports rapidocr and builds the engine)
     vision = None
     if args.vision_dev:
         vision = vx.Vision(args.vision_dev, max_side=args.vision_side,
@@ -2226,12 +2300,14 @@ def main(argv: list[str] | None = None) -> int:
                   f"  线程 {args.vision_threads}"
                   f"  抓帧常驻={'否' if args.vision_close else '是'}"
                   f"  rec 后端={'TensorRT' if args.vision_trt else 'CPU'}", flush=True)
-            # 先把句柄打开并预热好（MS2109 前 40 帧是黑的），
-            # 这样第一次「看屏幕」不用再等 1.2 秒。失败也不影响启动。
+            # Open the handle and warm it up front (the first 40 frames from an MS2109
+            # are black), so the first "look at screen" needs no extra 1.2 s. Failure
+            # does not block startup either.
             def _vision_warm():
                 vision.prewarm()
-                # TRT 的 engine 反序列化 + CUDA context + 首次 warmup 要好几秒，
-                # 落到用户头上就是「第一次看屏幕特别慢」，后台先付掉
+                # TRT engine deserialization + CUDA context + first warmup take several
+                # seconds; on the user that shows up as "the first look at the screen is
+                # very slow", so pay it up front in the background
                 if args.vision_trt and vision.warm_ocr():
                     note = vision.trt_note or "ok"
                     print(f"      OCR 引擎就绪  rec 后端={note}"

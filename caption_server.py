@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""会议字幕：采集卡音频 → 断句 → SenseVoice → 中日双语 → 网页滚动字幕。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-与 voice_server 完全解耦，各占一个音频设备（这里用 MS2109 采集卡），互不干扰。
+"""Meeting captions: capture-card audio -> segmentation -> SenseVoice -> zh/ja bilingual -> scrolling page.
 
-    ./asr-venv/bin/python caption_server.py                       # 采集卡 → 8096
-    ./asr-venv/bin/python caption_server.py --wav test.wav        # 离线跑一个文件
+Fully decoupled from voice_server; each owns one audio device (an MS2109 capture card here) without interference.
+
+    ./asr-venv/bin/python caption_server.py                       # capture card -> 8096
+    ./asr-venv/bin/python caption_server.py --wav test.wav        # run one file offline
     ./asr-venv/bin/python caption_server.py --device plughw:CARD=H340,DEV=0
 
-设计取舍：
-- 断句用能量门限而不是 Silero：会议音频直接从 HDMI 取，是没有回声和噪声的干净信号，
-  能量法足够，且没有 VAD 状态机跨段残留的问题。
-- 每段最长 3 秒强制切：发言人不换气时不至于憋一大段一次蹦出来。实测 ASR 对 6 秒音频
-  只要 0.3 秒，真正的延迟在"等段结束"，所以段越短出字越快。
-- **原文先出，译文后补**（两段式）：识别完立刻推一行只有原文的字幕，译文由独立线程
-  算完再以补丁形式回填同一个 seq。看字延迟从"ASR+翻译"降到"只有 ASR"。
-- 三段流水线解耦：采集线程只断句，ASR 线程只识别，翻译线程只翻译。任何一环变慢都
-  只在自己队列里堆积，不会把采集卡住（旧版翻译 1 秒期间采集帧在队列里干等）。
+Design trade-offs:
+- Segment with an energy threshold instead of Silero: meeting audio comes straight off HDMI as a clean
+  signal with no echo or noise, so energy is enough and VAD state never bleeds across segments.
+- Force-cut every segment at 3s: a speaker who never breathes still won't emit one long block. Measured ASR
+  takes 0.3s for 6s of audio, so the real latency is "waiting for the segment to end" -- shorter is faster.
+- **Source first, translation patched in later** (two stages): push a source-only line as soon as recognition
+  completes, then let a separate thread patch the translation into the same seq. Time-to-text drops to ASR only.
+- Three decoupled pipeline stages: capture only segments, ASR only recognizes, translation only translates; a
+  slow stage backs up in its own queue and never stalls capture (the old code idled frames for the full 1s translation).
 """
 
 from __future__ import annotations
@@ -36,13 +39,13 @@ from pathlib import Path
 
 import numpy as np
 
-# 必须放在模块级：本文件开了 `from __future__ import annotations`，
-# 注解是字符串，FastAPI 用 get_type_hints 在模块全局里找类型；
-# 只写在函数内部的话，它认不出 Request，会把它当 query 参数。
+# Must stay at module level: this file enables `from __future__ import annotations`,
+# so annotations are strings and FastAPI resolves types via get_type_hints in module globals;
+# if declared inside a function, it wouldn't recognize Request and would treat it as a query parameter.
 from fastapi import Request  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import paths  # noqa: E402  目录约定：MC_DATA 可覆盖，见 paths.py
+import paths  # noqa: E402  directory conventions: MC_DATA can override, see paths.py
 import voice_probe as vp  # noqa: E402
 from voice_server import Asr, clean_text  # noqa: E402
 
@@ -53,17 +56,17 @@ FRAME_N = int(SR * FRAME_S)
 LANG_TAG = re.compile(r"<\|(zh|ja|en|ko|yue)\|>")
 KANA = re.compile(r"[\u3040-\u309F\u30A0-\u30FF]")
 CJK = re.compile(r"[\u4e00-\u9FFF]")
-# 有实质内容的字符。噪声段被 min_s=0.25 放过时，SenseVoice 会返回 " 。" 这种
-# 只有标点的结果——它在页面上是一行空字幕，还白白占一次翻译调用和一行 seq。
+# Characters with real content. When a noise segment slips past min_s=0.25, SenseVoice
+# returns punctuation-only output like " 。": an empty caption line that also wastes a translation call and a seq.
 SUBSTANCE = re.compile(r"[0-9A-Za-z\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]")
 
 
-# ------------------------------------------------------------------ 采集
+# ------------------------------------------------------------------ capture
 def resolve_pw_target(hint: str = "MACROSILICON") -> str:
-    """从 pw-dump 里找采集卡的 source 节点名。
+    """Find the capture card's source node name from pw-dump.
 
-    PipeWire 把这台机器上的采集卡认成了默认录音源并长期占着 PCM，
-    ALSA 直连(arecord -D plughw)会一直「设备或资源忙」；走 PipeWire 取流则不冲突。
+    PipeWire here claims the capture card as the default source and holds the PCM permanently, so a direct
+    ALSA connection (arecord -D plughw) reports "device or resource busy"; going through PipeWire is fine.
     """
     try:
         out = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=8).stdout
@@ -82,7 +85,7 @@ def resolve_pw_source(hint: str = "MACROSILICON") -> str:
 
 
 def resolve_pw_sink(hint: str = "H340") -> str:
-    """找输出节点（耳机）。默认按名字找 H340，找不到就用系统默认输出。"""
+    """Find the output node (headphones). Looks for H340 by name, else uses the system default sink."""
     try:
         out = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=8).stdout
         for node in json.loads(out):
@@ -96,10 +99,10 @@ def resolve_pw_sink(hint: str = "H340") -> str:
 
 
 class Capture:
-    """定长 20ms 帧。读线程独占设备，别处不能再开同一个 card。
+    """Fixed 20ms frames. The reader thread owns the device; nothing else may open the same card.
 
-    backend="pw" 走 PipeWire（不独占，和其他音频客户端共存）；
-    backend="alsa" 走 arecord 直连（PipeWire 没抓这个设备时可用）。
+    backend="pw" goes through PipeWire (non-exclusive, coexists with other audio clients);
+    backend="alsa" uses a direct arecord connection (useful when PipeWire is not holding the device).
     """
 
     def __init__(self, device: str, sr: int = SR, *, backend: str = "pw",
@@ -108,7 +111,7 @@ class Capture:
         self.sr = sr
         self.backend = backend
         self.target = target
-        self.frames: queue.Queue = queue.Queue(maxsize=600)   # 12 秒，满了丢最旧
+        self.frames: queue.Queue = queue.Queue(maxsize=600)   # 12 seconds; when full, drop the oldest
         self.proc: subprocess.Popen | None = None
         self.errors = 0
         self.last_error = ""
@@ -137,7 +140,7 @@ class Capture:
         while not self._stop.is_set():
             chunk = self.proc.stdout.read(nbytes - len(buf))
             if not chunk:
-                # 进程退了，把它最后那句 stderr 留下来 —— 否则只有"设备忙"三个字可猜
+                # Process exited: keep its last stderr line -- otherwise all we can guess is "device busy"
                 err = ""
                 if self.proc.poll() is not None and self.proc.stderr:
                     try:
@@ -178,16 +181,16 @@ class Capture:
 
 
 class MonitorPipe:
-    """把 HDMI 进来的声音原样回放到本机耳机（监听 / 回放）。
+    """Play HDMI audio through the local headphones unchanged (monitor / playback).
 
-    用途：电脑的 HDMI 输出全部进了采集卡，人反而听不到。这里在 Jetson 上
-    把采集卡的音频接出来播到耳机，等于给 HDMI 链路挂了一个监听口。
+    Purpose: the PC's HDMI output all lands in the capture card, so nobody hears it. Here on the Jetson
+    the card's audio is tapped out to the headphones, effectively hanging a monitor tap off the HDMI chain.
 
-    实现是 pw-record | pw-cat 两条子进程直接对接，Python 不参与搬运：
-    采样数据在内核管道里过，延迟只有两端的缓冲（各 20ms），不占 CPU。
+    Implementation: two child processes, pw-record | pw-cat, wired straight together; Python moves no bytes.
+    Samples travel through a kernel pipe, so latency is only the end buffers (20ms each) and CPU cost is nil.
 
-    为什么能同时跑：PipeWire 允许多个客户端读同一个 source，字幕服务自己
-    那条 16k 采集流不受影响（实测两路并存无冲突）。
+    Why both can run at once: PipeWire lets multiple clients read one source, so the caption service's own
+    16k capture stream is unaffected (two concurrent paths measured conflict-free).
     """
 
     def __init__(self, src: str, sink: str, rate: int = 44100,
@@ -225,7 +228,7 @@ class MonitorPipe:
                 self.play = subprocess.Popen(play_cmd, stdin=self.rec.stdout,
                                              stderr=subprocess.PIPE)
                 if self.rec.stdout:
-                    self.rec.stdout.close()     # 让 play 独占读端，避免 EOF 收不到
+                    self.rec.stdout.close()     # let play own the read end, so EOF isn't missed
             except FileNotFoundError as e:
                 self.last_error = f"找不到 {e.filename}（需要 pipewire-bin）"
                 self._kill()
@@ -257,7 +260,7 @@ class MonitorPipe:
                     p.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     p.kill()
-        # 子进程被 kill 时 drain 掉 stderr，否则僵尸管道会攒一堆符号
+        # Drain stderr after killing the children, otherwise the zombie pipe accumulates garbage
         for p in (self.play, self.rec):
             if p is not None and p.stderr:
                 try:
@@ -277,22 +280,22 @@ class MonitorPipe:
                 "error": self.last_error}
 
 
-# ------------------------------------------------------------------ 断句
+# ------------------------------------------------------------------ segmentation
 class Segmenter:
-    """能量门限 + 静音挂起。本底用开头的安静样本估，之后快降慢升。
+    """Energy threshold plus silence hold. The floor is estimated from the opening quiet samples, then drops fast, rises slow.
 
-    硬切（到 max_s）时会回头找能量最低的一帧下刀：切在音节中间会让 ASR 输出半截词，
-    "天真好"被切成"天真"就会译成"天空"。往回退到音节间隙只需几百毫秒，但错字少很多。
+    A hard cut (at max_s) looks back for the lowest-energy frame to cut on: slicing mid-syllable makes ASR emit
+    half a word ("天真好" cut to "天真" translates as "sky"); backing into a syllable gap costs a few hundred ms but kills typos.
 
-    停顿门限随段长分层（2026-11-21）：
-    固定 0.42s 门限有个两难——设紧了，说话人词间的小停顿就被切碎
-    （实测 "140 亿美元…" 被切成 "…况且140。" + "亿美元对台均售…"，数字和单位分家）；
-    设松了，一句话说完要干等近 1 秒才出字幕，延迟全砸在等待上。
-    所以按"这一段已经攒了多久"来定门槛：
-      有声 < mid_s  → 要等 hold_long_s 的长停顿才切。段还短，宁可跟下一句并一起，也不切碎。
-      有声 < long_s → 用基准 hold_s，0.4s 上下大致对应正常句间停顿。
-      有声 ≥ long_s → hold_short_s 就切。已经拖够长，短停顿也认，延迟不能再涨。
-    max_s 仍是兜底上限，但有了分层，撞上限从"常态"退化成"少数情况"。
+    The pause gate tiers by segment length (2026-11-21):
+    a fixed 0.42s gate is a dilemma -- set tight, small inter-word pauses shred the speech
+    (measured: "140 亿美元..." split into "...况且140。" + "亿美元对台均售...", number and unit parted);
+    set loose, a finished sentence waits nearly a second before captions appear and all latency goes to waiting.
+    So the gate follows "how long has this segment been accumulating":
+      voiced < mid_s  -> wait for a long hold_long_s pause. Still short: better merged with the next sentence than shredded.
+      voiced < long_s -> use the base hold_s; around 0.4s roughly matches a normal inter-sentence pause.
+      voiced >= long_s -> cut at hold_short_s. Long enough already: accept a short pause, latency must not grow.
+    max_s is still the fallback ceiling, but with tiering, hitting it degrades from "normal" to "occasional".
     """
 
     FLOOR_MIN, FLOOR_MAX = -70.0, -32.0
@@ -309,7 +312,7 @@ class Segmenter:
         self.pre_frames = max(0, int(pre_s / FRAME_S))
         self.warm_frames = max(1, int(warm_s / FRAME_S))
         self.soft_frames = max(0, int(soft_s / FRAME_S))
-        # 分层门限：长段门槛不小于基准，短段门槛不大于基准，防止有人传反了把逻辑搞死
+        # Tiered gates: long-segment gate >= base, short-segment gate <= base, so a reversed argument can't break the logic
         self.hold_long_frames = max(self.hold_frames, int(hold_long_s / FRAME_S))
         self.hold_short_frames = min(self.hold_frames,
                                      max(1, int(hold_short_s / FRAME_S)))
@@ -327,13 +330,13 @@ class Segmenter:
         self._voiced_run = 0
         self.last_db = -99.0
         self.level_db = -99.0
-        self.last_cut = ""          # "silence"=自然停顿切 / "hard"=撞上限硬切
+        self.last_cut = ""          # "silence"=cut at a natural pause / "hard"=cut at the max_s ceiling
 
     def threshold(self) -> float:
         return self.floor + self.margin_db
 
     def hold_need(self) -> int:
-        """当前这一段需要多久静音才允许断句（帧数）。段越长，要求越松。"""
+        """Silence needed (in frames) before this segment may be cut. The longer the segment, the looser the requirement."""
         voiced = len(self._cur) - self._sil
         if voiced < self.mid_frames:
             return self.hold_long_frames
@@ -346,23 +349,23 @@ class Segmenter:
 
     def push(self, frame: np.ndarray, db: float) -> np.ndarray | None:
         self.last_db = db
-        # 电平显示用慢衰减包络，别让它闪；下限 -99 免得数字静音时一路掉到 -290
+        # Slow-decay envelope for the meter so it doesn't flicker; floor at -99 so digital silence can't sink to -290
         self.level_db = max(-99.0, db, self.level_db - 1.2)
 
-        # 开头 1.2 秒只估本底、不判语音；数字静音(-91)不是有效样本
+        # First 1.2s only estimates the floor, no speech decision; digital silence (-91) is not a valid sample
         if self._warm < self.warm_frames:
             self._warm += 1
             if db > -80.0:
                 self._samples.append(db)
             if self._warm >= self.warm_frames and self._samples:
                 self.floor = self._clamp(float(np.percentile(self._samples, 10)))
-            self._pre.append(frame)             # 预热期也要留预补，别丢了第一句开头
+            self._pre.append(frame)             # keep pre-roll during warm-up too, so the first sentence's onset isn't lost
             self._pre_db.append(db)
             return None
 
-        # 快降慢升：安静时迅速贴住本底，说话时几乎不动。
-        # 数字静音（-80 以下，HDMI 无音频流时的底噪）不是"房间本底"，不参与更新，
-        # 否则 floor 会被一路拖到下限，门限烂掉，连空调声都当成人说话。
+        # Fast drop, slow rise: snap to the floor when quiet, barely move while speaking.
+        # Digital silence (below -80, the floor when HDMI has no stream) is not "room floor" and
+        # never updates it, else floor slides to the minimum and the gate rots until even AC hum counts as speech.
         if db > -80.0:
             if db < self.floor:
                 self.floor = self._clamp(0.70 * self.floor + 0.30 * db)
@@ -377,7 +380,7 @@ class Segmenter:
             self._pre_db.append(db)
             if voiced:
                 self._voiced_run += 1
-                if self._voiced_run >= 3:        # 连续 60ms 才认，挡咔哒声
+                if self._voiced_run >= 3:        # require 60ms in a row, which rejects clicks
                     self._cur = list(self._pre)
                     self._cur_db = list(self._pre_db)
                     self._pre.clear()
@@ -401,17 +404,17 @@ class Segmenter:
         return None
 
     def draft(self) -> tuple[np.ndarray, float] | None:
-        """当前这一段的草稿音频（还没断句）。
+        """Draft audio for the current segment (not yet cut).
 
-        离线 ASR 必须等整段说完才能出字，一段最长 max_s 秒，屏幕上就是
-        「动两秒、空四五秒」。草稿让屏幕在说话过程中先出灰字，段结束再换成正式结果。
+        Offline ASR produces text only after the whole segment is spoken, and a segment can run max_s seconds --
+        on screen that is "two seconds of motion, four or five of nothing"; the draft fills that gap with gray text.
         """
         if not self._cur:
             return None
         return np.concatenate(self._cur), len(self._cur) * FRAME_S
 
     def _flush(self, look_back: int = 0) -> np.ndarray:
-        """收尾。look_back>0 时在尾巴里找能量最低处下刀，剩下的留给下一段。"""
+        """Wrap up. With look_back>0, cut at the lowest-energy point in the tail, leaving the rest for the next segment."""
         cur, cur_db = self._cur, self._cur_db
         if look_back and len(cur) > look_back + self.min_frames:
             tail = cur_db[-look_back:]
@@ -434,20 +437,20 @@ class Segmenter:
 
 
 def seg_tuning(args) -> dict:
-    """分层停顿的四个调参项。集中一处，实时采集和 --wav 离线两条路径不会跑偏。"""
+    """The four tiered-pause tuning knobs. Centralized here so live capture and --wav offline cannot diverge."""
     return {"hold_long_s": getattr(args, "hold_long", 0.90),
             "hold_short_s": getattr(args, "hold_short", 0.30),
             "mid_s": getattr(args, "seg_mid", 1.20),
             "long_s": getattr(args, "seg_long", 2.40)}
 
 
-# ------------------------------------------------------------------ 翻译
-# ------------------------------------------------------------------ 去口癖
-# 只清洗「送进翻译的文本」，不改页面显示的原文：会议里逐字稿本身有价值，
-# 但语气词会让翻译模型把「嗯…那个」当成实词译出来（实测会把「嗯」译成
-# 「はい/ええ」，把「あの」译成「那个」，整句语义被带偏）。
-# 名单刻意保守：只收纯语气词。「那个项目」的「那个」、「あの人」的「あの」
-# 后面跟的是实词，靠"前后必须是标点或句界"这条规则天然排除，不必进名单猜。
+# ------------------------------------------------------------------ translation
+# ------------------------------------------------------------------ filler removal
+# Only the text handed to the translator is cleaned; the on-page source keeps every word:
+# a verbatim transcript has value in a meeting, but fillers make the model treat "嗯...那个" as content words
+# (measured: "嗯" -> "はい/ええ", "あの" -> "那个", skewing the whole sentence).
+# The list is deliberately conservative -- pure fillers only. The "那个" in "那个项目" and
+# the "あの" in "あの人" precede content words and are excluded by the "bounded by punctuation" rule.
 _FILLERS = (
     "嗯嗯", "嗯", "呃", "额", "唔", "唉", "哎",
     "えーと", "えっと", "えー", "あのー", "そのー", "んー", "あの", "その",
@@ -455,36 +458,36 @@ _FILLERS = (
 )
 _SEP = r"[\s，,、。．.!！?？…~～]"
 _FILLER_RE = re.compile(
-    rf"(?<![^{_SEP[1:-1]}])"                       # 前面是句首或标点
-    rf"(?:{'|'.join(map(re.escape, _FILLERS))})"   # 一个语气词
-    rf"(?![^{_SEP[1:-1]}])"                        # 后面也是标点或句尾
-    rf"{_SEP}*",                                   # 顺手吃掉后面的分隔符
+    rf"(?<![^{_SEP[1:-1]}])"                       # preceded by start of text or punctuation
+    rf"(?:{'|'.join(map(re.escape, _FILLERS))})"   # a single filler token
+    rf"(?![^{_SEP[1:-1]}])"                        # followed by punctuation or end of text
+    rf"{_SEP}*",                                   # swallow the trailing separators too
     re.I)
 
 
 def strip_fillers(text: str) -> str:
-    """删掉纯语气词，给翻译用。全句都是语气词时原样返回，绝不返回空串。
+    """Strip pure fillers for the translator. If the whole sentence is fillers, return it as is -- never an empty string.
 
-    「嗯，那个项目怎么样了」→「那个项目怎么样了」
-    「あの人は誰」→ 不动（あの 后面是实词）
+    「嗯，那个项目怎么样了」 -> 「那个项目怎么样了」
+    「あの人は誰」 -> untouched (あの is followed by a content word)
     """
     if not text:
         return text
     out = _FILLER_RE.sub("", text)
-    out = re.sub(rf"^{_SEP}+", "", out)            # 残留的行首标点
-    out = re.sub(r"([，,、])[，,、\s]+", r"\1", out)  # 「，，」→「，」
+    out = re.sub(rf"^{_SEP}+", "", out)            # leftover leading punctuation
+    out = re.sub(r"([，,、])[，,、\s]+", r"\1", out)  # 「，，」 -> 「，」 (collapse doubled commas)
     out = re.sub(r"[，,、]\s*([。！？!?])", r"\1", out)
     out = out.strip()
     if not re.search(r"[^\s，,、。．.!！?？…~～]", out):
-        return text                                # 删完了就退回原文
+        return text                                # everything got stripped: fall back to the original
     return out
 
 
-# 译完自查：源语言的特征还留在译文里 = 没译干净。
-# 中日互译防不住照抄，prompt 只能降低概率，必须有个确定性的检查兜底。
-# 日译中查假名是**零误报**的；中译日只能查简体专用字形（日语用繁体或不同字形：
-# 說/説、對/対、這/这、時/时、個/个）。
-# 千万别把「会」「都」「那」放进来——它们在日语里是常用汉字，会误伤正常译文。
+# Post-translation check: source-language features left in the output means it wasn't translated.
+# Prompts only lower the odds of zh/ja copy-through, so a deterministic fallback check is required.
+# For ja->zh, looking for kana is **zero false positive**; for zh->ja only Simplified-only glyphs work
+# (Japanese uses traditional or different forms: 說/説, 對/対, 這/这, 時/时, 個/个).
+# Never add 「会」「都」「那」 -- they are common kanji in Japanese and would flag valid translations.
 _LEFTOVER = {
     "zh": re.compile(r"[\u3040-\u30FF\uFF66-\uFF9F]"),
     "ja": re.compile(r"[们给这说对很没让从把么吗呢吧啊嗯呃时个]"),
@@ -495,19 +498,19 @@ _RETRY_HINT = {
     "ja": "【注意】上一版译文混入了中文。这次必须从头到尾都是日语，"
           "一个中文词都不许留（简体字「们给这说对很没让从把么吗呢吧」都是错的）。",
 }
-TR_STATS = {"retry": 0, "fixed": 0}         # 供 /api/status 观察重试命中率
+TR_STATS = {"retry": 0, "fixed": 0}         # exposes the retry hit rate via /api/status
 
 
 def lang_clean(trans: str, target: str) -> bool:
-    """译文里有没有源语言残留。没有可判据的语言直接放过。
+    """Whether a translation still carries source-language residue. Languages without a test are passed.
 
-    中译日的字符名单只能抓「混写」，抓不住**整句照抄**——「我是主持人田英和」
-    每个字都是日语也有的汉字，按字符查是干净的，可它就是没翻译。
-    所以补一条结构性判据：一句话长度的日语不可能一个假名都没有
-    （助词 は/が/を/に/の、语尾 です/ます 必然带假名）。纯汉字 ≥6 字判脏。
+    For zh->ja the character list only catches "mixed writing", not **whole-sentence copying**: 「我是主持人田英和」
+    is all kanji that Japanese also uses, so a character scan looks clean although nothing was translated.
+    Hence a structural test: sentence-length Japanese cannot be kana-free
+    (particles は/が/を/に/の and endings です/ます necessarily carry kana). Pure kanji >= 6 chars counts as dirty.
 
-    日译中反过来要防误伤：专有名词按规则可以保留原文写法（「深セン」是深圳的
-    日文写法），少量假名夹在大段中文里是正常的，不该为此白跑一次重试。
+    For ja->zh the risk is the opposite, false positives: proper nouns may keep their original form
+    (「深セン」 is the Japanese spelling of Shenzhen), so a few kana in long Chinese text should not burn a retry.
     """
     if target == "ja" and len(trans) >= 6 and not re.search(r"[\u3040-\u30FF]", trans):
         return False
@@ -516,20 +519,20 @@ def lang_clean(trans: str, target: str) -> bool:
         if kana == 0:
             return True
         cjk = len(re.findall(r"[\u4e00-\u9FFF]", trans))
-        return kana <= 3 and cjk >= kana * 2      # 少量假名 + 大段汉字 = 专有名词
+        return kana <= 3 and cjk >= kana * 2      # a few kana + a long run of kanji = proper noun
     pat = _LEFTOVER.get(target)
     return True if pat is None else pat.search(trans) is None
 
 
-# Magnitude 的 /inference/v1 要 Bearer 鉴权，vLLM 不需要。由 --llm-key 设置。
+# Magnitude's /inference/v1 requires Bearer auth; vLLM does not. Set via --llm-key.
 _LLM_KEY = ""
 
-# 翻译 prompt 的档位：full（带反例的长版，7B 时代调出来的）/ short（35B 短版）。
-# 实测见 README 4.19：短版把 system 从 ~250 token 压到 ~70 token。
+# Translation prompt tier: full (long version with counter-examples, tuned in the 7B era) /
+# short (the 35B short version). Measured in README 4.19: short cuts system from ~250 tokens to ~70.
 TR_STYLE = "full"
 
-# 最近一次 translate_stream 拿到的引擎侧 timings（prompt_n / cache_n / prompt_ms）。
-# 只给离线工具做判据用，不参与业务逻辑。
+# Engine-side timings from the latest translate_stream call (prompt_n / cache_n / prompt_ms).
+# Used only as evidence by offline tools; not part of the business logic.
 LAST_TIMINGS: dict = {}
 
 
@@ -541,15 +544,15 @@ def _llm_headers() -> dict:
 
 
 def _tr_system_short(target: str) -> str:
-    """35B 专用短版（~100 字）。只保留三条硬规则，示例和语气词规则全砍。
+    """Short version for the 35B model (~100 chars). Only three hard rules survive; examples and filler rules are cut.
 
-    为什么可以砍：完整的 `_tr_system` 是靠「给反例 + 译完自查」压住中日汉字互抄，
-    但这份 prompt 有 250~300 token，是每句请求里最大的一块固定成本。35B-A3B 的
-    prefill 要读几乎全部专家，token 数直接换算成毫秒，所以先量「砍掉示例还守不守得住」。
-    三条不能砍的：
-    - 纯目标语言 + 中日共用汉字的陷阱（不给反例时最弱的一环，靠措辞硬顶）
-    - 按上文纠同音错字（否则忠实翻译错字）
-    - 半句译半句（段被切短后大量是半句）
+    Why that is safe: the full `_tr_system` suppresses zh/ja kanji copy-through with "counter-examples + self-check",
+    but it costs 250-300 tokens, the largest fixed cost in every request. 35B-A3B prefill reads nearly all
+    experts, so token count converts straight to milliseconds -- hence measuring "does it hold without examples".
+    The three rules that cannot go:
+    - target-language-only plus the shared-kanji trap (weakest link without examples; held up by wording alone)
+    - fix homophone typos from context (otherwise the typo gets translated faithfully)
+    - translate a half sentence as a half sentence (short segments produce many of them)
     """
     zh = (
         "你是中日会议同传。把【本句】译成纯中文，只输出译文一行，不加解释。\n"
@@ -570,15 +573,15 @@ def _tr_system_short(target: str) -> str:
 
 
 def _tr_system(target: str, style: str | None = None) -> str:
-    """翻译用 system prompt。两种目标语言各一份，前缀固定才能命中 vLLM 缓存。
+    """System prompt for translation. One per target language; a fixed prefix is what hits the vLLM cache.
 
-    为什么写成这样（都是实测踩出来的）：
-    - **中日共用汉字是最容易翻车的地方**。7B 模型遇到「坚持」「好处」「主持人」
-      这类词会直接照抄，输出一句汉字完全正确、语法全错的"日语"。光说
-      "必须是纯目标语言"守不住，必须给具体反例，并且要求译完自查。
-    - **ASR 同音错字要显式授权它改**。不说的话模型会忠实翻译错字
-      （「中方科意」→「中国側は科意」，一个不存在的词）。
-    - 反例用实测抓到的真实坏输出，模型的模仿倾向比抽象规则强。
+    Why it looks like this (all learned the hard way):
+    - **Shared zh/ja kanji is where things break most**. A 7B model copies words like 「坚持」「好处」「主持人」
+      verbatim and emits "Japanese" with flawless kanji and broken grammar. Saying "must be pure target
+      language" is not enough: concrete counter-examples plus a self-check are required.
+    - **ASR homophone typos must be explicitly delegated for fixing**. Otherwise the model translates the
+      typo faithfully ("中方科意" -> "中国側は科意", a word that doesn't exist).
+    - Counter-examples use real bad outputs captured in testing; imitation beats abstract rules.
     """
     if (style or TR_STYLE) == "short":
         return _tr_system_short(target)
@@ -633,10 +636,10 @@ def _tr_system(target: str, style: str | None = None) -> str:
             f"原文可能有语音识别错字，按上下文纠正后翻译；半句就译成半句，不要补完。")
 
 
-# Qwen3.5 系的 chat template 只要 enable_thinking 没定义就走 thinking 分支，
-# 于是 max_tokens=200 全烧在思考里、content 一直是空串，字幕表现为「没有译文」，
-# 而且每句都要等满 timeout 才放弃（实测每行间隔 9~10 秒）。所以默认显式关掉。
-# Qwen2.5 的模板不认这个变量，传了也无害。要跑思考模式加 --llm-think。
+# Qwen3.5 chat templates take the thinking branch whenever enable_thinking is undefined, so
+# max_tokens=200 burns on reasoning and content stays empty -- captions show "no translation" and
+# every line waits out the full timeout (measured 9~10s between lines). So it is disabled explicitly.
+# Qwen2.5 templates ignore the variable, so passing it is harmless. Add --llm-think to enable thinking.
 LLM_THINK = False
 
 
@@ -647,11 +650,11 @@ def _think_kw() -> dict:
 
 def translate(base: str, model: str, text: str, target: str, timeout: float = 12.0,
               ctx: str = "", hint: str = "") -> str:
-    """只输出译文，短句直译。失败返回空串，不阻塞字幕。
+    """Output the translation only, short sentences read literally. Returns "" on failure so captions never block.
 
-    ctx 是前一两句原文：段被切短后单句常常是半句，带上文能让术语、人称、语气对上，
-    也是模型能纠正同音错字的唯一依据（单看半句「中方科意」无从判断是「刻意」）。
-    hint 是重试时追加的强化指令，只在 lang_clean() 判脏之后用。
+    ctx is the previous one or two source lines: short segments are often half sentences, and context aligns
+    terminology, person, and tone; it is also the model's only basis for fixing homophone typos (a bare half
+    sentence like "中方科意" gives no way to tell it means 「刻意」). hint is the retry reinforcement, used after lang_clean().
     """
     sys = _tr_system(target)
     user = f"【上文】{ctx}\n【本句】{text}" if ctx else text
@@ -682,17 +685,17 @@ def translate_stream(base: str, model: str, text: str, target: str,
                      timeout: float = 12.0, ctx: str = "",
                      on_delta=None, hint: str = "",
                      screen_hint: str = "") -> tuple[str, int, int]:
-    """流式版翻译：边收边回调，返回 (全文, 首字ms, 总ms)。
+    """Streaming translation: call back as chunks arrive, return (full text, first-token ms, total ms).
 
-    为什么要流式：vLLM 的 system prompt 被前缀缓存，**首字只要 ~96ms**，
-    但整句要 300~1300ms（慢的是逐 token 生成，不是 prefill）。所以让译文
-    逐字浮现，用户看到第一个字的时间提前 3~7 倍，而总耗时完全不变。
+    Why stream: vLLM prefix-caches the system prompt, so the **first token takes only ~96ms** while the
+    full sentence takes 300~1300ms (the slow part is per-token generation, not prefill). Letting the
+    translation surface character by character makes time-to-first-character 3~7x faster at identical total cost.
 
-    中间态不做 strip 清理（会闪烁），只在结束时清一次。
+    Intermediate states are not stripped (that would flicker); cleaning happens once at the end.
     """
     sys = _tr_system(target)
     user = f"【上文】{ctx}\n【本句】{text}" if ctx else text
-    # 屏幕提示只在本句有「同音异字候选」时才非空：平时一个 token 都不加
+    # The screen hint is non-empty only when this sentence has a homophone candidate; otherwise not a single token is added
     if screen_hint:
         user += "\n" + screen_hint
     if hint:
@@ -716,7 +719,7 @@ def translate_stream(base: str, model: str, text: str, target: str,
     dbg: dict = {}
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            t_hdr = int((time.time() - t0) * 1000)   # 连上并拿到响应头
+            t_hdr = int((time.time() - t0) * 1000)   # connected and response headers received
             for raw in r:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
@@ -741,24 +744,24 @@ def translate_stream(base: str, model: str, text: str, target: str,
                     try:
                         on_delta("".join(parts))
                     except Exception:  # noqa: BLE001
-                        pass          # 推送失败绝不能让翻译线程崩
+                        pass          # a failed push must never crash the translation thread
     except Exception:  # noqa: BLE001
-        # 已经收到的部分仍然返回：半句译文比空白有用
+        # Still return whatever arrived: a partial translation beats a blank
         pass
     total_ms = int((time.time() - t0) * 1000)
-    # 最近一次的引擎侧 timings。离线工具（wav_seg_ab / ttft_prompt_ab）要拿
-    # prompt_n / cache_n 做判据，又不想自己重写一份请求体，就从这里取。
+    # Engine-side timings from the latest call. Offline tools (wav_seg_ab / ttft_prompt_ab) want
+    # prompt_n / cache_n as evidence but don't want to rebuild the request body, so they read it here.
     global LAST_TIMINGS
     LAST_TIMINGS = dbg or {}
     if os.environ.get("CAP_DEBUG"):
-        # 分段定位：hdr=连上并拿到响应头，ttft=第一个字，total=整句
+        # Stage breakdown: hdr=connected and headers received, ttft=first token, total=whole sentence
         print(f"[tr] hdr={t_hdr}ms ttft={ttft_ms}ms total={total_ms}ms "
               f"| srv prompt_n={dbg.get('prompt_n')} cache_n={dbg.get('cache_n')} "
               f"prompt_ms={dbg.get('prompt_ms')} ttft_ms={dbg.get('time_to_first_token_ms')}",
               flush=True)
     final = "".join(parts).strip().strip('"“”「」 ')
-    # 检出源语言残留就重试一次（非流式，带强化指令）。仍脏则保留首版——
-    # 半句混语言的译文也比空白强，而且重试不能无限循环拖住翻译线程。
+    # Source-language residue triggers one retry (non-streaming, with the reinforcement hint).
+    # Still dirty -> keep the first version: a mixed half sentence beats a blank, and retrying must not stall the thread.
     if final and not lang_clean(final, target):
         TR_STATS["retry"] += 1
         alt = translate(base, model, text, target, timeout=timeout, ctx=ctx,
@@ -768,45 +771,45 @@ def translate_stream(base: str, model: str, text: str, target: str,
             total_ms = int((time.time() - t0) * 1000)
             if on_delta is not None:
                 try:
-                    on_delta(alt)          # 整行替换成干净版本，前端 applyUpd 本就整行替换
+                    on_delta(alt)          # replace the whole line with the clean version; applyUpd already replaces wholesale
                 except Exception:  # noqa: BLE001
                     pass
             return alt, ttft_ms, total_ms
     return final, ttft_ms, total_ms
 
 
-# ------------------------------------------------------------------ 屏幕词表
-# 屏幕上现成的字（幻灯片标题、下三分之一人名条、窗口标题）是纠正 ASR 专有名词
-# 最便宜的来源——它不花一个 token，只要判断「ASR 是不是把屏幕上的词听成了同音异字」。
+# ------------------------------------------------------------------ screen term hints
+# Text already on screen (slide titles, lower-third name straps, window titles) is the cheapest
+# source of proper-noun correction for ASR -- zero tokens, you only judge "is this a homophone".
 #
-# 但**不能每句都塞一段屏幕文字**（2026-11-21 实测否定）：
-#   - 代价：60 字 → prompt 多 72 token → 首字 490→740ms；120 字更贵
-#   - 效果：6 句里 5 句被改写，其中 3 句变差（「三社」→「首次会谈」、凭空冒出
-#     「三家公司」、重复「特朗普那边」），因为屏幕里既有我们自己的页面（自我循环，
-#     把上一句译文当屏幕内容喂回去），又有与本句毫无关系的图文
-# 所以这里只做「按需提示」：屏幕词与本句某段**读音高度相似但写法不同**时才给一句话，
-# 每段最多一个词；没有命中就一个字都不加（零代价、零污染）。
+# But **you must not stuff screen text into every sentence** (measured and rejected 2026-11-21):
+#   - cost: 60 chars -> 72 extra prompt tokens -> first token 490->740ms; 120 chars is worse
+#   - effect: 5 of 6 sentences rewritten, 3 of them for the worse ("三社" -> "首次会谈",
+#     "三家公司" invented from nowhere, "特朗普那边" repeated), because the screen holds both our own
+#     page (self-loop: the previous translation fed back as screen content) and images unrelated to the sentence
+# So this only does "on-demand hints": emit one line only when a screen term and a span of this
+# sentence are **phonetically close but written differently**, one term per span; no hit, add nothing.
 _SCREEN_UI = ("会议字幕", "设备", "已识别", "延迟", "首字", "译完", "双语", "正在听",
               "停止", "清屏", "正在说", "运行中", "搜索", "创建", "Chrome",
               "youtube.com", "dB")
 
 _SCREEN_RES = (
-    re.compile(r"[0-9]{4,}"),                            # 年份/金额/期数
-    re.compile(r"[ァ-ヴー]{4,10}"),                      # 片假名名词
-    re.compile(r"[一-龥]{3,8}"),                         # 汉字串（人名、机构、术语）
+    re.compile(r"[0-9]{4,}"),                            # years / amounts / issue numbers
+    re.compile(r"[ァ-ヴー]{4,10}"),                      # katakana nouns
+    re.compile(r"[一-龥]{3,8}"),                         # kanji runs (names, organizations, terminology)
 )
-# 为什么没有拉丁字母：OpenJTalk 会把 "CloudflareObservability" 逐字母读成 50 拍
-# 「しーえるおー…」，永远撞不上日语读音，只会把词表挤满邮箱地址与网址
-# （实测 40 条候选全是这类垃圾）。屏幕上的英文词若 ASR 也写对了，本就不需要提示；
-# 若被听成片假名，靠读音也救不回来 —— 那种情况该走 ASR 热词，不是这条路。
+# Why no Latin letters: OpenJTalk reads "CloudflareObservability" letter by letter into 50 morae
+# ("しーえるおー..."), never matching a Japanese reading, and just fills the list with emails and URLs
+# (measured: 40 candidates, all such junk). An English word on screen that ASR already wrote correctly
+# needs no hint; if it was heard as katakana, phonetics can't save it -- that case belongs to ASR hotwords.
 _SCREEN_JUNK = ("@", "://", ".com", ".cn", ".jp", ".biz", ".net", "www.")
-# 简体外挂字：聊天窗口/中文界面上的字混进日语会议的词表只会制造假命中。
-# 出现两个以上才算中文行（日语里「的」偶尔出现，单个不能判）。
+# Simplified-Chinese marker chars: text from chat windows or a Chinese UI mixed into a Japanese meeting's
+# term list only creates false hits. Two or more marks a line as Chinese (Japanese does use 「的」, so one can't decide).
 _SCREEN_CN = "这们为说时个还就没都很地对吗呢吧啊从给过应该"
 
 
 def _hira(s: str) -> str:
-    """片假名转平假名，只留能比读音的字符（标点、拉丁、数字都不参与比较）。"""
+    """Katakana to hiragana, keeping only characters whose reading can be compared (punctuation, Latin, digits are skipped)."""
     out = []
     for ch in s or "":
         o = ord(ch)
@@ -818,7 +821,7 @@ def _hira(s: str) -> str:
 
 
 def _lev(a: str, b: str) -> int:
-    """编辑距离。只关心 ≤1，长度差超过 1 直接判 9（省掉整张表）。"""
+    """Edit distance. Only <=1 matters; a length gap over 1 short-circuits to 9 (skipping the whole table)."""
     if a == b:
         return 0
     if abs(len(a) - len(b)) > 1:
@@ -833,11 +836,11 @@ def _lev(a: str, b: str) -> int:
 
 
 class ScreenHints:
-    """后台隔几秒看一眼屏幕，压成一张词表，按需给翻译递一句提示。
+    """Look at the screen every few seconds in the background, compress it into a term list, hint the translator on demand.
 
-    为什么不自己开采集卡：`/dev/video0` 是独占的，voice-bench 常驻持有它。
-    所以这里走 voice-bench 的 `/api/look`（它内部有 dHash 缓存，同一画面近乎免费），
-    字幕服务不碰设备、也不引入 opencv/OCR 依赖。
+    Why not open the capture card directly: `/dev/video0` is exclusive and voice-bench holds it permanently.
+    So this goes through voice-bench's `/api/look` (which caches by dHash, making the same frame nearly free);
+    the caption service never touches the device and pulls in no opencv/OCR dependency.
     """
 
     def __init__(self, api: str = "http://127.0.0.1:8095/api/look",
@@ -848,7 +851,7 @@ class ScreenHints:
         self.max_terms = max(4, max_terms)
         self.timeout = timeout
         self.recent = recent or (lambda: [])
-        self._reader = reader          # 测试注入：text -> [(surface, 平假名读音)]
+        self._reader = reader          # test injection: text -> [(surface, hiragana reading)]
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._t: threading.Thread | None = None
@@ -863,12 +866,12 @@ class ScreenHints:
         self.last_err = ""
         self.last_hint = ""
 
-    # ------------------------------------------------------------ 读音
+    # ------------------------------------------------------------ readings
     def _morphemes(self, text: str) -> list[tuple[str, str]]:
         if self._reader is not None:
             return list(self._reader(text))
         try:
-            import pyopenjtalk            # 语音助理的 TTS 已经带了，不额外装
+            import pyopenjtalk            # already shipped with the voice assistant's TTS, no extra install
         except Exception:                 # noqa: BLE001
             self.last_err = "没有 pyopenjtalk，屏幕提示不可用"
             return []
@@ -882,7 +885,7 @@ class ScreenHints:
     @staticmethod
     def _windows(morphs: list[tuple[str, str]],
                  max_join: int = 4, max_mora: int = 14):
-        """把词素拼成 1~4 个词素的窗口，只留读音 4 拍以上的（太短必然撞车）。"""
+        """Join morphemes into windows of 1~4, keeping only readings of 4+ morae (shorter ones always collide)."""
         out = []
         for i in range(len(morphs)):
             surf, rd = "", ""
@@ -895,7 +898,7 @@ class ScreenHints:
                     out.append((surf, rd))
         return out
 
-    # ------------------------------------------------------------ 取屏幕
+    # ------------------------------------------------------------ grabbing the screen
     def _keep(self, lines: list[str]) -> list[str]:
         recent = [re.sub(r"\s+", "", x) for x in self.recent() if x]
         out = []
@@ -905,11 +908,11 @@ class ScreenHints:
                 continue
             if any(w in ln for w in _SCREEN_UI):
                 continue
-            if any(w in ln for w in _SCREEN_JUNK):   # 邮箱/网址整行都不值钱
+            if any(w in ln for w in _SCREEN_JUNK):   # emails / URLs: the whole line is worthless
                 continue
-            if sum(ln.count(c) for c in _SCREEN_CN) >= 2:   # 中文界面/聊天窗口
+            if sum(ln.count(c) for c in _SCREEN_CN) >= 2:   # Chinese UI / chat window
                 continue
-            # 与最近字幕有 8 字以上共同子串 → 认为是从我们自己页面抄来的，丢掉
+            # 8+ chars in common with a recent caption -> assumed copied from our own page, drop it
             flat = re.sub(r"\s+", "", ln)
             junk = False
             for r in recent:
@@ -924,7 +927,7 @@ class ScreenHints:
         return out
 
     def set_text(self, text: str) -> None:
-        """把一屏 OCR 文本压成词表（过滤 UI/自我循环 + 取读音 + 封顶条数）。"""
+        """Compress one screen of OCR text into a term list (filter UI and self-loop, take readings, cap the count)."""
         lines = [x for x in (text or "").splitlines() if x.strip()]
         self.lines_n = len(lines)
         kept = self._keep(lines)
@@ -936,10 +939,10 @@ class ScreenHints:
                     if w in seen:
                         continue
                     rd = "".join(r for _s, r in self._morphemes(w))
-                    if not 4 <= len(rd) <= 14:   # 太短必撞车、太长读不准
+                    if not 4 <= len(rd) <= 14:   # too short always collides, too long reads inaccurately
                         continue
                     seen[w] = rd
-        # 长读音优先：越长越具体，越不容易误命中
+        # Longer readings first: the longer it is, the more specific and the less likely a false hit
         terms = sorted(seen.items(), key=lambda kv: -len(kv[1]))[:self.max_terms]
         with self._lock:
             self.terms = terms
@@ -977,9 +980,9 @@ class ScreenHints:
     def stop(self) -> None:
         self._stop.set()
 
-    # ------------------------------------------------------------ 命中
+    # ------------------------------------------------------------ hits
     def suggest(self, text: str) -> str:
-        """有命中就返回一句提示，否则空串（空串 = 请求体一个 token 都不加）。"""
+        """Return one hint line on a hit, otherwise "" (an empty string adds zero tokens to the request)."""
         with self._lock:
             terms = list(self.terms)
         if not terms or len(text) < 4:
@@ -988,14 +991,14 @@ class ScreenHints:
         if not wins:
             return ""
         for word, wrd in terms:
-            if word in text:              # 已经写对了，不必提示
+            if word in text:              # already written correctly, no hint needed
                 continue
             for surf, rd in wins:
                 if surf == word or abs(len(rd) - len(wrd)) > 1:
                     continue
-                # 至少共用一个字：同音异字的真实形态是「畔蒜泰助 / 阪井泰介」（共用「泰」）、
-                # 「小委員会 / 小委部」（共用「小委」）。一个字都不共用的纯读音巧合几乎
-                # 都是假命中（尤其中文界面词被 OpenJTalk 硬读出日语读音时）。
+                # Share at least one character: real homophones look like 「畔蒜泰助 / 阪井泰介」 (share 「泰」)
+                # or 「小委員会 / 小委部」 (share 「小委」). Coincidences that share no character are almost
+                # always false hits (especially when Chinese UI terms are forced into Japanese readings by OpenJTalk).
                 if not (set(surf) & set(word)):
                     continue
                 if _lev(rd, wrd) <= 1:
@@ -1016,14 +1019,14 @@ class ScreenHints:
                 "last_hint": self.last_hint or None}
 
 
-# ------------------------------------------------------------------ 引擎
+# ------------------------------------------------------------------ engine
 class Captioner:
-    """识别 + 双语字幕。
+    """Recognition plus bilingual captions.
 
-    在线路径是三段流水：`submit()` 入队 → asr 线程识别 → 立刻落一行只有原文的字幕
-    → 翻译线程流式回填同一行的 `trans`（首字 ~96ms 就推上去），并登记补丁给前端。
-    看字不用等翻译，更不用等译文整句生成完。
-    离线路径 `handle()` 同步跑完，行为等价，供 wav 自测和单测用。
+    The online path is a three-stage pipeline: `submit()` enqueues -> the asr thread recognizes -> a
+    source-only caption line lands immediately -> the translation thread streams `trans` back into the same
+    line (first token pushed at ~96ms) and registers a patch for the frontend; text never waits for translation.
+    The offline path `handle()` runs synchronously with equivalent behavior, for wav self-tests and unit tests.
     """
 
     def __init__(self, asr: Asr, *, bilingual: bool = True,
@@ -1033,7 +1036,7 @@ class Captioner:
                  draft_every: float = 0.8, screen=None):
         self.asr = asr
         self.bilingual = bilingual
-        # 屏幕词表（可选）。命中才给翻译递一句提示，见 ScreenHints 的注释。
+        # Screen term hints (optional). A hint is passed to the translator only on a hit; see ScreenHints.
         self.screen = screen
         self.llm_base = llm_base
         self.llm_model = llm_model
@@ -1055,14 +1058,14 @@ class Captioner:
         self._q_tr: queue.Queue = queue.Queue(maxsize=64)
         self._updates: collections.deque = collections.deque(maxlen=120)
         self._lock = threading.RLock()
-        # 草稿线程和正式识别共用同一个 recognizer。sherpa-onnx 支持多线程各自
-        # create_stream，但两路同时 decode 会抢 CPU 核；串行一下，代价只是草稿
-        # 让路 200ms，换来正式链路的 lag 稳定。
+        # The draft thread and real recognition share one recognizer. sherpa-onnx supports per-thread
+        # create_stream, but decoding both at once fights over CPU cores; serializing costs the draft
+        # only a 200ms yield while keeping the real path's lag stable.
         self._asr_lock = threading.Lock()
         self._started = False
 
-        # 草稿字幕：说话过程中先出灰字，段结束后被正式行替换。
-        # 单槽队列（只留最新），草稿识别慢于说话节奏时自然丢掉过期的，绝不排队堆积。
+        # Draft captions: gray text while speaking, replaced by the final line when the segment ends.
+        # Single-slot queue (newest only): when draft recognition lags the speech rate, stale ones are dropped, never queued.
         self.draft_on = draft_on
         self.draft_every = draft_every
         self.draft_text = ""
@@ -1088,10 +1091,10 @@ class Captioner:
             threading.Thread(target=self._draft_loop, name="draft", daemon=True).start()
 
     def submit(self, pcm: np.ndarray, dur: float, end_ts: float | None = None) -> None:
-        """采集线程只负责把段丢进来，绝不在这里等识别。"""
+        """The capture thread only drops segments in here; it never waits for recognition."""
         if not self._started:
             self.start_workers()
-        # 这一段已定稿：草稿作废，正在跑的那次草稿识别结果回来也会被 epoch 挡掉
+        # This segment is final: the draft is void, and any draft result still in flight is rejected by epoch
         with self._lock:
             self.draft_epoch += 1
             self.draft_text = ""
@@ -1099,7 +1102,7 @@ class Captioner:
         try:
             self._q_asr.put_nowait(item)
         except queue.Full:
-            # 宁可丢最老的一段，也不能让字幕越拖越远（会议里迟到 10 秒的字幕等于没有）
+            # Rather drop the oldest segment than let captions drift further behind (10s-late captions are worthless)
             self.dropped += 1
             try:
                 self._q_asr.get_nowait()
@@ -1111,10 +1114,10 @@ class Captioner:
                 pass
 
     def push_draft(self, pcm: np.ndarray, dur: float) -> None:
-        """采集线程把「当前段到目前为止的音频」丢进来做草稿识别。
+        """The capture thread drops "the current segment's audio so far" in for draft recognition.
 
-        单槽：草稿是给人看的临时状态，旧的一律没用，来了新的就顶掉旧的。
-        绝不排队——排队会让草稿越拖越落后，最后显示的是几秒前的话。
+        Single slot: a draft is a temporary state for humans, old ones are worthless, a new one replaces it.
+        Never queue -- queuing makes the draft fall further and further behind until it shows speech from seconds ago.
         """
         if not (self.draft_on and self._started):
             return
@@ -1131,7 +1134,7 @@ class Captioner:
     def _draft_loop(self) -> None:
         while True:
             pcm, _dur, ep = self._q_draft.get()
-            # 有正式段在排队时草稿毫无意义（马上就会被真实结果替换），直接让路
+            # A draft is meaningless while a real segment is queued (it will be replaced right away), so step aside
             if not self._q_asr.empty():
                 continue
             t0 = time.time()
@@ -1143,7 +1146,7 @@ class Captioner:
             self.draft_ms = int((time.time() - t0) * 1000)
             self.drafts += 1
             with self._lock:
-                # 识别期间这一段可能已经定稿了（submit 会 epoch+1），结果作废
+                # The segment may have gone final during recognition (submit bumps epoch), so drop the result
                 if ep != self.draft_epoch:
                     continue
                 self.draft_text = text
@@ -1151,7 +1154,7 @@ class Captioner:
                 print(f"  [草稿] {self.draft_ms}ms {lang} {text}", flush=True)
 
     def take_updates(self) -> list[dict]:
-        """译文补丁：前端取走即清空。行对象里的 trans 也会回填，历史照样完整。"""
+        """Translation patches: drained on read. The line object's trans is also patched, so history stays complete."""
         out: list[dict] = []
         with self._lock:
             while self._updates:
@@ -1160,10 +1163,10 @@ class Captioner:
 
     def _push_update(self, seq: int, trans: str, final: bool,
                      trans_ms: int = 0, ttft_ms: int = 0) -> None:
-        """登记一条译文补丁；同一个 seq 只保留最新一条。
+        """Register a translation patch; only the newest one per seq is kept.
 
-        前端是 250ms 轮询，而流式每 ~80ms 就有一个增量。如果不合并，
-        一次 poll 会拿到同一行的 3 条中间态，页面白重绘 2 次。
+        The frontend polls every 250ms while streaming emits a delta every ~80ms. Without merging, one poll
+        would receive 3 intermediate states for the same line and the page would repaint twice for nothing.
         """
         with self._lock:
             for u in self._updates:
@@ -1185,8 +1188,8 @@ class Captioner:
             self.draft_epoch += 1
 
     def _ctx_before(self, seq: int) -> str:
-        # ctx_lines=0 必须真的「不带上文」：[-0:] 等于 [0:] 会把全部历史都塞进去，
-        # 曾经把 prompt 从 80 token 涨到 138，首字多花 300ms。
+        # ctx_lines=0 must really mean "no context": [-0:] equals [0:] and would stuff in the whole history,
+        # which once inflated the prompt from 80 to 138 tokens and added 300ms to the first token.
         if self.ctx_lines <= 0:
             return ""
         with self._lock:
@@ -1194,7 +1197,7 @@ class Captioner:
         return " / ".join(prev)
 
     def recognize(self, pcm: np.ndarray) -> tuple[str, str]:
-        """返回 (文本, 语种)。语种从 SenseVoice 的 <|ja|> 标签取，取不到就按字形猜。"""
+        """Return (text, language). Language comes from SenseVoice's <|ja|> tag; if absent, guess from the script."""
         x = vp.highpass(pcm.astype(np.float64), 150.0, SR, 2)
         s = self.asr.rec.create_stream()
         s.accept_waveform(SR, (x / vp.FULL_SCALE).astype(np.float32))
@@ -1203,7 +1206,7 @@ class Captioner:
         m = LANG_TAG.search(raw)
         lang = m.group(1) if m else ("ja" if KANA.search(raw) else "zh" if CJK.search(raw) else "")
         text = clean_text(raw)
-        if not SUBSTANCE.search(text):          # 只剩标点/空白 = 噪声段，不是一句话
+        if not SUBSTANCE.search(text):          # punctuation / whitespace only = noise segment, not a sentence
             return "", lang
         return text, lang
 
@@ -1243,7 +1246,7 @@ class Captioner:
         while True:
             line = self._q_tr.get()
             target = "ja" if line["lang"] == "zh" else "zh"
-            # 只清洗送进翻译的文本，line["text"]（页面显示）保持逐字
+            # Clean only the text handed to the translator; line["text"] (shown on the page) stays verbatim
             ctx = strip_fillers(self._ctx_before(line["seq"]))
             src = strip_fillers(line["text"])
             seq = line["seq"]
@@ -1262,16 +1265,16 @@ class Captioner:
                 self._push_update(seq, trans, True, dt, 0)
                 continue
 
-            # 流式：首字 ~96ms 就推上去，整句 300~1300ms 才完
+            # Streaming: first token pushed at ~96ms, the whole sentence completes in 300~1300ms
             state = {"last": 0.0, "last_len": 0}
-            # 屏幕词表：只有「读音对得上、写法不同」才递一句提示；否则空串，零代价
+            # Screen term hints: a hint only when "the reading matches but the spelling differs"; otherwise "", zero cost
             sh = self.screen.suggest(src) if self.screen is not None else ""
             if sh:
                 line["screen_hint"] = sh
 
             def on_delta(txt: str, _seq=seq, _line=line, _st=state) -> None:
                 now = time.time()
-                # 节流到 ~80ms 或 +4 字；推送本身会按 seq 合并，多推不会造成重绘
+                # Throttle to ~80ms or +4 chars; pushes merge by seq anyway, so extra ones don't cause repaints
                 if now - _st["last"] < 0.08 and len(txt) - _st["last_len"] < 4:
                     return
                 _st["last"] = now
@@ -1294,7 +1297,7 @@ class Captioner:
             self._push_update(seq, trans, True, total, ttft)
 
     def handle(self, pcm: np.ndarray, dur: float) -> dict | None:
-        """同步跑完一段：离线 wav 自测用。在线路径走 submit()。"""
+        """Run one segment synchronously: for offline wav self-tests. The online path uses submit()."""
         t0 = time.time()
         try:
             text, lang = self.recognize(pcm)
@@ -1325,7 +1328,7 @@ class Captioner:
         return line
 
     def draft_state(self) -> dict:
-        """草稿行当前该显示什么。空字符串=没有草稿，前端据此清掉灰色行。"""
+        """What the draft line should show right now. An empty string means no draft; the frontend clears the gray line."""
         with self._lock:
             return {"text": self.draft_text, "epoch": self.draft_epoch,
                     "ms": self.draft_ms}
@@ -1342,9 +1345,9 @@ class Captioner:
                 "screen": self.screen.status() if self.screen is not None else None}
 
 
-# ------------------------------------------------------------------ 页面
-# 注意：必须是 raw 字符串。PAGE 里嵌着 JS，非 raw 时 Python 会把 JS 里的 '\n'
-# 变成真换行，把单引号字符串截断 → 整段脚本语法错误 → 页面停在「连接中…」且按钮全失效。
+# ------------------------------------------------------------------ page
+# Note: this must be a raw string. PAGE embeds JS; as a non-raw string Python would turn the JS
+# '\n' into a real newline, truncating single-quoted strings -> the script fails to parse -> page sticks at "连接中…".
 PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <title>会议字幕</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
@@ -1364,7 +1367,7 @@ PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
     background:var(--panel);color:var(--dim)}
   .pill b{color:var(--fg)}
   main{padding:16px 22px 60px;max-width:1100px;margin:0 auto;
-    overflow-anchor:none}   /* 自己管滚动锚点，别让浏览器的滚动锚定插手 */
+    overflow-anchor:none}   /* we manage the scroll anchor ourselves; keep browser scroll anchoring out */
   .line{padding:10px 0;border-bottom:1px dashed #1e242e}
   .line .t{font-size:13px;color:#5f6a7d;font-variant-numeric:tabular-nums}
   .line .o{font-size:26px;line-height:1.45;margin:2px 0 0}
@@ -1382,8 +1385,8 @@ PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
   #stop.idle{border-color:#2f6b52;background:#152a22;color:#a8e6c8}
   #mon.run{border-color:#2f6b52;background:#152a22;color:#a8e6c8}
   .spacer{flex:1}
-  /* 草稿行：说话过程中先出灰字，段结束后被正式行替换。
-     刻意压暗＋斜体，让人一眼看出「这句可能还会改」，不会误当成定稿去引用。 */
+  /* Draft line: gray text while speaking, replaced by the final line when the segment ends.
+     Deliberately dimmed and italic so it reads as "this may still change" and never gets quoted as final. */
   .line.draft{opacity:.62}
   .line.draft .o{font-style:italic;color:#b9c2d4}
   .line.draft .t{color:#5f6a7d}
@@ -1408,16 +1411,16 @@ PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 const $ = s => document.querySelector(s);
 let last = 0, lines = [], running = true, idx = new Map(), draft = '';
 
-// ---------- 增量渲染 ----------
-// 为什么不再用「拼 HTML 字符串 + innerHTML 全量替换」（2026-11-21 改）：
-// 旧实现每收一次推送（流式时 ~80ms 一次）就把最后 30 行整个重建，再用像素
-// `window.scrollY` 回填滚动位置。长句译文正在逐字变高时，重建后的总高度变了，
-// 同一个 scrollY 指向的已经是别的内容 —— 用户正在读的那一行被推出视口，
-// 表现就是「下一句一来，上一句整行没了」。句子越长、高度变化越大，所以只有长句明显。
-// 改成增量后：每行一个常驻节点，只有变化的文本节点会被写，已有内容的几何位置不动。
-// 排列方向（2026-11-21 下午改）：**最新的一条在最上面，老行往下推**，草稿行占最顶。
-// 所以视线锚点从「底部」变成「顶部」：贴顶时新行插入即等于整屏下移；翻到下面看旧行时，
-// 按锚点元素补偿 scrollY，避免新行把正在读的那段顶跑（和旧 bug 同一类问题，方向相反）。
+// ---------- incremental rendering ----------
+// Why "HTML string + innerHTML replace" is gone (changed 2026-11-21): the old build rebuilt the last
+// 30 lines on every push (~80ms apart while streaming) and restored scroll from a pixel scrollY. As a
+// long translation grows character by character the rebuilt height changes, so the same scrollY now
+// points at different content -- the line being read is pushed out of view: "next sentence arrives,
+// previous line vanishes". Longer sentences change height more, hence only they showed it. Incremental
+// now: one persistent node per line, only changed text nodes are written, geometry never moves.
+// Ordering (2026-11-21 afternoon): **newest on top, older lines pushed down**, draft at the very top,
+// so the anchor moves from "bottom" to "top": pinned at top a new line shifts the screen down; scrolled
+// down, compensate scrollY by the anchor element so the line being read isn't shoved off (old bug, mirrored).
 const dom = new Map();      // seq -> {root, head, o, tr, key}
 let draftEl = null;
 
@@ -1436,7 +1439,7 @@ function syncLine(l){
   if(!d){
     d = makeLine(l);
     dom.set(l.seq, d);
-    // 最新在最上：新行插到最前面（草稿行随后由 syncDraft 再提到它前面）
+    // Newest on top: insert the new line at the very front (syncDraft later lifts the draft above it)
     const first = $('#main').firstElementChild;
     if(first) $('#main').insertBefore(d.root, first);
     else $('#main').appendChild(d.root);
@@ -1452,7 +1455,7 @@ function syncLine(l){
   const t = l.trans || '';
   const pend = !!l.pending;
   const k = t + (pend ? '\u0001' : '');
-  // 只在内容真的变了才动 DOM：流式时这一行每 80ms 变一次，其余 29 行一个字都不碰
+  // Touch the DOM only when content really changed: while streaming this line changes every 80ms, the other 29 stay untouched
   if(d.key.tr !== k){
     d.tr.textContent = '';
     if(t){
@@ -1487,7 +1490,7 @@ function syncDraft(){
   const o = draftEl.lastElementChild;
   if(draft){
     if(!draftEl.isConnected){
-      // 草稿是「最新的一条」，永远排在最上面
+      // The draft is "the newest entry" and always sits at the very top
       const first = $('#main').firstElementChild;
       if(first) $('#main').insertBefore(draftEl, first);
       else $('#main').appendChild(draftEl);
@@ -1504,7 +1507,7 @@ function syncDraft(){
   }
 }
 
-// 期望顺序：草稿（最新）在最上，其余按 seq 从大到小往下排
+// Expected order: draft (newest) at the top, the rest by descending seq below it
 function orderOk(m, visible){
   let prev = null;
   if(draftEl && draftEl.isConnected){
@@ -1531,8 +1534,8 @@ function render(){
   const empty = m.querySelector('.empty');
   if(empty) empty.remove();
 
-  // 视线锚点：贴顶时不动滚动，新行把内容往下推（这就是「字幕往下滚」）；
-  // 往下翻看旧行时按锚点补偿位移，否则插入新行会把正在读的段落顶跑。
+  // Visual anchor: pinned at top, don't scroll -- a new line pushes content down (that's "captions scrolling down");
+  // scrolled down reading old lines, compensate by the anchor's shift, or the inserted line shoves the paragraph away.
   const anchor = m.firstElementChild;
   const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
   const atTop = window.scrollY <= 24;
@@ -1540,13 +1543,13 @@ function render(){
   const visible = lines.slice(-30);
   const keep = new Set(visible.map(l => l.seq));
   for(const [seq, d] of dom){
-    if(!keep.has(seq)){ d.root.remove(); dom.delete(seq); }   // 只回收窗口外的旧行（现在在底部）
+    if(!keep.has(seq)){ d.root.remove(); dom.delete(seq); }   // recycle only rows outside the window (now at the bottom)
   }
   for(const l of visible) syncLine(l);
 
-  // 真的乱序时才重排。appendChild 对已有节点是「移动」，不重建、不丢内容
+  // Reorder only when genuinely out of order. appendChild on an existing node is a "move": no rebuild, no content loss
   if(!orderOk(m, visible)){
-    if(draftEl && draftEl.isConnected) m.appendChild(draftEl);   // 先落到最前，后面依次接上
+    if(draftEl && draftEl.isConnected) m.appendChild(draftEl);   // land it first, then attach the rest in order
     for(let i = visible.length - 1; i >= 0; i--) m.appendChild(dom.get(visible[i].seq).root);
   }
 
@@ -1555,7 +1558,7 @@ function render(){
   if(atTop){
     if(window.scrollY) window.scrollTo(0, 0);
   }else if(anchor && anchor.isConnected){
-    // 内容被推下去多少像素（top 变大），就多滚多少，视线保持在原来那句上
+    // Scroll by exactly the pixels the content was pushed down (top grew), keeping the eye on the same sentence
     const delta = anchor.getBoundingClientRect().top - anchorTop;
     if(Math.abs(delta) > 0.5) window.scrollBy(0, delta);
   }
@@ -1564,7 +1567,7 @@ function pushLines(arr){
   if(!arr || !arr.length) return false;
   let added = false;
   for(const l of arr){
-    if(idx.has(l.seq)) continue;      // SSE 重连会把 after 之前的行再发一遍，必须去重
+    if(idx.has(l.seq)) continue;      // an SSE reconnect resends lines before after, so dedupe is mandatory
     lines.push(l); idx.set(l.seq, l); added = true;
   }
   if(!added) return false;
@@ -1574,7 +1577,7 @@ function pushLines(arr){
   }
   return true;
 }
-// 译文补丁：同一个 seq 把 trans 填进去，不新增行
+// Translation patch: fill trans into the same seq, no new row
 function applyUpd(list){
   if(!list || !list.length) return false;
   let hit = false;
@@ -1582,7 +1585,7 @@ function applyUpd(list){
     const l = idx.get(u.seq);
     if(l){
       l.trans = u.trans;
-      // 流式中间态只更新文字；耗时和状态等 final 再定，否则数字一路往上跳
+      // Intermediate streaming states update text only; timings and status wait for final, or the numbers keep jumping
       if(u.final){
         l.trans_ms = u.trans_ms;
         if(u.ttft_ms) l.ttft_ms = u.ttft_ms;
@@ -1601,7 +1604,7 @@ function paint(r){
   if(lv) lv.textContent = r ? '运行中' : '已停止';
 }
 
-// 「听 HDMI」：把采集卡收到的声音回放到耳机，开会时可当监听口用
+// "Listen to HDMI": play capture-card audio through the headphones, usable as a monitor tap in meetings
 let monOn = null;
 function paintMon(on, err){
   monOn = on;
@@ -1641,7 +1644,7 @@ async function ctl(action){
   }catch(e){ $('#err').textContent = '控制失败：' + e; }
 }
 
-// 一份 payload 的处理逻辑，SSE 和轮询共用
+// Handling for one payload, shared by SSE and polling
 function applyPayload(j){
   const st = j.status || {};
   if(st.running !== running){ running = !!st.running; paint(running); }
@@ -1649,7 +1652,7 @@ function applyPayload(j){
   const got = pushLines(j.lines);
   if(got) last = Math.max(last, j.lines[j.lines.length-1].seq);
   const patched = applyUpd(j.upd);
-  // 草稿行：服务端在 submit 时清空，正式行随即出现，所以这里直接跟服务端走
+  // Draft line: the server clears it on submit and the final line appears right away, so just follow the server
   const dt = (j.draft && j.draft.text) || '';
   const draftHit = dt !== draft;
   if(draftHit) draft = dt;
@@ -1665,7 +1668,7 @@ function applyPayload(j){
   const bar = $('#lvl'); bar.style.width = pct + '%';
   bar.style.background = db > thr ? '#41c48a' : '#3a4356';
   if(st.bilingual === false) $('#bi').textContent = '仅原文';
-  // 屏幕词表：看不到就等于没生效，所以把「几词 / 命中几次」直接摆在标题栏
+  // Screen term hints: invisible means useless, so show "N terms / M hits" right in the header
   const sc = $('#scr');
   if(sc){
     const s = st.screen;
@@ -1673,7 +1676,7 @@ function applyPayload(j){
     else{
       sc.style.display = '';
       sc.innerHTML = '屏幕 <b>' + (s.terms || 0) + '</b> 词 · 命中 <b>' + (s.hits || 0) + '</b>';
-      // PAGE 是 raw 字符串，这里的 \n 会原样进 JS（改回非 raw 就会把脚本打断）
+      // PAGE is a raw string, so this \n reaches JS verbatim (making it non-raw would break the script)
       sc.title = (s.sample && s.sample.length ? '词表：' + s.sample.join('、') + '\n' : '')
                + (s.last_hint ? '最近命中：' + s.last_hint + '\n' : '')
                + '看屏幕一次 ' + (s.last_ms || 0) + 'ms'
@@ -1684,7 +1687,7 @@ function applyPayload(j){
   if(got || patched || draftHit) render();
 }
 
-// SSE 正常时由服务端推，轮询让位；SSE 一旦出错就关掉自己，回落到轮询
+// While SSE works the server pushes and polling stands down; if SSE errors it closes itself and falls back
 let es = null;
 function startSSE(){
   if(!window.EventSource) return false;
@@ -1695,7 +1698,7 @@ function startSSE(){
 }
 
 async function tick(){
-  if(es) return;                       // SSE 在跑，不再轮询
+  if(es) return;                       // SSE is running, stop polling
   try{
     const r = await fetch('/api/poll?after=' + last, {cache:'no-store'});
     applyPayload(await r.json());
@@ -1706,7 +1709,7 @@ async function tick(){
 $('#stop').onclick = () => ctl(running ? 'stop' : 'start');
 $('#clear').onclick = () => ctl('clear');
 paint(true);
-if(!startSSE()) tick();     // 有 EventSource 就走推送，否则轮询兜底
+if(!startSSE()) tick();     // push if EventSource exists, otherwise poll as a fallback
 </script></body></html>"""
 
 
@@ -1724,14 +1727,14 @@ def build_app(cap: Captioner, pipe: Pipeline, device: str, state: dict,
 
     @app.get("/api/events")
     async def events(request: Request, after: int = Query(0)):
-        """SSE 推送。译文每 ~80ms 有一个增量，轮询要等最多 250ms 才看到。
+        """SSE push. Streaming emits a translation delta every ~80ms; polling waits up to 250ms to see it.
 
-        服务端内部仍是 50ms 检查一次（cap 是同步对象），但**客户端不再有往返**，
-        中间态一到就画出来。前端断了会自动回落到 /api/poll。
+        Internally the server still checks every 50ms (cap is a synchronous object), but **the client no longer
+        round-trips**: an intermediate state paints on arrival, and a dropped frontend falls back to /api/poll.
 
-        这里不用 cap.take_updates()：那是「取走即清空」，两个页面同时开会
-        互相抢补丁，第二个永远停在「译文中…」。改成每个连接自己比对译文快照，
-        多端各自独立。
+        This deliberately avoids cap.take_updates(): that is "drain on read", so two open pages would steal
+        patches from each other and the second would sit at "译文中…" forever. Each connection instead
+        compares its own translation snapshot, keeping the clients independent.
         """
         import asyncio
 
@@ -1759,8 +1762,8 @@ def build_app(cap: Captioner, pipe: Pipeline, device: str, state: dict,
                                     "trans_ms": l.get("trans_ms") or 0,
                                     "ttft_ms": l.get("ttft_ms") or 0})
 
-                # 草稿行：说话过程中每 ~0.8s 更新一次，段结束被正式行替换。
-                # 必须和译文补丁分开推，它不是某一行，是「列表末尾正在长的那一行」。
+                # The draft line updates every ~0.8s while speaking and is replaced by the final line at segment end.
+                # It must be pushed separately from translation patches: it isn't a row, it's the row growing at the list end.
                 d = cap.draft_state()
                 now = time.time()
                 tick_status = (now - last_status) >= 1.0
@@ -1790,7 +1793,7 @@ def build_app(cap: Captioner, pipe: Pipeline, device: str, state: dict,
 
     @app.get("/api/poll")
     async def poll(after: int = Query(0)):
-        # 复制一份：翻译线程会就地回填 line["trans"]，别让序列化读到半截状态
+        # Copy: the translation thread patches line["trans"] in place; don't let serialization read a half state
         lines = [dict(l) for l in cap.lines if l["seq"] > after]
         return JSONResponse({
             "lines": lines,
@@ -1808,18 +1811,18 @@ def build_app(cap: Captioner, pipe: Pipeline, device: str, state: dict,
         return {**cap.status(), "running": pipe.running,
                 "level_db": state.get("level_db"), "thr_db": state.get("thr_db"),
                 "device": device,
-                # 断句参数原样回显：分段不对劲时第一件事是确认线上真的用了这组值，
-                # 而不是对着默认值猜（unit 里显式写死的参数会盖掉默认）
+                # Echo the segmentation params verbatim: when segmentation looks off, the first step is to confirm the
+                # live process really uses these values instead of guessing at defaults (explicit unit values win).
                 "seg": {"max_s": pipe.args.max_s, "hold": pipe.args.hold,
                         "hold_short": pipe.args.hold_short,
                         "hold_long": pipe.args.hold_long,
                         "mid": pipe.args.seg_mid, "long": pipe.args.seg_long},
-                "tr": dict(TR_STATS),          # retry/fixed：脏译文检出与救回次数
+                "tr": dict(TR_STATS),          # retry/fixed: dirty-translation detections and rescues
                 "monitor": monitor.status() if monitor else None}
 
     @app.post("/api/monitor")
     async def monitor_ctl(request: Request):
-        """把 HDMI 声音回放到耳机：{on: true|false}。"""
+        """Play HDMI audio through the headphones: {on: true|false}."""
         import asyncio
 
         if monitor is None:
@@ -1832,7 +1835,7 @@ def build_app(cap: Captioner, pipe: Pipeline, device: str, state: dict,
         loop = asyncio.get_running_loop()
         if want:
             ok = await loop.run_in_executor(None, monitor.start)
-            # PipeWire 里启动瞬间还在协商，稍等一下再读状态，否则第一次查总是 false
+            # PipeWire is still negotiating right after start; wait briefly before reading status, or the first check is always false
             if ok:
                 await asyncio.sleep(0.35)
         else:
@@ -1841,7 +1844,7 @@ def build_app(cap: Captioner, pipe: Pipeline, device: str, state: dict,
 
     @app.post("/api/control")
     async def control(request: Request):
-        """stop / start / clear。stop 会释放声卡，start 重新估本底。"""
+        """stop / start / clear. stop releases the sound card; start re-estimates the noise floor."""
         import asyncio
 
         try:
@@ -1851,7 +1854,7 @@ def build_app(cap: Captioner, pipe: Pipeline, device: str, state: dict,
         action = str(payload.get("action") or "")
         loop = asyncio.get_running_loop()
         if action == "stop":
-            # stop 里有 wait(timeout=2)，start 要等 arecord 站住，都不能卡事件循环
+            # stop has a wait(timeout=2) and start waits for arecord to come up; neither may block the event loop
             await loop.run_in_executor(None, pipe.stop)
             return {"ok": True, "running": pipe.running}
         if action == "start":
@@ -1866,12 +1869,12 @@ def build_app(cap: Captioner, pipe: Pipeline, device: str, state: dict,
     return app
 
 
-# ------------------------------------------------------------------ 管线
+# ------------------------------------------------------------------ pipeline
 class Pipeline:
-    """采集管线的启停。
+    """Start/stop for the capture pipeline.
 
-    停止必须真正释放声卡：只停线程不 terminate arecord，下次 start 会「设备或资源忙」。
-    每次 start 重建 Segmenter —— 本底电平要按当时的房间重新估，不能沿用上一场会议的。
+    Stopping must really release the sound card: halting the thread without terminating arecord makes the next
+    start fail with "device or resource busy". Each start rebuilds the Segmenter, re-estimating the floor for this room.
     """
 
     def __init__(self, cap: Captioner, device: str, args, state: dict):
@@ -1894,8 +1897,8 @@ class Pipeline:
                                   min_s=getattr(self.args, "min_s", 0.25),
                                   soft_s=getattr(self.args, "soft_cut", 0.7),
                                   **seg_tuning(self.args))
-            # USB 声卡被 terminate 后要过一小会儿才真的从 ALSA 释放，
-            # 立刻重开必然 "device busy"，所以重试几次而不是一次判死。
+            # A terminated USB sound card takes a moment to actually be released by ALSA, so reopening
+            # immediately always hits "device busy" -- hence several retries instead of one fatal verdict.
             last_err = "打开声卡失败：未知原因"
             for attempt in range(4):
                 src = Capture(self.device, SR, backend=getattr(self.args, "backend", "pw"),
@@ -1906,7 +1909,7 @@ class Pipeline:
                     last_err = f"打开声卡失败：{e}"
                     time.sleep(0.35)
                     continue
-                time.sleep(0.45)                   # arecord 是异步起进程，等它站住
+                time.sleep(0.45)                   # arecord starts its process asynchronously; wait for it to come up
                 if src.alive():
                     self._src = src
                     self.state["error"] = ""
@@ -1951,17 +1954,17 @@ class Pipeline:
             self.state["thr_db"] = seg.threshold()
             pcm = seg.push(frame, db)
             if pcm is not None and pcm.size:
-                # 只入队，不等识别：识别和翻译各有自己的线程，采集循环永不被阻塞
+                # Enqueue only, never wait for recognition: ASR and translation own their threads, capture never blocks
                 self.cap.submit(pcm, pcm.size / SR, end_ts=time.time())
-                last_draft = 0.0                 # 新段开始，草稿节流重新计时
+                last_draft = 0.0                 # new segment starts, restart the draft throttle timer
                 continue
-            # 段还没说完：隔 draft_every 秒把累积音频送去识别一次，屏幕上先出灰字。
-            # 不加这段，离线 ASR 必须等整段（最长 6 秒）说完才有第一行，观感就是「不流式」。
+            # Segment not finished: send the accumulated audio to recognition every draft_every seconds so gray text shows first.
+            # Without this, offline ASR waits for the whole segment (up to 6s) before the first line, which feels non-streaming.
             if self.cap.draft_on and pcm is None:
                 now = time.time()
                 if now - last_draft >= self.cap.draft_every:
                     d = seg.draft()
-                    if d is not None and d[1] >= 0.8:      # 太短的草稿没信息量
+                    if d is not None and d[1] >= 0.8:      # a too-short draft carries no information
                         last_draft = now
                         self.cap.push_draft(*d)
         src.stop()
@@ -1969,7 +1972,7 @@ class Pipeline:
 
 def run_wav(cap: Captioner, path: str, args) -> None:
     audio, sr = vp.read_wav(path)
-    if sr != SR:                                   # 线性重采样，仅供离线自测
+    if sr != SR:                                   # linear resampling, for offline self-tests only
         n = int(round(audio.size * SR / sr))
         audio = np.interp(np.linspace(0, audio.size - 1, n),
                           np.arange(audio.size), audio)
@@ -1978,7 +1981,7 @@ def run_wav(cap: Captioner, path: str, args) -> None:
                     min_s=getattr(args, "min_s", 0.25),
                     soft_s=getattr(args, "soft_cut", 0.7),
                     **seg_tuning(args))
-    # 末尾补 1 秒静音，否则最后一句还在缓冲里不会被 flush
+    # Append 1s of silence, otherwise the last sentence stays in the buffer and is never flushed
     audio = np.concatenate([audio, np.zeros(SR, dtype=audio.dtype)])
     for i in range(0, audio.size - FRAME_N, FRAME_N):
         frame = audio[i:i + FRAME_N]
@@ -2088,7 +2091,7 @@ def main(argv: list[str] | None = None) -> int:
                     draft_on=not args.no_draft, draft_every=args.draft_every,
                     screen=screen)
     if screen is not None:
-        # 自我循环防护：屏幕词表要能认出「这一行是我们自己的字幕」
+        # Self-loop guard: the screen term list must be able to recognize "this line is our own caption"
         screen.recent = lambda: [x for l in list(cap.lines)[-30:]
                                  for x in (l.get("text", ""), l.get("trans", ""))]
         screen.start()

@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
-# HDMI 输入探针：连续抓帧，区分「无信号 / 纯黑 / 有画面」
-# 用法：./hdmi_probe.sh [次数] [间隔秒]
-#   有画面时立刻保存 /tmp/hdmi_ok_<时间>.jpg 并退出 0
-#   全程无信号退出 1
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+# HDMI input probe: grab frames repeatedly and tell "no signal / pure black / picture" apart
+# Usage: ./hdmi_probe.sh [count] [interval seconds]
+#   on a picture, save /tmp/hdmi_ok_<time>.jpg immediately and exit 0
+#   exit 1 if there is no signal the whole time
 #
-# 关键：MS2109 每次打开设备/切换分辨率后，前 ~33-36 帧（约 1.2s）是黑帧。
-#       因此这里单次打开后先丢弃 WARMUP 帧再取样，否则抓到的一定是预热黑帧，
-#       会得出「无信号」的错误结论（本项目踩过这个坑）。
+# Key point: after the MS2109 opens the device or switches resolution, the first ~33-36 frames (~1.2s) are black.
+#       So each open here discards WARMUP frames before sampling; otherwise the sample is always a warm-up black frame
+#       and you draw the wrong conclusion "no signal" (this project has hit that trap).
 set -u
 DEV=${DEV:-/dev/video0}
 SIZE=${SIZE:-1920x1080}
-WARMUP=${WARMUP:-40}          # 丢弃的前置帧数（约 1.3s @30fps）
+WARMUP=${WARMUP:-40}          # number of leading frames to discard (~1.3s @30fps)
 N=${1:-20}
 GAP=${2:-1}
 
 probe_once() {
   rm -f /tmp/_probe.jpg
-  # 单次打开：抓 2.5 秒，从第 WARMUP 帧起取 1 帧
+  # single open: capture 2.5s, take 1 frame starting at frame WARMUP
   ffmpeg -hide_banner -loglevel quiet -f v4l2 -input_format mjpeg \
          -video_size "$SIZE" -framerate 30 -i "$DEV" -t 2.5 \
          -vf "select=gte(n\,$WARMUP)" -frames:v 1 -y /tmp/_probe.jpg 2>/dev/null
   if [ ! -s /tmp/_probe.jpg ]; then
     echo "坏帧|未写出文件"; return
   fi
-  # metadata=print 走 stderr，必须 2>&1
+  # metadata=print writes to stderr, so 2>&1 is required
   stats=$(ffmpeg -hide_banner -i /tmp/_probe.jpg -vf signalstats,metadata=print -f null - 2>&1)
   ymin=$(printf '%s' "$stats" | grep -o 'YMIN=[0-9.]*' | head -1 | cut -d= -f2)
   ymax=$(printf '%s' "$stats" | grep -o 'YMAX=[0-9.]*' | head -1 | cut -d= -f2)

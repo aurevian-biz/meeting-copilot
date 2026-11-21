@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""量端到端：从「一段话说完」到「页面看到第一个译文字」。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-算法：
-  段末时刻 ≈ 收到原文行的时刻 - lag_ms（lag 就是段末到原文出来的时间）
-  首字延迟 = 收到该行第一个非空 trans 的时刻 - 段末时刻
-对照：整句译完的延迟 = 收到 final 的时刻 - 段末时刻
+"""Measure end to end: from "the sentence is finished" to "the first translated character shows up on the page".
+
+Method:
+  segment end ≈ arrival time of the source line - lag_ms (lag is the time from segment end to source text popping out)
+  first token latency = arrival time of the first non-empty trans for that line - segment end
+For reference: full-sentence latency = arrival time of final - segment end
 """
 import json
 import statistics
@@ -21,7 +24,7 @@ def main() -> int:
     lag: dict[int, float] = {}
     first_word: dict[int, float] = {}
     final_at: dict[int, float] = {}
-    fresh: set[int] = set()      # 订阅期间新产生的行（首次收到时还没有译文）
+    fresh: set[int] = set()      # lines created during the subscription (no translation yet on first sight)
 
     t0 = time.time()
     with urllib.request.urlopen(f"{BASE}/api/events?after=0", timeout=DUR + 20) as r:
@@ -43,7 +46,7 @@ def main() -> int:
                 seen_line[seq] = now
                 lag[seq] = (l.get("lag_ms") or 0) / 1000.0
                 if not l.get("trans"):
-                    fresh.add(seq)          # 历史补发的行译文已就绪，不能算
+                    fresh.add(seq)          # backfilled historical lines already have their translation, must not count
                 else:
                     first_word.setdefault(seq, now)
             for u in j.get("upd") or []:

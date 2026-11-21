@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""确认生产环境：cuda-python 可用 + voice-bench 仍在 TensorRT 后端。"""
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+"""Confirm the production environment: cuda-python available + voice-bench still on the TensorRT backend."""
 import json
 import subprocess
 import urllib.request

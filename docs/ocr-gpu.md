@@ -1,27 +1,32 @@
-# 把 OCR 的识别后端换成 TensorRT（可选，但很值）
+# Moving the OCR recognition backend to TensorRT (optional, but worth a lot)
 
-只在「看一眼屏幕」这条链路上需要。不做也能跑，代价是 OCR 从 ~1.7s 变 ~4.1s。
+[**English**](ocr-gpu.md) · [中文](ocr-gpu.zh.md) · [日本語](ocr-gpu.ja.md)
 
-## 为什么不用 onnxruntime-gpu
+Only needed on the 「看一眼屏幕」 path. It runs without it too, at the cost of OCR going
+from ~1.7s to ~4.1s.
 
-这台机器是 JetPack 7.2（L4T r39.2.1）+ **CUDA 13.2**，而 onnxruntime 官方只发 **cu12** 轮子。
-`pip install onnxruntime-gpu` 能过、`get_available_providers()` 也会列出
-`CUDAExecutionProvider`，但建 session 时报 `No registered plugin EP device found`——
-EP 的 `.so` dlopen 失败。**这条路在 CUDA 13 上是死的**，别在上面耗时间。
+## Why not onnxruntime-gpu
 
-TensorRT 10.16 随系统就有（`libnvinfer.so.10` + `trtexec` + python `tensorrt`），
-所以绕过 onnxruntime 直接跑 TRT。
+This machine is JetPack 7.2 (L4T r39.2.1) + **CUDA 13.2**, while onnxruntime only ships
+**cu12** wheels. `pip install onnxruntime-gpu` succeeds and `get_available_providers()`
+even lists `CUDAExecutionProvider`, but creating a session fails with
+`No registered plugin EP device found` — the EP's `.so` fails to dlopen. **This road is
+dead on CUDA 13**; don't spend time on it.
 
-## 为什么只换 rec
+TensorRT 10.16 ships with the system (`libnvinfer.so.10` + `trtexec` + python `tensorrt`),
+so we bypass onnxruntime and run TRT directly.
 
-rec 占 OCR 的 88%，换它性价比最高。det（0.30s）和 cls（0.15s）先不动，
-而且 det 的输入尺寸随画面变化，profile 更难定。
+## Why only rec
 
-## 建 engine（约 11~12 分钟）
+rec accounts for 88% of OCR, so it buys the most. det (0.30s) and cls (0.15s) stay as they
+are, and det's input size varies with the screen, which makes its profile harder to pin
+down.
+
+## Building the engine (about 11~12 minutes)
 
 ```bash
 python -c "import rapidocr_onnxruntime, pathlib; print(pathlib.Path(rapidocr_onnxruntime.__file__).parent)"
-# 记下这个目录，下面用 <rapidocr> 表示
+# note this directory; below, <rapidocr> stands for it
 
 trtexec --onnx=<rapidocr>/models/ch_PP-OCRv4_rec_infer.onnx \
         --saveEngine=$MC_DATA/models/rec_fp16.engine --fp16 \
@@ -29,42 +34,49 @@ trtexec --onnx=<rapidocr>/models/ch_PP-OCRv4_rec_infer.onnx \
         --memPoolSize=workspace:1024 --timingCacheFile=/tmp/trt_cache.bin
 ```
 
-三个数都是有来由的，别随手改：
+All three numbers have a reason — don't change them casually:
 
-- `optShapes` 定 **320**：实测 75 个批次里 76% 就是基准 320（批内没有超宽行时
-  `max_wh_ratio` 取默认 6.67）。opt 定小值是让**常见路径**最快，不是取中间值
-- `maxShapes` 定 **2048**：第一版设 1024/1536 都失败过——屏幕上出现一行超长
-  （路径、URL、长代码行）时，整批会被撑到 1036、1656。这个数必须**量出来**再定，
-  拍脑袋必然要重建（每次 12 分钟）
-- 动态 shape 的 tactic 搜索很慢，日志会长时间不更新，**别以为卡死**
+- `optShapes` set to **320**: measured, 76% of 75 batches are exactly the 320 baseline
+  (when there is no extra-wide line in the batch, `max_wh_ratio` takes the default 6.67).
+  Setting opt to a small value makes the **common path** fastest; it is not about taking
+  the middle value
+- `maxShapes` set to **2048**: the first version set 1024/1536 and both failed — when an
+  extra-long line (path, URL, long code line) appears on screen, the whole batch gets
+  stretched to 1036, 1656. This number must be **measured** before you set it; guessing
+  always means a rebuild (12 minutes each time)
+- Tactic search for dynamic shapes is slow and the log stays unchanged for a long time —
+  **don't assume it has hung**
 
-engine 和 TensorRT 版本绑死：换 JetPack / 升级 TRT 后必须重建。
+The engine is tied to the TensorRT version: after changing JetPack or upgrading TRT you
+must rebuild it.
 
-## 效果（真机 132 行画面）
+## Results (132-line screen on real hardware)
 
-| 后端 | rec | OCR 合计 | 均分 | 逐行一致 |
+| Backend | rec | OCR total | Mean score | Per-line agreement |
 |---|---|---|---|---|
-| CPU (onnxruntime) | 3.4s | 4.12s | 0.951 | 基准 |
-| **TensorRT FP16** | — | **1.17s（3.5×）** | 0.952 | 128/132 |
+| CPU (onnxruntime) | 3.4s | 4.12s | 0.951 | baseline |
+| **TensorRT FP16** | — | **1.17s (3.5×)** | 0.952 | 128/132 |
 
-端到端（语音问「屏幕上是什么」，140 行）：**6.56s → 3.4~3.9s**。此时瓶颈已经不是 OCR，
-而是 LLM 生成（约 2.1s）。
+End to end (voice asks 「屏幕上是什么」, 140 lines): **6.56s → 3.4~3.9s**. The bottleneck is
+no longer OCR at this point, but LLM generation (about 2.1s).
 
-## 超 profile 的批次退回 CPU
+## Batches beyond the profile fall back to CPU
 
-rec 的批输入宽度 = 48 × 批内最大宽高比。屏幕偶尔出现超长行（URL、路径），
-会把整批撑到 profile 之外。实测 75 批里超 1536 的只占 **4%**，所以让这几批退回 CPU
-——4% 的批走慢路，比 100% 的批用差 kernel 划算。回退比例看 `/api/status` 的
-`vision.trt.fallback_pct`。
+rec's batch input width = 48 × the largest width/height ratio in the batch. Every so often
+an extra-long line (URL, path) appears on screen and pushes the whole batch outside the
+profile. Measured, only **4%** of 75 batches exceed 1536, so we let those few batches fall
+back to CPU — 4% of batches taking the slow path beats 100% of batches using a worse
+kernel. Watch the fallback ratio at `vision.trt.fallback_pct` in `/api/status`.
 
-## 挂上去
+## Wiring it in
 
-服务启动时传 engine 路径即可，不需要改 RapidOCR 源码：
+Just pass the engine path when starting the service; no RapidOCR source changes:
 
 ```bash
 --vision-trt $MC_DATA/models/rec_fp16.engine
 ```
 
-实现（`trt_rec.py`）：只把 `TextRecognizer.session` 换成 `TrtRecSession`，
-`resize_norm_img`、CTC 解码、字符表全部复用原实现——两边只差推理后端，
-测出来的才是纯后端差异。
+Implementation (`trt_rec.py`): only `TextRecognizer.session` is swapped for
+`TrtRecSession`; `resize_norm_img`, CTC decoding and the character table all reuse the
+original implementation — the two sides differ only in the inference backend, so what you
+measure is purely the backend difference.

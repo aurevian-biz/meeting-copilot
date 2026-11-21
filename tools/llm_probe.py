@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""语音场景的模型复测：首字延迟 + 单请求 decode + 首句出声。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-为什么不看聚合吞吐：个人助理是 1 路、2~4K 上下文、一次一句话。agent run 那套
-「40 次调用、30K 上下文、比聚合 tok/s」的口径在这里会得出相反结论（27B 在
-批处理上很强，但首句要 3 秒才出声，语音里就是「没反应」）。
+"""Re-measure a model for the voice scenario: first token latency + single-request decode + first sentence out.
 
-三个判据（README 4.14 的硬线）：
-  前缀命中 TTFT      < 300 ms
-  单请求 decode      >= 20 tok/s
-  首句出声（实测）    < 600 ms
+Why not look at aggregate throughput: a personal assistant is 1 stream, 2-4K context, one sentence at a time. The "40 calls, 30K context,
+compare aggregate tok/s" convention from agent runs yields the opposite conclusion here (27B is
+strong at batch work, yet its first sentence takes 3 seconds to come out, which in voice means "no reaction").
 
-注意：不要用「20 token」去折算首句延迟。中文分词约 1.3 字/token，Qwen2.5-7B
-实测 26 tok/s 折出来是 767 ms，但真实首句（到第一个句号或 12 字）只要 284 ms。
-这里直接测首句，20 token 只作为参考值打印。
+Three criteria (the hard lines in README 4.14):
+  prefix-hit TTFT      < 300 ms
+  single-request decode      >= 20 tok/s
+  first sentence out (measured)    < 600 ms
 
-用法：
+Careful: do not convert the first-sentence latency from "20 tokens". Chinese tokenises at about 1.3 chars/token, and Qwen2.5-7B
+at a measured 26 tok/s works out to 767 ms, while a real first sentence (up to the first full stop or 12 chars) takes only 284 ms.
+This measures the first sentence directly; 20 tokens is printed as a reference figure only.
+
+Usage:
   python tools/llm_probe.py --base http://127.0.0.1:8000/v1 --model qwen
   python tools/llm_probe.py --base http://127.0.0.1:8080/v1 --model local --runs 5
 
-只依赖标准库，任意 OpenAI 兼容端点都能测（vLLM / llama-server / Magnitude）。
+Standard library only; any OpenAI-compatible endpoint works (vLLM / llama-server / Magnitude).
 """
 from __future__ import annotations
 
@@ -30,7 +33,7 @@ import time
 import urllib.request
 import uuid
 
-# 接近真实助理的人设 + 工具说明长度（约 600~900 token）
+# Persona close to the real assistant + tool-description length (about 600-900 tokens)
 SYSTEM = (
     "你是「小八」，运行在 Jetson AGX Orin 上的个人语音助理。"
     "你通过麦克风听到用户说话，回答会被直接念出来，所以："
@@ -50,9 +53,9 @@ STOP = "。！？!?\n"
 
 def post_stream(base: str, model: str, messages: list[dict], max_tokens: int,
                 usage_out: dict | None = None):
-    """流式请求，返回 (ttft_ms, first_sent_ms, decode_tps, tokens, text)。
+    """Streaming request; returns (ttft_ms, first_sent_ms, decode_tps, tokens, text).
 
-    usage_out 传入 dict 时会填入 prompt_tokens / completion_tokens（调用方想看上下文大小时用）。
+    When usage_out is given a dict it is filled with prompt_tokens / completion_tokens (for callers that want the context size).
     """
     body = json.dumps({
         "model": model,
@@ -110,7 +113,7 @@ def post_stream(base: str, model: str, messages: list[dict], max_tokens: int,
     ttft_ms = (t_first - t0) * 1000
     first_sent_ms = ((t_sent or t_end) - t0) * 1000
     n = usage_tokens or tokens
-    # 首 token 之前的时间不算进 decode（否则 TTFT 会被重复计一次）
+    # Time before the first token does not count in decode (otherwise TTFT gets counted twice)
     gen_s = max(t_end - t_first, 1e-6)
     decode_tps = max(n - 1, 1) / gen_s
     return ttft_ms, first_sent_ms, decode_tps, n, text
@@ -137,13 +140,13 @@ def main() -> int:
     def one(cold: bool) -> dict:
         msgs = json.loads(json.dumps(base_msgs))
         if cold:
-            # 前缀加唯一 nonce，逼它重新 prefill（cache_n=0）
+            # Prepend a unique nonce so it re-prefills from scratch (cache_n=0)
             msgs[0]["content"] = f"[req {uuid.uuid4().hex[:8]}]\n" + msgs[0]["content"]
         ttft, sent, tps, n, _ = post_stream(args.base, args.model, msgs, args.max_tokens)
         return {"ttft_ms": ttft, "first_sent_ms": sent, "decode_tps": tps, "tokens": n}
 
     try:
-        one(cold=True)  # 预热：加载模型 / 触发 kernel 调优，不计入结果
+        one(cold=True)  # warm-up: model load / kernel autotuning, excluded from results
     except Exception as e:  # noqa: BLE001
         print(f"预热失败：{e}", file=sys.stderr)
         return 2

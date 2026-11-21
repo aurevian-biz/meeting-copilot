@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""断句参数离线对比：只跑 Segmenter，不碰 ASR / 翻译，几秒出结果。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-用法（在部署目录跑，venv 里有 numpy）：
+"""Offline comparison of segmentation parameters: runs the Segmenter only, never touches ASR / translation, results in seconds.
+
+Usage (run in the deployment directory, the venv has numpy):
     ./asr-venv/bin/python tools/seg_ab.py /tmp/meet60.wav
     ./asr-venv/bin/python tools/seg_ab.py /tmp/meet60.wav --sets "3.0:0.42:0.42:0.42,6.0:0.9:0.3:2.4"
 
---sets 每项写成 max_s:hold_s:hold_short:hold_long，默认跑四组对照。
+Each --sets entry is written max_s:hold_s:hold_short:hold_long; four comparison sets run by default.
 
-看三个数：
-- **静音切占比**：越高越说明切在自然停顿上，不是撞时间上限。这是本次改造的唯一目标。
-- 段长中位 / p75：直接决定出字延迟（段末才出原文）。
-- 撞上限占比：剩下多少是被 max_s 逼出来的。
+Watch three numbers:
+- **silence cut ratio**: the higher, the more cuts land on natural pauses instead of hitting the time cap. This is the only goal of the current rework.
+- segment length median / p75: directly sets the text latency (source text only leaves at segment end).
+- cap-hit ratio: how much of the rest was forced by max_s.
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ import caption_server as cs  # noqa: E402
 import voice_probe as vp  # noqa: E402
 
 DEFAULT_SETS = [
-    # max_s : hold : hold_short : hold_long   —— 第 1 组是改造前的现状
+    # max_s : hold : hold_short : hold_long   -- set 1 is the state before the rework
     (3.0, 0.42, 0.42, 0.42, "改造前 固定3s/固定0.42"),
     (6.0, 0.42, 0.30, 0.90, "分层 上限6s"),
     (8.0, 0.45, 0.30, 0.90, "分层 上限8s"),

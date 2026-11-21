@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""订阅 /api/events，统计收到的中间态与时间间隔。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-判据：
-  - 同一个 seq 能收到 >1 种 trans（说明服务端把中间态推出来了）
-  - 相邻两次推送的间隔明显小于 250ms 轮询周期（说明延迟真的省了）
+"""Subscribe to /api/events and tally the intermediate states received and the gaps between them.
+
+Criteria:
+  - the same seq yields >1 distinct trans (the server really does push intermediate states)
+  - the gap between consecutive pushes is clearly below the 250ms polling period (the latency saving is real)
 """
 import json
 import statistics

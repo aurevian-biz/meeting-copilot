@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""换模型后的冒烟：确认三件事——能出中文/日文、思考块没把 token 吃光、流式首字正常。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+"""Smoke test after a model switch: confirm three things — Chinese/Japanese output, thinking block not eating all tokens, streaming first token OK.
 
     ./tools/llm_switch.sh status
     /opt/meeting-copilot/data/asr-venv/bin/python tools/smoke_llm.py

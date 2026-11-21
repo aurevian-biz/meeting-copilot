@@ -1,17 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
 # /etc/systemd/system/voice-bench.service
 #
-# 语音助手：唤醒 → ASR → LLM → TTS，浏览器打开 8095 就能对着机器说话。
+# Voice assistant: wake word -> ASR -> LLM -> TTS; open 8095 in a browser and talk to the box.
 #
-# LLM 默认用 Magnitude 的 35B-A3B（10100），不用 vLLM 的 7B（8000）。为什么换：
-#   · 质量：7B 在这套日语 system + 中文回复的组合下会出「会議的时间确认 needed。」
-#     这种中日混杂，还会冒出 -topic1- / 西语单词；35B 一处没有
-#   · 全文：长回答（读屏幕、总结）快 25~35%，MoE 解码只激活 3B
-#   · 首字：慢 170~370ms（45 字左右的首句约多 250ms），接受
-#   · 语言：语音助手必须「日语会议、中文播报」，靠 --reply-lang zh；指令挂在
-#     user 末尾（voice_server._lang_directive），35B 才听（挂 system 是 0/6，挂 user 是 6/6）
+# The LLM defaults to Magnitude's 35B-A3B (10100) rather than vLLM's 7B (8000). Why the switch:
+#   · Quality: with this Japanese system prompt + Chinese replies, the 7B emits mixed
+#     Chinese/Japanese like "会議的时间确认 needed." and stray -topic1- / Spanish words; 35B never does
+#   · Full answer: 25~35% faster on long answers (screen reading, summaries); MoE decoding activates only 3B
+#   · First token: 170~370ms slower (~250ms extra on a ~45-character opening line), accepted
+#   · Language: the assistant must do "Japanese meeting, Chinese playback", via --reply-lang zh; the directive
+#     goes at the end of the user message (voice_server._lang_directive), only then does 35B obey (0/6 on system, 6/6 on user)
 #
-# 回滚到 7B：把 --llm-* 换成 `--llm-model qwen`（base 默认 8000），
-# 并确认 vLLM 容器在跑（docker start vllm-qwen）。
+# Roll back to 7B: change --llm-* to `--llm-model qwen` (base defaults to 8000),
+# and make sure the vLLM container is running (docker start vllm-qwen).
 [Unit]
 Description=Voice bench (SenseVoice ASR + LLM 35B-A3B + Piper TTS, web UI on 8095)
 Documentation=https://github.com/__GH_REPO__
@@ -25,7 +28,7 @@ WorkingDirectory=__HOME__
 EnvironmentFile=-/etc/meeting-copilot/env
 Environment=PYTHONUNBUFFERED=1
 Environment=PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
-# 本地播报走 pw-play，必须能连到 user session 的 PipeWire
+# Local playback goes through pw-play, which must reach the user session's PipeWire
 Environment=XDG_RUNTIME_DIR=/run/user/__UID__
 ExecStart=__HOME__/.venv/bin/python __HOME__/voice_server.py \
     --port 8095 --reply-lang zh \

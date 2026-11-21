@@ -2,7 +2,7 @@
 
 **一台边缘设备上跑完的日中双语会议字幕 + 语音助手，全本地、零云端推理。**
 
-[日本語](README.md) · [English](README.en.md) · [MIT](LICENSE)
+[English](README.md) · [**中文**](README.zh.md) · [日本語](README.ja.md) · [MIT](LICENSE)
 
 语音识别、翻译、语音合成、屏幕 OCR、大模型推理全在本机完成。会议的声音和画面都不出机器，
 适合内网会议、涉密内容，以及「没网也要能用」的现场。
@@ -44,12 +44,12 @@ bash scripts/healthcheck.sh
 
 浏览器打开 `http://<设备IP>:8095`（助手）和 `:8096`（字幕）。
 
-> **动手前务必先看 [hardware.md](docs/hardware.md) 的三件事**：60Hz 工频哼声要高通、
+> **动手前务必先看 [hardware.zh.md](docs/hardware.zh.md) 的三件事**：60Hz 工频哼声要高通、
 > H340 采集增益要从 +8dB 降到 0dB、采集卡要丢 40 帧预热黑帧。
 > 这三条不修，后面所有调参都是白费，而且它们**都不报错**。
 
-完整步骤见 [install.md](docs/install.md)，卡住先看
-[troubleshooting.md](docs/troubleshooting.md)。
+完整步骤见 [install.zh.md](docs/install.zh.md)，卡住先看
+[troubleshooting.zh.md](docs/troubleshooting.zh.md)。
 
 ## 硬件
 
@@ -61,7 +61,7 @@ bash scripts/healthcheck.sh
 | 外置 SSD | ≥128G | 模型 3.4G + 35B 权重 22.9G |
 
 x86 + NVIDIA GPU 也能跑；CUDA 13 下 `onnxruntime-gpu` 用不了，OCR 加速改走
-TensorRT（见 [ocr-gpu.md](docs/ocr-gpu.md)）。
+TensorRT（见 [ocr-gpu.zh.md](docs/ocr-gpu.zh.md)）。
 
 ## 架构要点
 
@@ -79,22 +79,26 @@ USB 麦 ─→ KWS ─→ ASR ─→ LLM ─→ 按句 TTS ─→ pw-play ─→
 - **译文 SSE + 增量 DOM**：早期全量 `innerHTML` + 像素 `scrollY` 回填，
   长句逐字变高时锚点漂移，表现为「下一句一来上一句整行消失」
 
-详见 [architecture.md](docs/architecture.md)。
+详见 [architecture.zh.md](docs/architecture.zh.md)。
 
 ## 文档
 
+每份文档都有中 / 日 / 英三版：下表指向中文版，把文件名改成 `.md` / `.ja.md`
+就是英文 / 日文版（例如 [hardware.md](docs/hardware.md)、[hardware.ja.md](docs/hardware.ja.md)）。
+每页顶部都有语言切换。
+
 | 文档 | 内容 |
 |---|---|
-| [hardware.md](docs/hardware.md) | BOM、接线、必须先修的三个物理问题 |
-| [install.md](docs/install.md) | 从零装一遍 |
-| [models.md](docs/models.md) | 模型清单、为什么选它、许可证提醒 |
-| [llm-serving.md](docs/llm-serving.md) | Magnitude 35B vs vLLM 7B、prefill / 前缀缓存的坑 |
-| [ocr-gpu.md](docs/ocr-gpu.md) | TensorRT 把 OCR 提速 3.5 倍 |
-| [usage.md](docs/usage.md) | 界面操作、全部参数、状态字段 |
-| [latency.md](docs/latency.md) | 延迟预算、量法、哪些是硬地板 |
-| [testing.md](docs/testing.md) | 离线回归与 A/B 工具 |
-| [troubleshooting.md](docs/troubleshooting.md) | 静默失效类故障合集 |
-| [engineering-log.md](docs/engineering-log.md) | 全部实测数据与被否掉的方案（约 65KB） |
+| [hardware.zh.md](docs/hardware.zh.md) | BOM、接线、必须先修的三个物理问题 |
+| [install.zh.md](docs/install.zh.md) | 从零装一遍 |
+| [models.zh.md](docs/models.zh.md) | 模型清单、为什么选它、许可证提醒 |
+| [llm-serving.zh.md](docs/llm-serving.zh.md) | Magnitude 35B vs vLLM 7B、prefill / 前缀缓存的坑 |
+| [ocr-gpu.zh.md](docs/ocr-gpu.zh.md) | TensorRT 把 OCR 提速 3.5 倍 |
+| [usage.zh.md](docs/usage.zh.md) | 界面操作、全部参数、状态字段 |
+| [latency.zh.md](docs/latency.zh.md) | 延迟预算、量法、哪些是硬地板 |
+| [testing.zh.md](docs/testing.zh.md) | 离线回归与 A/B 工具 |
+| [troubleshooting.zh.md](docs/troubleshooting.zh.md) | 静默失效类故障合集 |
+| [engineering-log.zh.md](docs/engineering-log.zh.md) | 全部实测数据与被否掉的方案 |
 
 ## 测试
 
@@ -117,11 +121,14 @@ node tools/dom_render_test.js                # 渲染层 26 项
 - LLM 的 Bearer token 放在 `/etc/meeting-copilot/env`（0640），
   **仓库不含任何密钥**。CI 每次都会扫 `mag-*` / 本机路径 / 内网 IP
 - 首次部署可先复制 `conf/env.example` 核对参数
+- 仓库里没有任何能定位到开发机的信息：无主机名、用户名、邮箱、序列号、内网地址，
+  见 [SECURITY.md](SECURITY.md)
 
 ## 许可证
 
-代码 **MIT**；**模型权重不包含在仓库里**，`scripts/download-models.sh` 只从上游官方地址下载。
-SenseVoice / Piper 各音色 / PP-OCR / Qwen 等各有自己的许可证，商用前请逐个核对模型卡。
+代码 **MIT**，版权声明见 [LICENSE](LICENSE)：Copyright (c) 2026 meeting-copilot contributors。
+**模型权重不包含在仓库里**，`scripts/download-models.sh` 只从上游官方地址下载。
+SenseVoice / Piper 各音色 / PP-OCR / Qwen 等各有自己的许可证，商用前请逐个核对模型卡；第三方组件与声明汇总在 [NOTICE](NOTICE)。
 
 致谢：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)、
 [SenseVoice](https://github.com/FunAudioLLM/SenseVoice)、

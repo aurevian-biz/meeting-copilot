@@ -1,422 +1,424 @@
-# 工程日志：每一个数字是怎么来的
+# Engineering log: where every number came from
 
-> 这份文档是项目开发过程的原始记录，按时间顺序保留了「试了什么、量到什么数、最后选了哪条路」。
-> 它不是入门材料 —— 想快速跑起来看 [../README.md](../README.md) 和 [install.md](install.md)。
-> 这里保留失败方案和实测数据，是因为这套系统的每个默认值背后都有一组被否掉的替代方案，
-> 换个数字就退化（例如 `--max-s` 从 6.0 调到 7.0，同一段音频会开始出现幻觉）。
+[**English**](engineering-log.md) · [中文](engineering-log.zh.md) · [日本語](engineering-log.ja.md)
 
-# jetson-voice-assistant
+> This document is the raw record of the project's development process, kept in chronological order:
+> "what we tried, what number we measured, which path we finally took".
+> It is not introductory material — to get running quickly see [../README.md](../README.md) and [install.md](install.md).
+> Failed approaches and measured data are kept here because every default value in this system has a set of
+> rejected alternatives behind it, and changing one number degrades it (for example, moving `--max-s` from 6.0
+> to 7.0 makes hallucinations start appearing on the same piece of audio).
 
-Jetson AGX Orin 64GB 上的语音对话链路。当前处于**可用阶段**：拾音 → ASR → LLM → TTS 已串成一条闭环，有一个浏览器测试台可以直接对着说话。
+Voice dialogue pipeline on a Jetson AGX Orin 64GB. Currently in a **usable stage**: capture → ASR → LLM → TTS is closed into one loop, and there is a browser test bench you can talk to directly.
 
-## 1. 现状
+## 1. Current state
 
-| 组件 | 状态 | 位置 |
+| Component | Status | Location |
 |---|---|---|
-| 麦克风 | ✅ Logitech H340 USB 耳机（card 0） | `plughw:CARD=H340,DEV=0` |
-| ASR · SenseVoice | ✅ RTF 0.04，可切中日 | `asr-models/sherpa-onnx-sense-voice-.../model.int8.onnx` |
-| VAD · Silero | ✅ 模型 643KB，负责判停 | `asr-models/vad/silero_vad.onnx` |
-| TTS · Piper 日语 | ✅ 首块 636ms、RTF 0.135 | `tts-models/ja_JP-hi_fi_captain-medium.onnx` |
-| TTS · Piper 中文 | ✅ RTF 0.08–0.19 | `tts-models/zh_CN-huayan-medium.onnx` |
-| LLM · Qwen2.5-7B AWQ | ✅ 25 tok/s、首字 90ms | `models/qwen2.5-7b-awq`（5.2G）经 vLLM 0.19 服务 |
-| 唤醒 · KWS zipformer | ✅ 唤醒词「小八你好」，RTF 0.03、纯 CPU | `asr-models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01` |
-| 打断 · barge-in | ✅ 播报中插话即停，串音不误触 | 见 4.6，`BargeMonitor` |
-| 回声判别 | ✅ 播报期串音靠 ASR 文本重合排除，不做 AEC | 见 4.6；外放时靠它防自激 |
-| HDMI 采集 · MS2109 | ✅ 1080p30 稳定，需丢弃 1.2s 预热帧 | 见 4.7，`/dev/video0` |
-| 看屏幕 · 采集卡 OCR | ✅ RapidOCR 5.9s / 54 行，语音或按钮触发 | 见 4.8，`vision.py` |
-| 常驻 | ✅ systemd `voice-bench` | 端口 8095，重启自动拉起 |
+| Microphone | ✅ Logitech H340 USB headset (card 0) | `plughw:CARD=H340,DEV=0` |
+| ASR · SenseVoice | ✅ RTF 0.04, can switch zh/ja | `asr-models/sherpa-onnx-sense-voice-.../model.int8.onnx` |
+| VAD · Silero | ✅ model 643KB, decides end of speech | `asr-models/vad/silero_vad.onnx` |
+| TTS · Piper Japanese | ✅ first chunk 636ms, RTF 0.135 | `tts-models/ja_JP-hi_fi_captain-medium.onnx` |
+| TTS · Piper Chinese | ✅ RTF 0.08–0.19 | `tts-models/zh_CN-huayan-medium.onnx` |
+| LLM · Qwen2.5-7B AWQ | ✅ 25 tok/s, first token 90ms | `models/qwen2.5-7b-awq` (5.2G) served through vLLM 0.19 |
+| Wake · KWS zipformer | ✅ wake word 「小八你好」, RTF 0.03, CPU only | `asr-models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01` |
+| Barge-in | ✅ speaking during playback stops it; crosstalk does not false-trigger | see 4.6, `BargeMonitor` |
+| Echo discrimination | ✅ crosstalk during playback excluded by ASR text overlap, no AEC | see 4.6; this is what prevents self-oscillation on speaker |
+| HDMI capture · MS2109 | ✅ 1080p30 stable, must discard 1.2s of warm-up frames | see 4.7, `/dev/video0` |
+| See screen · capture-card OCR | ✅ RapidOCR 5.9s / 54 lines, triggered by voice or button | see 4.8, `vision.py` |
+| Resident service | ✅ systemd `voice-bench` | port 8095, restarted automatically |
 
-磁盘：`asr-models` 3.1G + `tts-models` 137M + 权重 5.2G，venv 都在外置盘，根盘余 5.9G。
+Disk: `asr-models` 3.1G + `tts-models` 137M + weights 5.2G, venvs all on an external disk, root disk has 5.9G free.
 
-## 1.1 TTS 安装的三个坑（都踩过）
+## 1.1 Three pitfalls installing TTS (all stepped on)
 
-1. **`piper-phonemize` 在 aarch64 没有 wheel**，装不上 —— 但 `piper-tts` 1.8.0 已经不依赖它，能直接装（`piper_tts-1.8.0-cp39-abi3-manylinux_2_28_aarch64.whl`）
-2. **日语需要 `pyopenjtalk`**，而官方 `pyopenjtalk` 只有源码包（要编译 OpenJTalk）。改用 **`pyopenjtalk-plus`**，它有 cp312 aarch64 wheel，模块名仍然是 `pyopenjtalk`，是 drop-in 替换
-3. **CLI 写 wav 头会报 `# channels not specified`** —— 改用 Python API `PiperVoice.synthesize_wav()`，见 `tts_probe.py`
+1. **`piper-phonemize` has no aarch64 wheel** and cannot be installed — but `piper-tts` 1.8.0 no longer depends on it and installs directly (`piper_tts-1.8.0-cp39-abi3-manylinux_2_28_aarch64.whl`)
+2. **Japanese needs `pyopenjtalk`**, and the official `pyopenjtalk` only ships a source package (you have to compile OpenJTalk). Switched to **`pyopenjtalk-plus`**, which has a cp312 aarch64 wheel; the module name is still `pyopenjtalk`, so it is a drop-in replacement
+3. **The CLI reports `# channels not specified` when writing the wav header** — switched to the Python API `PiperVoice.synthesize_wav()`, see `tts_probe.py`
 
-Piper 的日语只有**一个音色**：`ja_JP-hi_fi_captain-medium`（2 个说话人）。想要更好音质只能换 VOICEVOX 或修 MeloTTS。
+Piper's Japanese has only **one voice**: `ja_JP-hi_fi_captain-medium` (2 speakers). For better audio quality the only options are to switch to VOICEVOX or to fix MeloTTS.
 
-## 2. 拾音：两个必须先处理的问题
+## 2. Capture: two problems that must be handled first
 
-### 2.1 60Hz 工频哼声（实测）
+### 2.1 60Hz mains hum (measured)
 
-原始本底 **−30.6 dBFS**，频谱最强点 60Hz 且有 120Hz 谐波，0–80Hz 占 38.4% 能量。这不是房间噪声，是工频/地环路。
+Raw noise floor **−30.6 dBFS**, the strongest spectral peak at 60Hz with a 120Hz harmonic, 0–80Hz carrying 38.4% of the energy. This is not room noise, it is mains/ground loop.
 
-加 150Hz、4 阶高通后：
+After adding a 150Hz, 4th-order high-pass:
 
-| | 高通前 | 高通后 |
+| | Before high-pass | After high-pass |
 |---|---|---|
-| 本底 | −30.6 dBFS | **−48.8 ~ −56.6 dBFS** |
-| 语音段信噪比 | 9.8 dB | **34 dB** |
+| Noise floor | −30.6 dBFS | **−48.8 ~ −56.6 dBFS** |
+| Speech SNR | 9.8 dB | **34 dB** |
 
-语音主区在 300Hz–3kHz，切掉 150Hz 以下对 ASR 无损。**这一步不能省**，否则 VAD 门限会被哼声顶高，人声切不出来。
+The main speech region is 300Hz–3kHz, so cutting everything below 150Hz is lossless for ASR. **This step cannot be skipped**, otherwise the VAD threshold gets pushed up by the hum and speech never gets cut out.
 
-### 2.2 采集增益（已调，可恢复）
+### 2.2 Capture gain (adjusted, recoverable)
 
-H340 的采集增益出厂是满刻度 `44/44 = +8dB`，实测削顶 33 个样本。
+The H340's capture gain ships at full scale, `44/44 = +8dB`, and we measured 33 clipped samples.
 
 ```bash
-amixer -c 0 cset numid=4 32     # 44 → 32，即 +8dB → 0dB
-amixer -c 0 cset numid=4 44     # 恢复原值
+amixer -c 0 cset numid=4 32     # 44 → 32, i.e. +8dB → 0dB
+amixer -c 0 cset numid=4 44     # restore the original value
 ```
 
-注意：这个控件**没有** Playback/Capture 前缀，`amixer sget 'Mic Capture Volume'` 会报找不到，必须用 `numid`。
+Note: this control has **no** Playback/Capture prefix, so `amixer sget 'Mic Capture Volume'` reports not found; you must use `numid`.
 
-## 3. 引擎对比（同一段日语，3.29s / 3.56s）
+## 3. Engine comparison (same Japanese clip, 3.29s / 3.56s)
 
-用户口述内容（推定）：「このセクションのインターフェース仕様を確認してください」
+What the user said (presumed): 「このセクションのインターフェース仕様を確認してください」 ("please check the interface spec of this section")
 
-| 引擎 | 段1 | 段2 | RTF | 错误类型 |
+| Engine | Clip 1 | Clip 2 | RTF | Error type |
 |---|---|---|---|---|
-| whisper large-v3-turbo | この**セクション**の…**使用**を | この**セクッション**の…**使用**を | 2.2 | 汉字语义替换 |
-| whisper small | このセクションの…**使用**を | この**セキューション**の**インタフェース**を | 0.92 | 片假名退化 + 漏词 |
-| **SenseVoice int8** | この**セシ**の…**仕様**を | この**石晶**の**インタフェース** **仕様**を | **0.04** | 片假名崩塌 |
+| whisper large-v3-turbo | この**セクション**の…**使用**を | この**セクッション**の…**使用**を | 2.2 | kanji semantic substitution |
+| whisper small | このセクションの…**使用**を | この**セキューション**の**インタフェース**を | 0.92 | katakana degradation + dropped words |
+| **SenseVoice int8** | この**セシ**の…**仕様**を | この**石晶**の**インタフェース** **仕様**を | **0.04** | katakana collapse |
 
-两个引擎的失败点**不重叠**：whisper 读对片假名但把 `仕様` 换成 `使用`（语义级错误，事后无从发现）；SenseVoice 读对 `仕様` 但把 `セクション` 崩成 `セシ`/`石晶`（字形级错误，上下文可修复）。
+The two engines' failure points **do not overlap**: whisper reads the katakana correctly but replaces `仕様` (spec) with `使用` (use) — a semantic-level error that cannot be discovered after the fact; SenseVoice reads `仕様` correctly but collapses `セクション` (section) into `セシ`/`石晶` — a glyph-level error that context can repair.
 
-**结论**：ASR 用 SenseVoice（快 50 倍，双工唯一可行），片假名错误交给本地 LLM 纠错。这和 `work-memory` 里 OCR 的「确定性提取 + LLM 纠错」是同一套范式。
+**Conclusion**: use SenseVoice for ASR (50× faster, the only viable option for duplex), and hand katakana errors to the local LLM for correction. This is the same paradigm as the OCR rule in `work-memory`: "deterministic extraction + LLM correction".
 
-### 为什么不能用 whisper
+### Why whisper cannot be used
 
-`ctranslate2` 的 aarch64 wheel 是**纯 CPU**：`get_cuda_device_count() == 0`，faster-whisper 在这台机器上无法用 GPU。12 线程已拉满（默认只有 4 线程，拉动后 RTF 3.83 → 2.08）。GPU 必须留给 LLM。
+`ctranslate2`'s aarch64 wheel is **CPU only**: `get_cuda_device_count() == 0`, so faster-whisper cannot use the GPU on this machine. 12 threads are already maxed out (the default is only 4 threads; after raising it RTF went 3.83 → 2.08). The GPU has to be reserved for the LLM.
 
-## 3.1 TTS 实测与闭环验证
+## 3.1 TTS measurements and closed-loop verification
 
 ```
-加载      1.803s
-首块延迟  636.1ms      ← 双工真正感知的延迟，比总 RTF 重要得多
-合成      1.053s / 音频 7.83s  → RTF 0.135
-采样率    22050Hz   语速 6.6 字/秒
+load            1.803s
+first chunk     636.1ms      ← the latency duplex actually perceives, far more important than total RTF
+synthesis       1.053s / audio 7.83s  → RTF 0.135
+sample rate     22050Hz   speaking rate 6.6 chars/s
 ```
 
-闭环验证（合成 → 回读，原文已知）：
+Closed-loop verification (synthesise → read back, original text known):
 
-| | 文本 |
+| | Text |
 |---|---|
-| 原文 | この**設計書**のインターフェース仕様を確認してください。データベース接続には**コネクションプール**を使用します。 |
-| SenseVoice 回读 | この**設計者**のインターフェース仕様を確認してください、データベース接続にはコネクションプールを使用します。 |
+| Original | この**設計書**のインターフェース仕様を確認してください。データベース接続には**コネクションプール**を使用します。 |
+| SenseVoice read-back | この**設計者**のインターフェース仕様を確認してください、データベース接続にはコネクションプールを使用します。 |
 
-只有 `設計書→設計者`（しょ→しゃ）一处错，长片假名词全对。**注意这是合成音的分数**，比真实麦克风录音容易得多，不能当作实机准确率。
+Only one error: `設計書→設計者` (しょ→しゃ, "design document" → "designer"); the long katakana terms are all correct. **Note that this is a score on synthetic speech**, far easier than a real microphone recording, so it must not be taken as real-device accuracy.
 
-## 4. Web 测试台（`voice_server.py`）
+## 4. Web test bench (`voice_server.py`)
 
-浏览器打开 **http://127.0.0.1:8095**，点一下开始说话，服务器录音、识别、回答、合成，浏览器边收边播。
+Open **http://127.0.0.1:8095** in a browser, click once to start talking; the server records, recognises, answers and synthesises, and the browser plays as it receives.
 
-播报默认从**打开页面的那台机器**出声；插在 Jetson 上的耳机要出声，需开「声音：耳机」（见 4.11）。
+Playback by default comes out of **the machine that opened the page**; for the headset plugged into the Jetson to make sound you need to turn on "Sound: headset" (see 4.11).
 
-服务已注册为 systemd，重启自动恢复：
+The service is registered with systemd and recovers automatically on reboot:
 
 ```bash
-sudo systemctl status voice-bench      # 状态
-sudo systemctl restart voice-bench     # 改完代码重启
-journalctl -u voice-bench -f           # 看日志
+sudo systemctl status voice-bench      # status
+sudo systemctl restart voice-bench     # restart after changing code
+journalctl -u voice-bench -f           # watch the log
 ```
 
-### 4.1 三个设计取舍
+### 4.1 Three design trade-offs
 
-| 决定 | 原因 |
+| Decision | Reason |
 |---|---|
-| **录音在服务器端** | 麦克风插在 Jetson 上。浏览器录音只会用到你笔记本的麦克风，测不到真机拾音 |
-| **Silero VAD 判停，不定长** | 固定录 N 秒会让「说完了还得等」掩盖真实延迟。VAD 在停顿 0.6 秒后收尾 |
-| **按句合成、逐句回传** | 整段合成要等 LLM 全部生成完。这里 LLM 吐出一句就合成一句推给浏览器 |
+| **Recording on the server side** | The microphone is plugged into the Jetson. Recording in the browser would only use your laptop's microphone and would never exercise the real device's capture |
+| **Silero VAD decides the end, no fixed length** | Recording a fixed N seconds makes "you still have to wait after you finish speaking" mask the real latency. VAD closes the turn 0.6 seconds after a pause |
+| **Synthesise per sentence, send back per sentence** | Synthesising the whole thing would wait for the LLM to generate everything. Here the LLM emits one sentence and it is synthesised and pushed to the browser |
 
-### 4.2 为什么放弃了能量 VAD
+### 4.2 Why energy VAD was abandoned
 
-最初用「本底 + 余量」的绝对阈值，实测两种失败都出现过：
+At first we used an absolute threshold of "noise floor + margin", and both failure modes showed up in measurement:
 
-- **增益高时**：本底被语音污染 → 门限抬到 −20dB → 语音被自己判成静音，只截到 0.81s（`thr_db` 与 `peak_db` 完全相等是这病的指纹）
-- **环境嘈杂时**：噪声本身在门限之上 → 永远判不出「说完了」→ 每次都撞满 12 秒上限（用户实测两条记录都是 `record_s: 12.04`）
+- **When the gain is high**: the noise floor gets contaminated by speech → the threshold is pushed to −20dB → speech is judged as silence by itself, and only 0.81s is captured (`thr_db` exactly equal to `peak_db` is the fingerprint of this disease)
+- **In a noisy environment**: the noise itself sits above the threshold → "finished speaking" is never detected → every recording hits the 12-second cap (both records the user measured were `record_s: 12.04`)
 
-Silero VAD 基于 512 样本窗的语音概率，对增益和稳态噪声都不敏感，而且自带「说完多久算一段」。换掉之后，7.59 秒的音频在播放结束即收尾，不再撞上限。
+Silero VAD is based on speech probability over 512-sample windows, insensitive to both gain and stationary noise, and it comes with "how long after you stop counts as one segment". After the swap, a 7.59-second clip closed as soon as playback ended and no longer hit the cap.
 
-### 4.3 中文 / 日语音色自动切换
+### 4.3 Automatic Chinese / Japanese voice switching
 
-Piper 的日语音色读中文、中文音色读日文都会严重变调。判定规则：**有假名 → 日语；无假名但有汉字 → 中文**（中日混排已确认不存在，按句判断足够）。
+Piper's Japanese voice reading Chinese, and its Chinese voice reading Japanese, both distort badly. Decision rule: **kana present → Japanese; no kana but kanji present → Chinese** (mixed Chinese-Japanese has been confirmed not to occur, so a per-sentence judgement is enough).
 
-另外「回答用什么语言」不交给模型自己决定：实测前几轮是中文时，用户改说日语，模型仍用中文回答，因为它跟的是上下文风格。所以每轮按当前这句话的语言追加一条硬指令。想固定语言用 `--reply-lang zh|ja`，默认 `auto`。
+Also, "what language to answer in" is not left to the model to decide: we measured that when the previous turns were in Chinese and the user switched to Japanese, the model still answered in Chinese, because it follows the style of the context. So each turn appends a hard instruction based on the language of the current sentence. To pin the language use `--reply-lang zh|ja`, default `auto`.
 
-#### 两个真实故障（已修）
+#### Two real faults (both fixed)
 
-**① `合成失败：# channels not specified`** —— 不是录音也不是声卡问题。文本里没有一个能发音的字符（`。`、`……`、`「」`、纯空白）时，Piper 音素化结果为空，`synthesize_wav` 一帧都没写，`wave` 在 close 时发现声道数仍是 0，就抛这句。日志里对应的真实信号是 `JPCommonLabel_make(): No phoneme`。
+**① `合成失败：# channels not specified`** ("synthesis failed: # channels not specified") — it is neither a recording nor a sound-card problem. When the text contains no pronounceable character (`。`, `……`, `「」`, pure whitespace), Piper's phonemisation result is empty, `synthesize_wav` writes not a single frame, and `wave` finds the channel count is still 0 when closing, so it throws this line. The corresponding real signal in the log is `JPCommonLabel_make(): No phoneme`.
 
-现在三道防线：`strip_for_tts()` 用 `SPEAKABLE`（假名/汉字/字母/数字）判断，无发音字符直接跳过不送合成；`synth_to()` 合成到内存先看帧数，0 帧换另一音色重试；仍为 0 才抛出可读的 `ValueError`。
+There are now three lines of defence: `strip_for_tts()` uses `SPEAKABLE` (kana/kanji/letters/digits) to decide, and text with no pronounceable characters is skipped and never sent to synthesis; `synth_to()` synthesises into memory and checks the frame count first, retrying with the other voice if it is 0 frames; only if it is still 0 does it raise a readable `ValueError`.
 
-**② 中文回答里的数字读出日语** —— 纯数字句（`1.5`、`2026`、`OK`）既没假名也没汉字，原来落到 `default`（日语），于是「3.14」成了「さんてんいちよん」。现在 `pick()` 接受 `hint`：这类句子跟随上一句已确定的音色，`TurnRunner` 每轮用 `--reply-lang` 初始化、每句合成后更新；没有上下文时才退回中文。
+**② Numbers in Chinese answers were read out in Japanese** — pure-number sentences (`1.5`, `2026`, `OK`) have neither kana nor kanji, so they used to fall through to `default` (Japanese), and "3.14" became 「さんてんいちよん」 (san-ten-ichi-yon). Now `pick()` accepts a `hint`: such sentences follow the voice already decided for the previous sentence, `TurnRunner` initialises it from `--reply-lang` each turn and updates it after each sentence is synthesised; only when there is no context does it fall back to Chinese.
 
-顺带修了切句：`SENT_END` 的 `.` 原来会把 `3.14`、`v2.0` 拦腰切断，现在用 `(?<!\d)\.(?!\d)` 要求小数点两侧不同时是数字。
+Sentence splitting was fixed along the way: `.` in `SENT_END` used to cut `3.14` and `v2.0` in half; now `(?<!\d)\.(?!\d)` requires that the two sides of the decimal point are not both digits.
 
-### 4.4 实测延迟（本机）
+### 4.4 Measured latency (this machine)
 
-| 环节 | 中文 | 日文 |
+| Stage | Chinese | Japanese |
 |---|---|---|
-| ASR（SenseVoice） | 0.3–0.5s | 0.23–0.37s |
-| LLM 首字 | 90–440ms | 90ms |
-| TTS 首句 | 0.14–0.31s | 0.18s |
-| **端到端（无录音等待）** | **0.55–1.19s** | **0.44s** |
+| ASR (SenseVoice) | 0.3–0.5s | 0.23–0.37s |
+| LLM first token | 90–440ms | 90ms |
+| TTS first sentence | 0.14–0.31s | 0.18s |
+| **End to end (no recording wait)** | **0.55–1.19s** | **0.44s** |
 
-### 4.5 唤醒词（常驻监听）
+### 4.5 Wake word (always-on listening)
 
-页面上点「常驻监听」，之后说 **「小八你好」** 就能起一轮对话，不用碰鼠标。
+Click "常驻监听" (always-on listening) on the page, then say **「小八你好」** ("hi Xiaoba") and a dialogue turn starts without touching the mouse.
 
-用的是 `sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01`：中文拼音建模，3.3M 参数，纯 CPU。
+It uses `sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01`: Chinese pinyin modelling, 3.3M parameters, CPU only.
 
-| 指标 | 实测 |
+| Metric | Measured |
 |---|---|
-| RTF | 0.030（8 秒音频 0.26 秒算完，占单核约 3%） |
-| 误触发 | 14 段普通中文语音（新闻/访谈）0 次 |
-| 自定义词 | 汉字 → 拼音由 `text2token` 运行时生成，改词不用重训 |
+| RTF | 0.030 (8 seconds of audio computed in 0.26 seconds, about 3% of one core) |
+| False triggers | 0 times across 14 segments of ordinary Chinese speech (news/interviews) |
+| Custom words | kanji → pinyin generated at runtime by `text2token`; changing the word needs no retraining |
 
-**为什么必须加 `AudioHub`**：唤醒要求麦克风一直开着，而 ALSA 设备同一时刻只能被一个进程占用。原来 `record()` 每次自己起 `arecord`，唤醒线程一起来就会抢设备。现在由一个线程独占设备、把 20ms 定长帧分发给订阅者：
+**Why `AudioHub` is mandatory**: the wake word needs the microphone open all the time, and an ALSA device can only be held by one process at a time. Originally `record()` started its own `arecord` every time, so as soon as the wake thread started it fought for the device. Now a single thread owns the device and distributes fixed 20ms frames to subscribers:
 
-- 订阅时先补最近 0.3–0.6 秒的帧 → 「小八你好，今天天气怎么样」连说时不丢字
-- 队列满时丢最旧帧，采集线程永不被慢消费者阻塞
-- `arecord` 异常退出自动重开（`/api/health` 的 `hub.errors` 可观察）
+- On subscribe, backfill the last 0.3–0.6 seconds of frames → nothing is lost when you say 「小八你好，今天天气怎么样」 ("hi Xiaoba, what's the weather like today") in one breath
+- When the queue is full, drop the oldest frames; the capture thread is never blocked by a slow consumer
+- `arecord` exiting abnormally reopens automatically (observable as `hub.errors` in `/api/health`)
 
-浏览器侧**不用长连接，用 400ms 短轮询**（`GET /api/poll?after=<seq>`）。原先是 `GET /api/live` 的 NDJSON 长连接，实测在这个访问环境里根本建不起来（服务端 `live` 恒为 0），唤醒命中 7 次全部被判成「没有页面在听」跳过。短轮询用普通 fetch，任何代理环境都能通，代价是唤醒到提示音最多 400ms 延迟。
+On the browser side **no long connection: 400ms short polling** (`GET /api/poll?after=<seq>`). Previously it was an NDJSON long connection on `GET /api/live`, which in this access environment could not be established at all (server-side `live` was always 0), and all 7 wake hits were judged "no page listening" and skipped. Short polling uses ordinary fetch, works through any proxy environment, at the cost of up to 400ms delay from wake to the cue tone.
 
-服务端维护 600 条事件环形缓冲 + 自增序号，页面打开时用 `after=` 一个极大值对齐到当前，不重放历史事件。唤醒轮和手动轮用同一把 `turn_lock` 互斥，不会同时抢麦克风。
+The server keeps a 600-event ring buffer plus a monotonic sequence number; when the page opens it aligns to the present with `after=` set to a very large value, without replaying historical events. Wake turns and manual turns are mutually excluded by the same `turn_lock`, so they never fight over the microphone at the same time.
 
-> 只有中文唤醒词：官方 KWS 模型是 wenetspeech（中文拼音）训练的，日语发音对不上。若将来要日语唤醒，只能退回「常驻 SenseVoice 识别 + 文本匹配」，CPU 占用会从 3% 升到 10% 左右。
+> Chinese wake words only: the official KWS model is trained on wenetspeech (Chinese pinyin), and Japanese pronunciation does not match. If Japanese wake-up is wanted in future, the only fallback is "always-on SenseVoice recognition + text matching", which raises CPU usage from 3% to around 10%.
 
-### 4.6 打断（播报中插话）
+### 4.6 Barge-in (interjecting during playback)
 
-助理还在说话时直接开口，它会立刻停下听你说，不用等它讲完。
+If you simply start talking while the assistant is still speaking, it stops immediately and listens, without waiting for it to finish.
 
-**为什么需要播报时钟**：合成比播放快一个数量级（RTF 0.1），`TurnRunner.run()` 返回时前面几段还在浏览器里排队播。如果按「生成结束」判断，用户在助理正说话时就已经被当成「说完了」，根本没有打断窗口。所以服务端维护一条虚拟播放时间线（`SpeakState`）：每发一段音频就把结束时刻往后推 `audio_s` 秒，队列排空自然归零。
+**Why a playback clock is needed**: synthesis is an order of magnitude faster than playback (RTF 0.1), so when `TurnRunner.run()` returns, the earlier segments are still queued in the browser waiting to play. If we judged by "generation finished", the user would already be treated as "done speaking" while the assistant is talking, and there would be no barge-in window at all. So the server maintains a virtual playback timeline (`SpeakState`): each time a segment of audio is sent, the end time is pushed back by `audio_s` seconds, and it naturally returns to zero when the queue drains.
 
-判定链三道，任何一道不过就不打断：
+The decision chain has three stages; if any one of them fails there is no barge-in:
 
-| 判据 | 作用 | 默认 |
+| Criterion | Role | Default |
 |---|---|---|
-| 能量 | 高于静默本底 + 余量 | `--barge-db -42`、`--barge-margin 8` |
-| 语音概率 | Silero VAD，过滤键盘/椅子/风扇 | 阈值 0.5，需连续 0.30s |
-| 文本重合 | 排除外放时的自身串音 | 最长公共子串 ≥3 字且占比 ≥0.7 |
+| Energy | above silent noise floor + margin | `--barge-db -42`, `--barge-margin 8` |
+| Speech probability | Silero VAD, filters keyboard/chair/fan | threshold 0.5, requires 0.30s continuous |
+| Text overlap | excludes the assistant's own crosstalk on speaker | longest common substring ≥3 chars and ratio ≥0.7 |
 
-**第三道是关键**。外放时麦克风会听到助理自己的声音，不排除就会自激：一播报就被打断，重新播报又被自己打断。串音窗口只有一两秒，识别出来就是三五个字（实测 `今天天`），拿它和十四字整句算 `SequenceMatcher.ratio` 只有 0.35，永远够不着阈值；改成「最长公共子串占比」后 `3/3 = 1.0`，判定干净利落。
+**The third stage is the key one.** On speaker the microphone hears the assistant's own voice, and if you do not exclude it you get self-oscillation: it starts playing, is immediately interrupted, replays, and is interrupted by itself again. The crosstalk window is only one or two seconds, so what gets recognised is three to five characters (measured: `今天天`); computing `SequenceMatcher.ratio` against the full fourteen-character sentence gives only 0.35, which never reaches the threshold; switching to "longest common substring ratio" gives `3/3 = 1.0`, a clean decision.
 
-几个实现细节：
+A few implementation details:
 
-- **门限只跟静默本底走**，不参考播报期电平——串音和真人音量本来就相当，电平上根本分不开，用它抬门限只会让真人插话也打不断
-- **判成串音后冷却 1.2 秒**，否则同一句话每 0.3 秒重判一次，白跑十来次 ASR
-- **帧交接**：打断检测已读走的 1.2 秒帧通过 `hub.subscribe(pre_frames=...)` 原样交给录音，用户那句话的开头不会丢（环形缓冲只有 0.6 秒，补不回来）
-- **被打断的轮次不进历史**（`done.interrupted`）：它是不完整的，留着会污染后续上下文
-- 播报结束回到非播报期时重建 VAD，否则上一句的残留状态会把下一轮的 holding 算歪
+- **The threshold follows only the silent noise floor**, it does not reference the level during playback — crosstalk and a real person's volume are comparable, so they simply cannot be separated by level, and using it to raise the threshold would only make a real person's interjection unable to barge in either
+- **After being judged as crosstalk, cool down for 1.2 seconds**, otherwise the same sentence is re-judged every 0.3 seconds and a dozen ASR runs are wasted
+- **Frame handover**: the 1.2 seconds of frames already consumed by barge-in detection are handed to the recorder as-is via `hub.subscribe(pre_frames=...)`, so the beginning of the user's sentence is not lost (the ring buffer only holds 0.6 seconds, not enough to backfill)
+- **An interrupted turn does not enter history** (`done.interrupted`): it is incomplete, and keeping it would pollute the following context
+- When playback ends and we return to the non-playing period, rebuild the VAD, otherwise the leftover state of the previous sentence skews the next turn's holding computation
 
-实测（真 VAD + 真 ASR + 真 TTS，合成音喂帧代替麦克风）：
+Measured (real VAD + real ASR + real TTS, synthetic audio fed as frames instead of the microphone):
 
-| 场景 | 结果 |
+| Scenario | Result |
 |---|---|
-| 外放串音 | 2 次全判串音，0 次打断 |
-| 有人插话「等一下，我还想问个问题」 | 1 次打断，起新轮，事件与 LLM 调用各 1 次 |
-| 静默 2 秒 | 无任何反应 |
-| 已播完再说话 | 不判（播报时钟归零） |
+| Speaker crosstalk | 2 of 2 judged crosstalk, 0 barge-ins |
+| Someone interjects 「等一下，我还想问个问题」 ("wait, I want to ask something else") | 1 barge-in, a new turn started, 1 event and 1 LLM call each |
+| 2 seconds of silence | no reaction at all |
+| Speaking after playback has finished | not judged (playback clock at zero) |
 
-复现：`../asr-venv/bin/python tools/barge_e2e.py`（不需要麦克风，约 8 秒）。
+Reproduce: `../asr-venv/bin/python tools/barge_e2e.py` (no microphone needed, about 8 seconds).
 
-**限制**：打断只在常驻模式下生效。手动点「开始说话」时录音设备由 `record()` 独占，没有旁听通道。另外戴耳机效果最好——外放时串音虽被排除，但冷却期内无法打断。
+**Limitations**: barge-in only takes effect in always-on mode. When you click "开始说话" (start talking) manually, the recording device is exclusively held by `record()` and there is no listening channel alongside. Also, headphones work best — on speaker, crosstalk is excluded, but barge-in is impossible during the cooldown.
 
 ```bash
---no-barge              # 关闭打断
---barge-db -38          # 环境嘈杂时提高门限
---barge-margin 12       # 本底波动大时加余量
+--no-barge              # disable barge-in
+--barge-db -38          # raise the threshold in a noisy environment
+--barge-margin 12       # add margin when the noise floor fluctuates a lot
 ```
 
-观察：`/api/health` 的 `barge.hits`（打断次数）、`barge.echo`（排除掉的串音次数）、`barge.thr_db`（当前门限）、`barge.playing` / `remain_s`（播报时钟）。命中与串音都会打到 journal：`[barge] 打断：「…」` / `[barge] 疑似串音，忽略：「…」`。
+Observation: `barge.hits` (barge-in count), `barge.echo` (excluded crosstalk count), `barge.thr_db` (current threshold), `barge.playing` / `remain_s` (playback clock) in `/api/health`. Both hits and crosstalk are written to the journal: `[barge] 打断：「…」` (barge-in) / `[barge] 疑似串音，忽略：「…」` (suspected crosstalk, ignored).
 
-## 4.7 HDMI 采集卡（MacroSilicon MS2109）
+## 4.7 HDMI capture card (MacroSilicon MS2109)
 
-链路：**信号源 → 4K USB KVM → 采集卡 HDMI IN → USB → Jetson**。2026-11-19 打通，1080p30 稳定出图。
+Link: **signal source → 4K USB KVM → capture card HDMI IN → USB → Jetson**. Working since 2026-11-19, stable image at 1080p30.
 
-| 项目 | 值 |
+| Item | Value |
 |---|---|
-| 设备 | `534d:2109 MacroSilicon USB3.0 Capture`，UVC 1.00 |
-| 节点 | `/dev/video0`（视频）、`/dev/video1`（metadata） |
-| 当前接入点 | 4 口扩展坞第 **4** 口 → 系统 `1-4.4`（Bus 001 / 480Mbps） |
-| 格式 | MJPEG + YUYV，1920×1080 ~ 640×480 共 11 档 |
-| 实际能力 | HDMI 输入到 4K@30Hz；UVC 输出上限 1080p30（MS2109 是 USB2.0 芯片，“USB3.0”指 HDMI 侧） |
+| Device | `534d:2109 MacroSilicon USB3.0 Capture`, UVC 1.00 |
+| Nodes | `/dev/video0` (video), `/dev/video1` (metadata) |
+| Current port | 4-port dock port **4** → system `1-4.4` (Bus 001 / 480Mbps) |
+| Formats | MJPEG + YUYV, 1920×1080 ~ 640×480, 11 modes in total |
+| Actual capability | HDMI input up to 4K@30Hz; UVC output capped at 1080p30 (the MS2109 is a USB2.0 chip, "USB3.0" refers to the HDMI side) |
 
-### 最大的坑：每次打开设备有约 1.2 秒预热黑帧
+### Biggest pitfall: about 1.2 seconds of warm-up black frames every time the device is opened
 
-**MS2109 每次打开设备、以及每次切换分辨率后，前 33~36 帧固定输出纯黑（YMAX=7）。**
+**Every time the MS2109 device is opened, and after every resolution switch, the first 33~36 frames are solid black (YMAX=7).**
 
-实测（640×480 连抓 40 帧）：前 33 帧 `YMAX=7`，第 34 帧起 `YMAX=255`。
+Measured (640×480, 40 consecutive frames): the first 33 frames have `YMAX=7`, and from frame 34 on `YMAX=255`.
 
-只抓 1 帧去判断信号的人（包括我）一定会得出「无信号」的错误结论 —— 抓到的永远是预热黑帧。更迷惑的是这会让现象看起来跟带宽完全相反：`640×480` 全黑、`1920×1080` 反而 9/10 出图，因为低分辨率那轮刚切完没预热够。
+Anyone who grabs a single frame to decide whether there is a signal (me included) will inevitably conclude "no signal" — what gets grabbed is always a warm-up black frame. More confusingly, this makes the symptom look exactly opposite to bandwidth: `640×480` is all black, while `1920×1080` actually produces an image 9/10 times, because that round at the low resolution had just switched and had not warmed up enough.
 
-正确的取样方式（单次打开内丢弃预热帧）：
+The correct sampling method (discard warm-up frames within a single open):
 
 ```bash
 ffmpeg -f v4l2 -input_format mjpeg -video_size 1920x1080 -framerate 30 -i /dev/video0 \
        -t 2.5 -vf "select=gte(n\,40)" -frames:v 1 -y shot.jpg
 ```
 
-### 预热后的稳定性
+### Stability after warm-up
 
-连采 10 秒 / 300 帧：前 36 帧黑，之后 **264 帧全部正常，零中断**。偶发 `EOI missing, emulating` / `overread 8`（hub 带宽边缘的坏 JPEG，ffmpeg 能恢复），不影响画面。
+Continuous capture for 10 seconds / 300 frames: the first 36 frames black, then **all 264 frames normal, zero dropouts**. Occasional `EOI missing, emulating` / `overread 8` (corrupt JPEGs at the edge of hub bandwidth, which ffmpeg recovers from) do not affect the picture.
 
-### 排查顺序（下次照这个来）
+### Troubleshooting order (use this next time)
 
-1. `lsusb | grep 534d` —— 没有就是枚举问题（查供电、换口、别用刷机口 USB-C）
-2. `/dev/video*` 是否存在 —— 有卡无节点通常是 uvcvideo 没绑上
-3. 跑 `tools/hdmi_probe.sh`（已内置预热丢弃）—— 它说无信号才是真无信号
-4. 仍无信号再查：HDMI 线是否插 IN 口、源是否开着、KVM 是否切到该通道、4K@60 是否超出上限
+1. `lsusb | grep 534d` — if it is missing it is an enumeration problem (check power, change port, do not use the flashing USB-C port)
+2. Whether `/dev/video*` exists — a card without nodes usually means uvcvideo did not bind
+3. Run `tools/hdmi_probe.sh` (warm-up discarding built in) — only when it says there is no signal is there really no signal
+4. If there is still no signal, check further: is the HDMI cable in the IN port, is the source switched on, is the KVM switched to that channel, does 4K@60 exceed the limit
 
-### 踩过的供电坑
+### Power pitfalls stepped on
 
-同一张卡插扩展坞第 3 口时，枚举成功但 **166 秒后自己断开**；换到第 4 口后连续 8 分钟无掉线。无源 hub 带耳机 + 鼠标 + 采集卡供电吃紧，长时间采集建议直插机身 Type-A 口（`1-1` / `1-2`）。
+With the same card in port 3 of the dock, enumeration succeeded but **it disconnected itself after 166 seconds**; after moving to port 4 there were no dropouts for 8 continuous minutes. An unpowered hub carrying headset + mouse + capture card is tight on power; for long captures it is better to plug straight into the machine's Type-A port (`1-1` / `1-2`).
 
-## 4.8 看屏幕（抽帧 → OCR → 进对话）
+## 4.8 See screen (frame grab → OCR → into the dialogue)
 
-让助手能回答「屏幕上写的是什么」。链路：**采集卡取帧 → 丢弃预热帧 → 缩到 1440 → RapidOCR → 拼进 user message**。
+Lets the assistant answer "what is written on the screen". Link: **capture card grabs a frame → discard warm-up frames → downscale to 1440 → RapidOCR → splice into the user message**.
 
 ```bash
-python vision.py --image shot.jpg        # 无硬件，直接测 OCR
-python vision.py --dev /dev/video0       # 真设备取一帧并识别
-curl -X POST -d '{"force":true}' localhost:8095/api/look   # 走服务
+python vision.py --image shot.jpg        # no hardware, test OCR directly
+python vision.py --dev /dev/video0       # grab one frame from the real device and recognise it
+curl -X POST -d '{"force":true}' localhost:8095/api/look   # go through the service
 ```
 
-### 两种触发
+### Two triggers
 
-| 触发 | 行为 |
+| Trigger | Behaviour |
 |---|---|
-| 语音说「看看屏幕上是什么」等 | `is_look_intent()` 命中 → 先播「我看一下。」→ OCR → 连同屏幕文字一起问 LLM |
-| 页面点「看屏幕」按钮 | 只跑取帧 + OCR，把结果摊在「屏幕文字」卡片里，不惊动 LLM |
+| Say 「看看屏幕上是什么」 ("look at what's on the screen") or similar | `is_look_intent()` matches → plays 「我看一下。」 ("let me take a look") first → OCR → asks the LLM together with the screen text |
+| Click the "看屏幕" (look at screen) button on the page | only runs frame grab + OCR and lays the result out in the "屏幕文字" (screen text) card, without disturbing the LLM |
 
-### 为什么用 RapidOCR，不用 PaddleOCR
+### Why RapidOCR and not PaddleOCR
 
-同一张 1080p 中文界面（50 行）在 Jetson 上实测：
+The same 1080p Chinese UI (50 lines) measured on the Jetson:
 
-| 引擎 | 耗时 | 平均置信 |
+| Engine | Time | Mean confidence |
 |---|---|---|
 | **RapidOCR (onnxruntime)** | **6.2s** | 0.894 |
-| PaddleOCR 默认 server 模型 | 17.0s | 0.98 |
+| PaddleOCR default server model | 17.0s | 0.98 |
 | PaddleOCR mobile | 24.6s | 0.749 |
 
-mobile 模型在 Jetson 上反而更慢（CPU 对大卷积不友好），置信度还掉了。RapidOCR 另外省掉 paddle 那几百 MB 依赖 —— asr-venv 里现成就有。
+The mobile model is actually slower on the Jetson (the CPU is unfriendly to large convolutions) and the confidence dropped as well. RapidOCR also saves the several hundred MB of paddle dependencies — it is already there in asr-venv.
 
-### 为什么输入先缩到 1440
+### Why the input is downscaled to 1440 first
 
-| 输入 | 耗时 | 结果 |
+| Input | Time | Result |
 |---|---|---|
-| 1920 | 7.3s | 「窗口」读成「官口」 |
-| **1440** | **5.7s** | 「窗口」读对 |
-| 1280 | 4.6s | 开始出错 |
-| 960 | 4.3s | 小字糊（「编辑」→「编冀」） |
+| 1920 | 7.3s | 「窗口」 read as 「官口」 ("window" → "official opening") |
+| **1440** | **5.7s** | 「窗口」 read correctly |
+| 1280 | 4.6s | errors start |
+| 960 | 4.3s | small text blurred (「编辑」→「编冀」, "edit" → nonsense) |
 
-RapidOCR 内部会把长边压到固定尺寸，先自己用 INTER_AREA 缩能少一次重采样，反而更准。
+RapidOCR internally squeezes the long edge to a fixed size; downscaling with INTER_AREA ourselves first saves one resampling and is actually more accurate.
 
-2026-11-21 又拿真机帧（132 行密集文本）复测了降分辨率这条路，**结论是不做**：
+On 2026-11-21 we re-measured the downscaling path with a real-device frame (132 lines of dense text), **and the conclusion is: do not do it**:
 
-| 长边 | 耗时（同条件 4 线程交替测） | 行数 | 置信 |
+| Long edge | Time (4 threads, alternating under the same conditions) | Lines | Confidence |
 |---|---|---|---|
 | **1440** | 6.13s | 132 | **0.951** |
 | 1200 | 5.94s | 134 | 0.942 |
 | 1080 | 5.70s | 132 | 0.922 |
 
-只省 7%，置信掉 0.03、行数还不稳。**行数多的时候耗时由「行数 × 每行解码」决定，不是由输入像素数决定**——按面积算出来的收益根本兑现不了。
+Saves only 7%, confidence drops 0.03, and the line count is not even stable. **With many lines the time is determined by "lines × per-line decode", not by the number of input pixels** — the gain computed from area simply cannot be cashed in.
 
-这条规律后来被两组数据钉死（同一台机、同样 8 线程、同样 1440 宽）：
+This rule was later nailed down by two data sets (same machine, same 8 threads, same 1440 width):
 
-| 屏幕行数 | OCR 耗时 | 每行 |
+| Screen lines | OCR time | Per line |
 |---|---|---|
-| 132 行（IDE 满屏） | 4.24s | 32 ms |
-| 53 行（切到别的窗口） | 1.61s | 30 ms |
+| 132 lines (IDE full screen) | 4.24s | 32 ms |
+| 53 lines (switched to another window) | 1.61s | 30 ms |
 
-**所以「想让看屏幕变快」= 「让屏幕上少几行」**，跟分辨率、跟引擎参数都没关系。
+**So "make looking at the screen faster" = "put fewer lines on the screen"**, and it has nothing to do with resolution or with engine parameters.
 
-### 实测（含语音链路，2026-11-21 上机，HDMI 有画面）
+### Measured (including the voice path, on the machine 2026-11-21, HDMI has a picture)
 
 ```
 LOOK: ok=True 行=130 置信=0.949 4.45s
 DONE: look_s=4.45 llm_first_ms=1001 llm_s=2.0 total_s=6.56
 ```
 
-抓帧常驻生效后复测两轮，**端到端 6.56s / 7.30s**（之前推算的 6.3s 基本对上，略偏乐观）：
+After the resident frame grab took effect, two rounds re-measured **end to end 6.56s / 7.30s** (the earlier estimate of 6.3s basically matches, slightly optimistic):
 
-| 段 | 第 1 轮 | 第 2 轮 | 占比 |
+| Stage | Round 1 | Round 2 | Share |
 |---|---|---|---|
-| 取帧 | 0.08s | 0.06s | ~1% |
+| Frame grab | 0.08s | 0.06s | ~1% |
 | **OCR** | **4.34s** | **5.55s** | **68%~77%** |
-| LLM 首字 | 1.00s | 0.45s | 冷 / 热（前缀缓存命中） |
-| LLM 全量 | 2.00s | 1.59s | — |
-| 首句 TTS 合成 | 0.10s | 0.07s | ~1% |
+| LLM first token | 1.00s | 0.45s | cold / warm (prefix cache hit) |
+| LLM full | 2.00s | 1.59s | — |
+| First sentence TTS synthesis | 0.10s | 0.07s | ~1% |
 
-结论：**取帧已经被压到可忽略，OCR 是唯一瓶颈，且自身抖动 ±1.2s**。LLM 首字冷 1 秒、热 0.45 秒，因为 130 行 OCR 文本每次都变，前缀缓存只吃到 system prompt 那段。
+Conclusion: **frame grabbing has been pushed down to negligible; OCR is the only bottleneck, and it jitters by ±1.2s itself**. The LLM first token is 1 second cold and 0.45 seconds warm, because the 130-line OCR text changes every time and the prefix cache only covers the system prompt part.
 
-> 这组是**纯 CPU** 的数。rec 换 TensorRT 之后端到端掉到 **3.4~3.9s**，见下面「把 rec 搬到 GPU」。
+> These are **pure CPU** numbers. After rec moved to TensorRT the end-to-end dropped to **3.4~3.9s**, see "Moving rec to the GPU" below.
 
-### 缓存救不了：画面一直在变
+### Caching cannot save it: the picture is always changing
 
-`look()` 有 dHash 缓存（8 秒内同画面直接返回）。但真机连测三次 `force=false`，`cached` **全是 False**，行数在 130/133/132 之间跳——IDE 光标、时间戳、终端输出一直在动。
+`look()` has a dHash cache (the same picture within 8 seconds is returned directly). But testing `force=false` three times in a row on the real device, `cached` was **always False**, and the line count jumped between 130/133/132 — the IDE cursor, timestamps and terminal output are always moving.
 
-所以「同一画面重复看能省 4 秒」这个假设**不成立**，语音触发继续用 `force=True` 是对的。
+So the assumption "looking at the same picture repeatedly saves 4 seconds" **does not hold**, and continuing to use `force=True` for voice triggers is correct.
 
-### OCR 线程数：必须显式钉死（2026-11-21）
+### OCR thread count: must be pinned explicitly (2026-11-21)
 
-`RapidOCR()` 不传线程数时吃 onnxruntime 默认值。同一帧真机画面、同一进程串行测：
+When `RapidOCR()` is not given a thread count it takes the onnxruntime default. Same real-device frame, same process, serial measurement:
 
-| 线程 | 耗时 | 行数 | 置信 |
+| Threads | Time | Lines | Confidence |
 |---|---|---|---|
 | 6 | **4.34s** | 132 | 0.951 |
 | **8** | **4.49s** | 132 | 0.951 |
 | 10 | 5.11s | 132 | 0.951 |
-| 12（=核数） | **9.10s** | 132 | 0.951 |
+| 12 (= core count) | **9.10s** | 132 | 0.951 |
 
-**12 线程比 8 线程慢一倍**——这台机同时跑 vLLM、ASR、字幕服务，12 线程把 12 核全部超订，线程迁移和抢核的代价远大于并行收益。平坦区在 6~8，10 开始退化，12 直接崩。
+**12 threads is twice as slow as 8** — this machine runs vLLM, ASR and the caption service at the same time, and 12 threads oversubscribe all 12 cores; the cost of thread migration and core contention far exceeds the parallel gain. The flat region is 6~8, degradation starts at 10, and 12 collapses outright.
 
-现在 `vision.OCR_THREADS = 8` 写死，`--vision-threads` 可调。注意：**生产原来的默认值本来就落在 8 附近**（实测一直是 4.0~4.5s，不是 9s），所以这改动是**防止退化的加固**，不是提速——换机型、换 onnxruntime 版本、调大核数时不会突然慢一倍。
+Now `vision.OCR_THREADS = 8` is hard-coded, adjustable via `--vision-threads`. Note: **the original production default already landed near 8** (measurements were always 4.0~4.5s, not 9s), so this change is **hardening against regression**, not a speed-up — it means that changing the machine model, the onnxruntime version or the core count will not suddenly make it twice as slow.
 
-> 反例教训：第一轮对比时三档一起跑，结果 1200/1080 反而比 1440 慢一倍。原因是 benchmark 自己的 onnxruntime 也起了 12 线程，测的是「两个进程互抢」，不是分辨率。**测并发敏感的东西必须先限线程、档间留间隔。**
+> Counter-example lesson: in the first comparison round all three settings ran together, and 1200/1080 came out twice as slow as 1440. The reason is that the benchmark's own onnxruntime also started 12 threads, so what was being measured was "two processes fighting each other", not resolution. **When measuring anything concurrency-sensitive you must limit threads first and leave a gap between settings.**
 
-### 为什么 rec 在 CPU 上压不下去（七条路，全试穿）
+### Why rec cannot be pushed down on CPU (seven paths, all tried)
 
-先纠正一个容易想当然的判断：**RapidOCR 的 rec 本来就是批量的**，不是「一行一调用」。`TextRecognizer.__call__` 收的是 crop **列表**，按 `rec_batch_num`（默认 6）拼成一个 `norm_img_batch` 送 session。所以「把多行合成一批」这个优化方向从一开始就不存在。
+First correct an easy assumption: **RapidOCR's rec is already batched**, it is not "one call per line". `TextRecognizer.__call__` takes a **list** of crops and assembles them into one `norm_img_batch` by `rec_batch_num` (default 6) before sending to the session. So the optimisation direction "merge multiple lines into one batch" never existed in the first place.
 
-耗时拆解（132 行真机画面，8 线程）：
+Time breakdown (132 real-device lines, 8 threads):
 
-| 阶段 | 耗时 | 占比 |
+| Stage | Time | Share |
 |---|---|---|
 | det | 0.297s | 7.6% |
 | cls | 0.153s | 3.9% |
-| **rec** | **3.437s**（25 批 × batch 6，147 框） | **88.4%** |
+| **rec** | **3.437s** (25 batches × batch 6, 147 boxes) | **88.4%** |
 
-然后逐个试：
+Then tried one by one:
 
-| 尝试 | 结果 | 判定 |
+| Attempt | Result | Verdict |
 |---|---|---|
-| `rec_batch_num` 6 → 12 / 24 / 48 | 4.03 → 4.13 / 4.01 / 4.85s | ❌ 无收益，48 反而崩（`max_wh_ratio` 取批内最大，批越大补边越宽） |
-| 关 `use_cls` | -0.15s | ⚠️ 只 4%，且丢掉倒置文本保护，不值 |
-| int8 全量化 | 10.8MB → 2.9MB | ❌ **精度崩**：132 行 → 9 行，均分 0.951 → 0.563（CTC 对 logits 极敏感） |
-| int8 只量化 MatMul | 精度 132 行 / 0.951 / 1846 字符，**完全无损** | ❌ 速度 3.98s，一点没快 |
-| 换 PP-OCRv6_small | 4.68s，精度反而更高（135 行 / 0.971 / 1976 字符） | ❌ 慢 15% |
-| `unclip_ratio` 1.6 → 1.2 / 1.0 | 4.69 / 5.14s | ❌ 框更紧反而更慢（违反直觉） |
-| 常量折叠 `Constant` → `initializer` | 3.90s（-4%，精度逐字一致） | ➖ 收益≈测量噪声（±0.2s），不值得维护一个自定义模型文件 |
-| CUDA EP | 系统 CUDA **13.2**，ORT 只发 **cu12** 轮子；`pip` 无 cu13 包，`apt-cache` 里也没有 `cuda-cudart-12-*` | ❌ 这条路要自编 ORT 才能走 |
+| `rec_batch_num` 6 → 12 / 24 / 48 | 4.03 → 4.13 / 4.01 / 4.85s | ❌ no gain; 48 actually collapses (`max_wh_ratio` takes the max within the batch, so bigger batches mean wider padding) |
+| Turn off `use_cls` | -0.15s | ⚠️ only 4%, and it loses the protection for inverted text; not worth it |
+| int8 full quantisation | 10.8MB → 2.9MB | ❌ **accuracy collapses**: 132 lines → 9 lines, mean score 0.951 → 0.563 (CTC is extremely sensitive to logits) |
+| int8 on MatMul only | accuracy 132 lines / 0.951 / 1846 characters, **completely lossless** | ❌ speed 3.98s, not faster at all |
+| Switch to PP-OCRv6_small | 4.68s, accuracy actually higher (135 lines / 0.971 / 1976 characters) | ❌ 15% slower |
+| `unclip_ratio` 1.6 → 1.2 / 1.0 | 4.69 / 5.14s | ❌ tighter boxes are slower (counter-intuitive) |
+| Constant folding `Constant` → `initializer` | 3.90s (-4%, accuracy identical character by character) | ➖ gain ≈ measurement noise (±0.2s), not worth maintaining a custom model file |
+| CUDA EP | system CUDA **13.2**, ORT only ships **cu12** wheels; `pip` has no cu13 package and `apt-cache` has no `cuda-cudart-12-*` either | ❌ this path requires building ORT yourself |
 
-结论：**rec 在 CPU 上没有无损提速的空间**。真出路只有 GPU——见下。
+Conclusion: **there is no room for lossless speed-up of rec on CPU**. The only real way out is the GPU — see below.
 
-#### 顺手记一个 Paddle2ONNX 的坑
+#### Also noting a Paddle2ONNX pitfall
 
-`ch_PP-OCRv4_rec_infer.onnx` 里 **initializer 数 = 0，420 个权重全是 `Constant` 节点**。ORT 的 `quantize_dynamic` 只认 initializer，直接跑会报 `Expected conv2d_157.w_0 to be an initializer`。必须先做常量折叠（把 `Constant` 的 tensor 搬进 `graph.initializer` 再删节点），量化才会真的动到权重——否则你会得到一个「文件大小一模一样」的假成功。
+In `ch_PP-OCRv4_rec_infer.onnx` the **initializer count = 0; all 420 weights are `Constant` nodes**. ORT's `quantize_dynamic` only recognises initializers, and running it directly reports `Expected conv2d_157.w_0 to be an initializer`. You must do constant folding first (move the `Constant` tensors into `graph.initializer` and then delete the nodes) for quantisation to actually touch the weights — otherwise you get a fake success where "the file size is exactly the same".
 
-### 把 rec 搬到 GPU：TensorRT（2026-11-21）
+### Moving rec to the GPU: TensorRT (2026-11-21)
 
-**不要走 onnxruntime 的 CUDA EP。** 这台机是 JetPack 7.2 + CUDA **13.2**，而 ORT 官方只发 **cu12** 轮子：pip 上没有 cu13 包，`apt-cache` 里也没有 `cuda-cudart-12-*`。装 `onnxruntime-gpu` 之后 `get_available_providers()` 会**照常列出** `CUDAExecutionProvider`（骗人的），但建 session 时报 `No registered plugin EP device found`——那是 EP 的 .so dlopen 失败。别在这上面浪费时间。
+**Do not use onnxruntime's CUDA EP.** This machine is JetPack 7.2 + CUDA **13.2**, while ORT officially only ships **cu12** wheels: there is no cu13 package on pip, and no `cuda-cudart-12-*` in `apt-cache` either. After installing `onnxruntime-gpu`, `get_available_providers()` will **list** `CUDAExecutionProvider` as usual (deceptive), but creating a session reports `No registered plugin EP device found` — that is the EP's .so failing to dlopen. Do not waste time on it.
 
-TensorRT 10.16 随系统就有（`libnvinfer.so.10` + `trtexec` + python `tensorrt`），直接绕过 onnxruntime 跑 rec。
+TensorRT 10.16 ships with the system (`libnvinfer.so.10` + `trtexec` + the python `tensorrt`), so we bypass onnxruntime and run rec directly.
 
-**做法**：不改 RapidOCR 源码，只把 `TextRecognizer.session` 换成 `trt_rec.TrtRecSession`。这样 `resize_norm_img`、CTC 解码、字符表全部复用原实现，两边只差推理后端，测出来的才是纯后端差异。
+**Approach**: do not touch RapidOCR's source, only replace `TextRecognizer.session` with `trt_rec.TrtRecSession`. That way `resize_norm_img`, CTC decoding and the character table all reuse the original implementation, and the only difference between the two sides is the inference backend — so what gets measured is a pure backend difference.
 
-| 后端 | OCR 合计（132 行） | 行数 | 均分 | 逐行一致 |
+| Backend | OCR total (132 lines) | Lines | Mean score | Per-line agreement |
 |---|---|---|---|---|
-| CPU (onnxruntime) | 4.12s | 132 | 0.951 | 基准 |
-| **TensorRT FP16** | **1.17s（3.5×）** | 132 | 0.952 | 128/132 |
+| CPU (onnxruntime) | 4.12s | 132 | 0.951 | baseline |
+| **TensorRT FP16** | **1.17s (3.5×)** | 132 | 0.952 | 128/132 |
 
-端到端（语音提问「屏幕上是什么」，140 行）：**6.56s / 7.30s → 3.87s / 3.41s**。剩下的时间主要花在 LLM 生成（2.1s）上，OCR 已经不是瓶颈了。
+End to end (voice question 「屏幕上是什么」, "what's on the screen", 140 lines): **6.56s / 7.30s → 3.87s / 3.41s**. The remaining time is mostly spent on LLM generation (2.1s); OCR is no longer the bottleneck.
 
-逐行差异只有 `θ.98 → 8.98`、`—a → 一a`、`误。 → 误触` 这类单字抖动，属于 FP16 与 CPU FP32 的正常差别，不影响「读懂屏幕」。
+The only per-line differences are single-character jitter such as `θ.98 → 8.98`, `—a → 一a`, `误。 → 误触`; that is the normal difference between FP16 and CPU FP32 and does not affect "understanding the screen".
 
-#### engine 怎么来的
+#### Where the engine comes from
 
 ```bash
 trtexec --onnx=<rapidocr>/models/ch_PP-OCRv4_rec_infer.onnx \
@@ -425,101 +427,101 @@ trtexec --onnx=<rapidocr>/models/ch_PP-OCRv4_rec_infer.onnx \
         --memPoolSize=workspace:1024 --timingCacheFile=/tmp/trt_cache.bin
 ```
 
-在 Orin 上约 **11~12 分钟**（动态 shape 的 tactic 搜索很慢，日志会长时间不更新，别以为卡死）。
+On Orin it takes about **11~12 minutes** (tactic search for dynamic shapes is very slow; the log stops updating for long stretches, do not assume it has hung).
 
-`optShapes` 定 320 是有依据的：实测 75 个批次的宽度分布，**76% 就是基准 320**（批内没有超宽行时 `max_wh_ratio` 取默认 6.67），超 1536 的只占 4%。所以 opt 定在小值是让常见路径最快，而不是取个「中间值」。
+Setting `optShapes` to 320 has a basis: we measured the width distribution over 75 batches and **76% are exactly the baseline 320** (when there is no extra-wide line in the batch, `max_wh_ratio` takes the default 6.67), and only 4% exceed 1536. So setting opt to a small value makes the common path fastest, rather than picking a "middle value".
 
-> 第一版把 `max` 设成 1024/1536 都失败过——屏幕上有一行特别长（路径、URL、长代码行），`max_wh_ratio` 会把整批撑到 1036、1656。**这个数必须量出来再定**，拍脑袋必然要重建（每次 12 分钟）。
+> The first version failed with `max` set to 1024 and to 1536 — there was one particularly long line on screen (a path, a URL, a long line of code) and `max_wh_ratio` stretched the whole batch to 1036, 1656. **This number has to be measured before it is set**; guessing means a rebuild (12 minutes each time).
 
-#### 超 profile 的批次退回 CPU
+#### Batches beyond the profile fall back to CPU
 
-`TrtRecSession` 里 `set_input_shape` 返回 False 就转给原 ORT session。理由是：为极值重建一个 max 3000+ 的 engine 会拖慢 96% 的常见批次，不如让那 4% 走慢路。`/api/health` 的 `vision.trt.fallback_pct` 就是这比例，**正常应该接近 0**（profile 定对之后实测 0 回退）。
+In `TrtRecSession`, if `set_input_shape` returns False it hands over to the original ORT session. The reason: rebuilding an engine with max 3000+ for the extreme case would slow down the 96% common batches, so it is better to let that 4% take the slow path. `vision.trt.fallback_pct` in `/api/health` is that ratio, and **normally it should be close to 0** (after the profile was set correctly we measured 0 fallbacks).
 
-#### 运行依赖：`cuda-python`（别当探索残留卸掉）
+#### Runtime dependency: `cuda-python` (do not uninstall it as exploration leftovers)
 
-`TrtRecSession` 要自己分配显存、配 stream，靠的是 `cuda-python`：
+`TrtRecSession` allocates GPU memory and sets up streams itself, relying on `cuda-python`:
 
 ```bash
 asr-venv/bin/pip install cuda-python
-# 自检（约 1 秒）
+# self-check (about 1 second)
 asr-venv/bin/python -c "from cuda.bindings import runtime as rt; e,p = rt.cudaMalloc(16); print(e,p)"
 # → (<cudaError.cudaSuccess: 0>, <cuda.bindings.runtime.cudaDevicePtr...>)
 ```
 
-**它和 `onnxruntime-gpu` 是两件不相干的事**，别混为一谈。ORT 的 CUDA EP 在这套系统上是死的（CUDA 13.2 vs 轮子只发 cu12），而 TensorRT 这条路通——正因为如此，`cuda-python` 是当前唯一让 rec 上 GPU 的依赖。
+**It has nothing to do with `onnxruntime-gpu`**, do not conflate the two. ORT's CUDA EP is dead on this system (CUDA 13.2 vs wheels only shipped for cu12), while the TensorRT path works — precisely because of that, `cuda-python` is currently the only dependency that puts rec on the GPU.
 
-卸掉它**不会报错**，只会**静默**退回 CPU：`/api/health` 的 `vision.trt.backend` 变成 `cpu`，OCR 从 1.17s 悄无声息地变回 4.12s。清理环境时把这条记住。
+Uninstalling it **does not raise an error**, it only **silently** falls back to CPU: `vision.trt.backend` in `/api/health` becomes `cpu`, and OCR quietly goes from 1.17s back to 4.12s. Remember this when cleaning up the environment.
 
-两个 API 细节（都踩过）：`cudaMalloc` 返回 `(err, ptr)` 元组要解包两个值；`cudaFree` 只返回 `err`。
+Two API details (both stepped on): `cudaMalloc` returns an `(err, ptr)` tuple so you must unpack two values; `cudaFree` returns only `err`.
 
-#### 启用
+#### Enabling
 
 ```bash
-# models/rec_fp16.engine 放到部署目录，然后
+# put models/rec_fp16.engine in the deployment directory, then
 voice_server.py ... --vision-trt /path/to/models/rec_fp16.engine
 ```
 
-不给 `--vision-trt` 就走 CPU，行为与以前完全一致。engine 加载失败、TRT 版本不匹配、文件不存在——全部吞掉退回 CPU，绝不会让「看屏幕」整个不可用。启动时后台线程先把 engine 建好（实测 3 秒），否则第一次看屏幕要额外等 CUDA context。
+Without `--vision-trt` it uses CPU, with behaviour exactly as before. Engine load failure, TRT version mismatch, missing file — all are swallowed and fall back to CPU; "look at screen" is never made completely unavailable. At startup a background thread builds the engine first (measured 3 seconds), otherwise the first look-at-screen has to wait extra for the CUDA context.
 
-**engine 是跟 TensorRT 版本绑死的**：换 JetPack / 升级 TRT 之后必须重建，否则反序列化会失败（那时会自动退回 CPU，不会崩）。
+**The engine is tied to the TensorRT version**: after changing JetPack / upgrading TRT it must be rebuilt, otherwise deserialisation fails (at which point it falls back to CPU automatically and does not crash).
 
-> 与 vLLM 共存没问题：Orin 是统一内存，vLLM 常驻约 7GB，TRT 推理只用几百 MB。实测两者同时跑，OCR 与 LLM 都正常。但**构建 engine 时要吃 30GB+** 做 profiling，那几分钟别让别的任务抢显存。
+> Coexisting with vLLM is no problem: the Orin has unified memory, vLLM resident takes about 7GB and TRT inference uses only a few hundred MB. Measured with both running at once, OCR and the LLM both work normally. But **building the engine consumes 30GB+** for profiling, so during those few minutes do not let other tasks compete for GPU memory.
 
-### 抓帧常驻：预热只付一次（2026-11-21）
+### Resident frame grab: pay the warm-up only once (2026-11-21)
 
-旧写法每次 `grab()` 都 `cv2.VideoCapture()` 打开设备再丢 40 帧预热，**每次看屏幕固定交 1.2 秒**，而且 `look()` 是先抓帧再查缓存——屏幕没变也照付。现在 `_Capture` 把句柄常驻：
+The old code called `cv2.VideoCapture()` on every `grab()`, opened the device and threw away 40 warm-up frames, **paying a fixed 1.2 seconds on every look-at-screen**, and `look()` grabbed the frame before checking the cache — so it paid even when the screen had not changed. Now `_Capture` keeps the handle resident:
 
-| | 旧（每次开关） | 新（常驻） |
+| | Old (open/close every time) | New (resident) |
 |---|---|---|
-| 打开设备 + 协商 | 每次 | **进程启动一次**（`prewarm()` 在后台线程） |
-| 40 帧预热 | 每次 1.2s | 每次 open 一轮，正常全程只 1 轮 |
-| 每次取帧 | 2.87s | **读 2 帧，约 0.07s** |
+| Device open + negotiation | every time | **once at process start** (`prewarm()` in a background thread) |
+| 40-frame warm-up | 1.2s every time | one round per open; normally exactly 1 round in total |
+| Per frame grab | 2.87s | **read 2 frames, about 0.07s** |
 
-不做「后台线程连续解码」是刻意的：1080p MJPG 解码是持续的 CPU 开销，而「看屏幕」一场会只用几次。`BUFFERSIZE=1` 让驱动始终只持有一个缓冲、持续覆盖，读到的就是当前画面，所以不需要靠连续读来保新鲜。
+Not doing "continuous decoding in a background thread" is deliberate: 1080p MJPG decoding is a continuous CPU cost, while look-at-screen is used only a few times per meeting. `BUFFERSIZE=1` makes the driver always hold exactly one buffer that is continuously overwritten, so what you read is the current picture — there is no need to rely on continuous reading to stay fresh.
 
-三条自愈规则：
+Three self-healing rules:
 
-1. **读帧失败 → 松开重开一次**（`reconnects` 计数）。扩展坞那种 166 秒断流就靠这条回来，不必重启服务。
-2. **全黑 → 补一轮预热再判**。源切分辨率后 MS2109 会重新吐黑帧，常驻句柄遇不到 open 却会遇到这种「流中途变黑」，不补就会误报「HDMI 没信号」。
-3. **闲置 `--vision-idle-release` 秒后松开设备**（默认 0 = 永不释放）。要让别的程序用这块采集卡时把它设成 300 之类。
+1. **Frame read fails → release and reopen once** (`reconnects` counter). The 166-second dropout with the dock is recovered by this rule, without restarting the service.
+2. **All black → do one more warm-up round before judging**. After the source switches resolution the MS2109 emits black frames again; a resident handle never sees `open` but does see this "stream turning black mid-way", and without the extra round it would falsely report "HDMI has no signal".
+3. **Release the device after `--vision-idle-release` seconds idle** (default 0 = never release). Set it to something like 300 when you want another program to use this capture card.
 
-`GET /api/status` 的 `vision.capture` 里能直接看到 `opens / warmups / reads / reconnects / open_s / grab_s`：**`opens` 应该一直是 1**，涨了说明中途掉线重连过。
+In `vision.capture` of `GET /api/status` you can see `opens / warmups / reads / reconnects / open_s / grab_s` directly: **`opens` should stay 1**; if it grows, the connection dropped and reconnected at some point.
 
-### 三道保护
+### Three protections
 
-1. **预热帧**：`_Capture` 每次 open 固定丢弃 40 帧（见 4.7），否则拿到的是一张黑图，OCR 出来是空的
-2. **无信号即判 blank**：判据是「又暗又平」——`mean < 12 且 std < 6`。旧判据 `mean < 3` 在真机上永远不命中：MS2109 无信号时吐的是 **mean 7.0 / std 1.5** 的帧（YMAX=7 带传感器噪点），于是会被当成「一屏没有字的画面」，返回 `ok=True, lines=0` 这种假及格。判 blank 前会先补一轮预热复查，避免源切分辨率时误报
-3. **看不到就直说**：OCR 没拿到文字时不塞空上下文，明确报错，避免模型照着想象编
+1. **Warm-up frames**: `_Capture` always discards 40 frames on each open (see 4.7), otherwise what you get is a black image and OCR comes back empty
+2. **No signal → judge blank**: the criterion is "dark and flat" — `mean < 12 and std < 6`. The old criterion `mean < 3` never matched on the real device: with no signal the MS2109 emits frames with **mean 7.0 / std 1.5** (YMAX=7 with sensor noise), so they were treated as "a screen with no text" and returned `ok=True, lines=0`, a fake pass. Before judging blank it does one extra warm-up round and re-checks, to avoid a false report when the source switches resolution
+3. **If it cannot see, say so**: when OCR gets no text it does not stuff empty context in, it reports an explicit error, so the model does not make things up from imagination
 
-### 已知限制
+### Known limitations
 
-- **3.4~3.9 秒**出结果（rec 走 TensorRT，实测）。账是：**取帧 0.08s + OCR 0.76~1.56s + LLM 首字 0.2~0.6s + 生成 2.1s**。瓶颈已经转到 LLM 生成，不再是 OCR
-- 不挂 `--vision-trt` 时退回 CPU，端到端 6.5~7.3 秒
-- 想压 LLM 那段，**砍 OCR 送进 prompt 的字数**比换模型有用：冷 prefill 约 0.58 ms/token，1.6K 字就要 1 秒、3.3K 字接近 2 秒；换 27B 会把这项从 1 秒变 8 秒（见 4.14）
-- 等 OCR 期间 **barge-in 不生效**：那时不在播报，打断监听没启动，用户插话要等这轮结束
-- OCR 有稳定错字（帧 → 顿、Jetson → letson、引号丢失），靠 system prompt 让 LLM「按文脉补正」，不做纠错模型
-- 屏幕文字超过 1400 字会被截断（`max_chars`）
+- **3.4~3.9 seconds** to a result (rec on TensorRT, measured). The accounting is: **frame grab 0.08s + OCR 0.76~1.56s + LLM first token 0.2~0.6s + generation 2.1s**. The bottleneck has moved to LLM generation, no longer OCR
+- Without `--vision-trt` it falls back to CPU, 6.5~7.3 seconds end to end
+- To compress the LLM part, **cutting the number of characters of OCR text sent into the prompt** is more useful than changing models: cold prefill is about 0.58 ms/token, so 1.6K characters costs 1 second and 3.3K characters close to 2 seconds; switching to 27B turns this item from 1 second into 8 seconds (see 4.14)
+- **Barge-in does not work while waiting for OCR**: there is no playback at that time, so barge-in listening is not running, and a user interjection has to wait for the turn to end
+- OCR has stable misrecognitions (帧 → 顿, "frame" → "meal"; Jetson → letson; lost quotation marks); we let the LLM "correct by context" via the system prompt and do not build a correction model
+- Screen text longer than 1400 characters is truncated (`max_chars`)
 
-## 4.9 有文字、没声音（浏览器自动播放拦截）
+## 4.9 Text but no sound (browser autoplay blocking)
 
-症状：页面上文字回答正常出现，但**一点声音都没有，也没有任何报错**。
+Symptom: the textual answer appears normally on the page, but **there is no sound at all and no error either**.
 
-根因不在服务端。抓一轮实测：
+The root cause is not on the server. One round of measurements:
 
-| 检查 | 结果 |
+| Check | Result |
 |---|---|
-| 服务端 TTS | ✅ 合成出 2.38s wav，`mean -15.1dB / max 0dB`，不是静音 |
-| `GET /audio/xxx.wav` | ✅ 200，`audio/wav`，105004 字节 |
-| 浏览器 | ❌ `play()` 返回 `NotAllowedError`，而旧代码 `catch(()=>{ playNext() })` **把这个错误静默吞掉了** |
+| Server-side TTS | ✅ synthesised a 2.38s wav, `mean -15.1dB / max 0dB`, not silence |
+| `GET /audio/xxx.wav` | ✅ 200, `audio/wav`, 105004 bytes |
+| Browser | ❌ `play()` returns `NotAllowedError`, and the old code `catch(()=>{ playNext() })` **silently swallowed this error** |
 
-Chrome / Edge 的策略：页面没有过任何用户交互时，带声音的 `play()` 会被直接拒绝。用唤醒词连续对话时全程没有点击，于是每一轮都被拦 —— 文字照常渲染，声音全丢，界面上却看不出任何异常。
+Chrome / Edge policy: when the page has never had any user interaction, a `play()` with sound is rejected outright. In continuous dialogue via the wake word there is no click at all, so every turn is blocked — text renders as usual, the sound is entirely lost, and nothing looks abnormal in the UI.
 
-### 现在的处理
+### Current handling
 
-1. **不再静默**：`play()` 失败且 `name === 'NotAllowedError'` 时，页面顶部弹出橙色横幅「浏览器拦截了自动播放，所以这轮没有声音」
-2. **不丢音频**：被拦下的 URL 放回队列头部，解锁后接着播（之前是直接丢）
-3. **一键自证**：新增「声音测试」按钮 → `POST /api/say` 合成一句「声音测试，一二三。」→ 浏览器播放。成功显示时长与音色，失败显示具体错误名
-4. **点哪都算解锁**：横幅本身、以及页面任意一次点击，都会尝试补播欠下的音频
+1. **No longer silent**: when `play()` fails and `name === 'NotAllowedError'`, an orange banner appears at the top of the page: 「浏览器拦截了自动播放，所以这轮没有声音」 ("the browser blocked autoplay, so this turn has no sound")
+2. **Do not drop the audio**: the blocked URL goes back to the head of the queue and plays once unlocked (previously it was simply dropped)
+3. **One-click self-proof**: new "声音测试" (sound test) button → `POST /api/say` synthesises 「声音测试，一二三。」 → the browser plays it. On success it shows the duration and voice; on failure it shows the specific error name
+4. **Any click counts as unlocking**: the banner itself, and any click on the page, will try to play back the owed audio
 
 ```bash
 curl -X POST -H 'Content-Type: application/json' \
@@ -527,436 +529,438 @@ curl -X POST -H 'Content-Type: application/json' \
 # {"ok":true,"url":"/audio/say_xxx.wav","tts_s":0.15,"audio_s":2.04,"voice":"zh"}
 ```
 
-### 排查顺序
+### Troubleshooting order
 
-1. 点「声音测试」—— 有声 → 是自动播放策略，点一下页面即解锁；无声 → 继续
-2. 看横幅显示的错误名：`NotAllowedError` = 策略拦截；`NotSupportedError` = 取不到 wav（查 `/audio/` 路由）
-3. 都没有，就查**标签页是否被静音**（标签上有喇叭斜杠）、系统输出设备、耳机是否插在 Jetson 而不是电脑上
+1. Click "声音测试" — sound → it is the autoplay policy, clicking the page once unlocks it; no sound → continue
+2. Look at the error name shown in the banner: `NotAllowedError` = policy block; `NotSupportedError` = cannot fetch the wav (check the `/audio/` route)
+3. If neither, check **whether the tab is muted** (a speaker with a slash on the tab), the system output device, and whether the headset is plugged into the Jetson rather than the computer
 
-### 声音跑到 HDMI 去了（真实踩到）
+### The sound went to HDMI (actually hit this)
 
-浏览器跟着 Windows 的默认输出设备走。这台机器的默认输出一度是 `UHD-SPLITTER` / `HD TO USB`（Display Audio 端点），于是播报声全进了 HDMI 链路，音响一声不出。
+The browser follows Windows' default output device. This machine's default output was once `UHD-SPLITTER` / `HD TO USB` (a Display Audio endpoint), so the playback all went into the HDMI link and the speakers made no sound at all.
 
-两条路，按改动大小排：
+Two approaches, ordered by size of change:
 
-| 目标 | 做法 | 代价 |
+| Goal | How | Cost |
 |---|---|---|
-| **只要浏览器走音响**（推荐） | Win11 設定 → システム → サウンド → 音量ミキサー → 找到 Chrome → 输出改成 `スピーカー (SC-HC410)` | 无，不用装东西 |
-| 同一路声音两边同时出 | Voicemeeter（A1/A2 双输出）；或 Stereo Mix + 侦听 | 装虚拟声卡 / 100ms+ 延迟 |
+| **Only the browser through the speakers** (recommended) | Win11 設定 → システム → サウンド → 音量ミキサー → find Chrome → change output to `スピーカー (SC-HC410)` ("Speakers") | none, nothing to install |
+| The same audio out of both at once | Voicemeeter (A1/A2 dual output); or Stereo Mix + Listen | installs a virtual sound card / 100ms+ latency |
 
-**顺带一个隐患**：采卡 MS2109 带 USB Audio，Jetson 上已经多出 `card 4: MS2109`。也就是电脑的声音经 HDMI → KVM → 采集卡回到了 Jetson。现在播报在浏览器，不受影响；**一旦改成 Jetson 本地 `aplay` 播报，就会形成回路**，而且 barge-in 会把自己播的声音当成用户插话。
+**One hidden hazard along the way**: the capture card MS2109 has USB Audio, and the Jetson now shows an extra `card 4: MS2109`. That means the computer's sound goes through HDMI → KVM → capture card back into the Jetson. Right now playback is in the browser so it is unaffected; **as soon as playback is changed to local `aplay` on the Jetson, a loop forms**, and barge-in would treat its own playback as a user interjection.
 
-## 4.10 会议字幕（caption_server.py）
+## 4.10 Meeting captions (caption_server.py)
 
-开会时把会议音频实时转成中日双语字幕。独立进程、独立端口（8096），与语音助手**完全解耦**，各占不同声源互不干扰。
+During a meeting, turn the meeting audio into real-time Chinese-Japanese bilingual captions. A separate process on a separate port (8096), **completely decoupled** from the voice assistant, each taking a different audio source so they do not interfere.
 
 ```bash
-sudo systemctl start caption-bench       # 常驻服务（已 enable）
-journalctl -u caption-bench -f           # 实时日志
-python caption_server.py --wav x.wav     # 离线跑一个文件，不需要硬件
+sudo systemctl start caption-bench       # resident service (already enabled)
+journalctl -u caption-bench -f           # live log
+python caption_server.py --wav x.wav     # run one file offline, no hardware needed
 ```
 
-链路：`采集卡音频 → 能量断句 → SenseVoice(auto) → 中/日互译 → 网页滚动大字幕`
+Link: `capture card audio → energy segmentation → SenseVoice(auto) → zh/ja mutual translation → scrolling large captions on the web page`
 
-### 三个坑（都踩过）
+### Three pitfalls (all stepped on)
 
-1. **PipeWire 抢占设备** —— 最重要。MS2109 被 PipeWire 认成默认录音源后长期占着 `pcmC4D0c`，`arecord -D plughw:CARD=MS2109` 会一直「设备或资源忙」，而且 `pgrep arecord` 看不到任何进程（占用者是 `pipewire`）。改用 `pw-record --target <node>` 取流，不独占设备，还能和其他音频客户端共存。节点名从 `pw-dump` 里按 `MACROSILICON` 自动找。
-2. **systemd 里 pw-record 连不上** —— 系统服务没有 `XDG_RUNTIME_DIR`，找不到 user session 的 PipeWire socket，进程一启动就退。unit 里必须写 `Environment=XDG_RUNTIME_DIR=/run/user/<uid>`。
-3. **本底电平初值污染** —— 原来用 `min(floor, db)` 估本底，第一次采到数字静音（-91dB）就把 floor 钉死在 -999，门限变成 -991dB，等于「任何声音都不算说话」。改成开头 1.2 秒取 10 分位、之后快降慢升，并钳在 `[-85, -32]`。
+1. **PipeWire seizing the device** — the most important one. After PipeWire recognised the MS2109 as the default recording source it held `pcmC4D0c` long-term, so `arecord -D plughw:CARD=MS2109` kept saying "device or resource busy", and `pgrep arecord` showed no process at all (the holder was `pipewire`). Switched to `pw-record --target <node>` to take the stream, which does not hold the device exclusively and can coexist with other audio clients. The node name is found automatically from `pw-dump` by `MACROSILICON`.
+2. **pw-record cannot connect from inside systemd** — a system service has no `XDG_RUNTIME_DIR`, cannot find the user session's PipeWire socket, and the process exits as soon as it starts. The unit must contain `Environment=XDG_RUNTIME_DIR=/run/user/<uid>`.
+3. **Initial noise-floor value contaminating everything** — we used to estimate the floor with `min(floor, db)`, and the first digital-silence sample (-91dB) pinned floor at -999, so the threshold became -991dB, equivalent to "no sound at all counts as speech". Changed to take the 10th percentile over the first 1.2 seconds, then fast-down slow-up, clamped to `[-85, -32]`.
 
-### 页面上的启停
+### Start/stop on the page
 
-| 按钮 | 行为 |
+| Button | Behaviour |
 |---|---|
-| **停止** | 真 terminate 采集进程、释放声卡，按钮变绿「开始」，电平归零 |
-| **开始** | 重建 Segmenter（按当时的房间重新估本底）并恢复采集 |
-| 清屏 | 只清空已出字幕，不停止采集 |
+| **Stop** | really terminates the capture process and releases the sound card; the button turns green "Start" and the level meter goes to zero |
+| **Start** | rebuilds the Segmenter (re-estimating the noise floor for the room at that moment) and resumes capture |
+| Clear | only clears captions already shown, does not stop capture |
 
-停止后立刻点开始，可能撞上 USB 声卡释放的延迟，内部会自动重试 4 次（间隔 0.35~1.1 秒）。
+Clicking Start immediately after Stop may hit the USB sound card's release latency; internally it retries 4 times automatically (interval 0.35~1.1 seconds).
 
-### 参数
+### Parameters
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `--backend` | `pw` | `pw`=PipeWire（推荐）；`alsa`=arecord 直连 |
-| `--device` | `plughw:CARD=MS2109,DEV=0` | 仅在 `--backend alsa` 时用 |
-| `--margin` | `8.0` | 高于本底多少 dB 算说话，嘈杂环境调大 |
-| `--hold` | `0.45` | 基准静音门限（段长介于 `--seg-mid` 与 `--seg-long` 之间时用） |
-| `--hold-long` | `0.90` | 段还短时要等多久静音才断句，见 4.16 |
-| `--hold-short` | `0.30` | 段已长时的断句门限，见 4.16 |
-| `--seg-mid` / `--seg-long` | `1.20` / `2.40` | 上面两个门限的切换点（秒） |
-| `--max-s` | `6.0` | 一段最长多少秒，兜底硬切（定值依据见 4.16：7.0 会出幻觉） |
-| `--soft-cut` | `0.7` | 硬切前回退找能量低谷的搜索窗（秒） |
-| `--min-s` | `0.25` | 有声短于这个长度直接丢 |
-| `--no-bilingual` | 关 | 只出原文，不调 LLM 翻译 |
+| `--backend` | `pw` | `pw`=PipeWire (recommended); `alsa`=arecord direct |
+| `--device` | `plughw:CARD=MS2109,DEV=0` | only used with `--backend alsa` |
+| `--margin` | `8.0` | how many dB above the floor counts as speech; raise it in noisy environments |
+| `--hold` | `0.45` | baseline silence threshold (used when the segment length is between `--seg-mid` and `--seg-long`) |
+| `--hold-long` | `0.90` | how long to wait for silence before cutting while the segment is still short, see 4.16 |
+| `--hold-short` | `0.30` | cut threshold when the segment is already long, see 4.16 |
+| `--seg-mid` / `--seg-long` | `1.20` / `2.40` | switching points between the two thresholds above (seconds) |
+| `--max-s` | `6.0` | maximum length of one segment in seconds, hard cut as the fallback (basis for the value in 4.16: 7.0 produces hallucinations) |
+| `--soft-cut` | `0.7` | search window for backtracking to an energy trough before a hard cut (seconds) |
+| `--min-s` | `0.25` | drop anything whose speech is shorter than this |
+| `--no-bilingual` | off | original text only, no LLM translation |
 
-### 已知限制
+### Known limitations
 
-- **音乐会被"听"成文字**：SenseVoice 对唱词、纯音乐会产生幻觉文本（实测把一首歌识别成「风从楼间穿过去…」）。真人说话才准
-- 延迟 = 断句等待（0.55s）+ ASR（0.1~0.4s）+ 翻译（0.3~0.8s），约 1~2 秒，做会议记录够用，同传偏低
-- 翻译走本地 qwen（7B），长句和专有名词会偏；原文有错字时译文可能跟着歪
+- **Music gets "heard" as words**: SenseVoice produces hallucinated text for lyrics and pure music (measured: a song recognised as 「风从楼间穿过去…」, "wind passing between the buildings…"). Only real human speech is accurate
+- Latency = segmentation wait (0.55s) + ASR (0.1~0.4s) + translation (0.3~0.8s), about 1~2 seconds — enough for meeting notes, on the low side for simultaneous interpretation
+- Translation goes through local qwen (7B); long sentences and proper nouns drift; when the original text has misrecognised characters the translation may tilt along with it
 
-### 4.11 播报出口：浏览器 vs 本机耳机
+### 4.11 Playback output: browser vs local headset
 
-**症状**：耳机插在 Jetson 的 USB 口上，麦克风也认到了（`plughw:CARD=H340`），但助手从来不从耳机出声。
+**Symptom**: the headset is plugged into the Jetson's USB port and the microphone is recognised (`plughw:CARD=H340`), but the assistant never makes sound from the headset.
 
-**根因**：播报是**浏览器**播放的。`_speak()` 只 `emit({"type":"audio","url":...})`，由打开页面的那台机器去取 wav 并播放。所以「声音从哪出来」等于「页面开在哪台机器上」，跟麦克风插在哪无关。实测页面开在电脑（`127.0.0.1`）时，`voice-bench` 那台机器上没有任何播放流。
+**Root cause**: playback is done by the **browser**. `_speak()` only does `emit({"type":"audio","url":...})`, and the machine that opened the page fetches the wav and plays it. So "where the sound comes out" equals "which machine the page is open on", regardless of where the microphone is plugged in. Measured with the page open on the computer (`127.0.0.1`), there is no playback stream at all on the `voice-bench` machine.
 
-**解决**：加一路本地播报 `LocalSpeaker`，合成完直接 `pw-play` 到本机声卡。
+**Solution**: add a local playback path `LocalSpeaker`, which `pw-play`s straight to the local sound card after synthesis.
 
 ```
-合成 wav ─┬─ emit audio{local:true} → 浏览器只显示文字、不播
-          └─ LocalSpeaker.play()    → pw-play --target <H340> → 耳机
+synthesise wav ─┬─ emit audio{local:true} → browser only displays text, does not play
+                └─ LocalSpeaker.play()    → pw-play --target <H340> → headset
 ```
 
-**三个设计点**
+**Three design points**
 
-| 问题 | 做法 |
+| Question | Approach |
 |---|---|
-| 为什么用 `pw-play` 而不是 `aplay` | 麦克风被 `AudioHub` 以 ALSA 独占方式占着，`arecord -D plughw:CARD=H340` 会报「设备或资源忙」。播放走 PipeWire，和采集是 USB 声卡的两条独立流，互不抢 |
-| 打断怎么掐掉 | `LocalSpeaker.cancel()` 清空队列 + `terminate()` 当前 `pw-play`；`BargeMonitor._on_barge()` 里和 `SpeakState.cancel()` 一起调用 |
-| systemd 里为什么放不出声 | 和字幕服务同一个坑：缺 `XDG_RUNTIME_DIR=/run/user/<uid>`，`pw-play` 连不上 user session 的 PipeWire 会直接失败 |
+| Why `pw-play` and not `aplay` | The microphone is held exclusively by `AudioHub` through ALSA, so `arecord -D plughw:CARD=H340` reports "device or resource busy". Playback goes through PipeWire: playback and capture are two independent streams on the USB sound card, so they do not fight |
+| How barge-in cuts it off | `LocalSpeaker.cancel()` clears the queue + `terminate()`s the current `pw-play`; called together with `SpeakState.cancel()` inside `BargeMonitor._on_barge()` |
+| Why there is no sound from systemd | Same pitfall as the caption service: missing `XDG_RUNTIME_DIR=/run/user/<uid>`, so `pw-play` cannot connect to the user session's PipeWire and fails outright |
 
-**切换**：页面新增「声音：耳机 / 声音：浏览器」按钮 → `POST /api/route {on:bool}`，运行时可切，不用重启。`/api/say` 的「声音测试」也跟随这个开关，保证「试听有没有声」和「实际有没有声」是同一条路径。
+**Switching**: new "声音：耳机 / 声音：浏览器" (sound: headset / sound: browser) button on the page → `POST /api/route {on:bool}`, switchable at runtime without a restart. The "声音测试" (sound test) in `/api/say` also follows this switch, so that "does the test produce sound" and "does the real thing produce sound" are the same path.
 
-**启动参数**
+**Startup parameters**
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `--local-speak` | 关 | 开启本地播报 |
-| `--local-sink` | 空（系统默认） | PipeWire 目标节点名/id，如 `alsa_output.usb-Logitech_Inc._Logi_USB_Headset_H340-00.analog-stereo` |
-| `--local-gain` | `1.0` | 流音量 0~1 |
+| `--local-speak` | off | enable local playback |
+| `--local-sink` | empty (system default) | PipeWire target node name/id, e.g. `alsa_output.usb-Logitech_Inc._Logi_USB_Headset_H340-00.analog-stereo` |
+| `--local-gain` | `1.0` | stream volume 0~1 |
 
-`/api/health` 的 `speaker` 字段可看 `on / sink / plays / errors / busy / last_error`：`plays` 只统计**退出码 0** 的播放，能区分「播了但没声」和「压根没播」。
+The `speaker` field in `/api/health` shows `on / sink / plays / errors / busy / last_error`: `plays` only counts playback with **exit code 0**, which distinguishes "played but no sound" from "never played at all".
 
-**排查顺序**：`speaker.plays` 有增长 → 播放链路是通的，去查耳机本体（H340 线控音量轮、插孔是否插到底）；`plays` 不动而 `errors` 增长 → 看 `last_error`（多半是 `XDG_RUNTIME_DIR` 或 sink 名字写错）。
+**Troubleshooting order**: `speaker.plays` growing → the playback chain works, go check the headset itself (the H340 inline volume wheel, whether the plug is fully inserted); `plays` not moving while `errors` grows → look at `last_error` (most likely `XDG_RUNTIME_DIR` or a misspelled sink name).
 
-### 4.12 把 HDMI 进来的声音回放到耳机
+### 4.12 Play HDMI audio back to the headset
 
-**场景**：电脑的 HDMI 输出全进了采集卡（音画都进 Jetson），人反而听不到。Jetson 上再挂一副耳机，把这一路原样回放出来，等于给 HDMI 链路加了个监听口。
+**Scenario**: the computer's HDMI output all goes into the capture card (both audio and video into the Jetson) and the person cannot hear it. Hanging another headset on the Jetson and playing that stream back as-is effectively adds a monitor port to the HDMI link.
 
 ```
-采集卡 source ──┬─ pw-record 16k  → 断句 → ASR → 字幕
-                └─ pw-record 44.1k → pw-cat → 耳机（监听）
+capture card source ──┬─ pw-record 16k  → segmentation → ASR → captions
+                      └─ pw-record 44.1k → pw-cat → headset (monitor)
 ```
 
-两条采集流并存：PipeWire 允许多个客户端读同一个 source，实测字幕那条 16k 流完全不受影响。
+Two capture streams coexist: PipeWire allows multiple clients to read the same source, and measurement showed the 16k caption stream was completely unaffected.
 
-**实现要点**
+**Implementation points**
 
-| 问题 | 做法 |
+| Question | Approach |
 |---|---|
-| 怎么搬运 | `pw-record \| pw-cat` 两条子进程直接对接，采样数据只走内核管道，Python 不参与，CPU 占用接近 0 |
-| 为什么不用 `pw-link` 直连节点 | 直连延迟更低，但设备重插后链路会断且无提示；子进程方案断了能立刻从 `poll()` 看出来，便于重连 |
-| 采样率 | 耳机节点是 **44100**，采集卡是 48000。统一用 44100，省一次重采样 |
-| 缓冲 | `--latency 20ms` 两端各 20ms，端到端约 60~100ms。实测 20/40/默认三档均无欠载，20ms 最跟手 |
-| 开关 | 页面「听 HDMI」按钮 → `POST /api/monitor {on}`；`--monitor` 让服务启动时直接开 |
+| How to move the data | `pw-record \| pw-cat`, two subprocesses wired directly together, sample data goes only through the kernel pipe, Python is not involved, CPU usage is close to 0 |
+| Why not use `pw-link` to connect the nodes directly | A direct link has lower latency, but the link breaks without any notice when the device is replugged; with the subprocess approach a break is immediately visible from `poll()`, which makes reconnection easy |
+| Sample rate | The headset node is **44100** and the capture card is 48000. Use 44100 uniformly to save one resampling |
+| Buffering | `--latency 20ms`, 20ms at each end, about 60~100ms end to end. Measured 20/40/default, none underran; 20ms feels the most responsive |
+| Switch | "听 HDMI" (listen to HDMI) button on the page → `POST /api/monitor {on}`; `--monitor` makes the service start with it on |
 
-**验证方法**（声音这件事不能只看进程活着）
+**Verification method** (for sound you cannot just check that the process is alive)
 
 ```bash
-# 看端口有没有真的接上：出现 [active] 才算在传
+# check the ports are really connected: only [active] means it is transferring
 wpctl status | sed -n '/Streams:/,$p' | grep -A2 pw-cat
-# 看它是否按实时速率读：4 秒后 rchar 应涨约 700KB
+# check it reads at real-time rate: rchar should grow by about 700KB after 4 seconds
 grep rchar /proc/$(pgrep -x pw-cat)/io
 ```
 
-**坑**：`pw-top` 里 `pw-cat` 和耳机节点会显示 `???`（quantum 0、rate 0），看起来像没跑，但 `[active]` 链路和 `rchar` 增长都证明在传。`???` 只说明该节点不是图里的 driver、拿不到时间戳，**不能当作"没声音"的证据**；真正的判据是 `wpctl status` 的 `[active]` 和进程 IO 计数。
+**Pitfall**: in `pw-top` the `pw-cat` and headset nodes show `???` (quantum 0, rate 0) and look like they are not running, yet the `[active]` link and the growing `rchar` both prove it is transferring. `???` only means that node is not the driver in the graph and gets no timestamps — **it cannot be taken as evidence of "no sound"**; the real criteria are `[active]` in `wpctl status` and the process IO counters.
 
-**副作用（要注意）**：耳机里放出来的会议声音会被 H340 麦克风拾到一点，可能触发唤醒词或打断。开会时若出现自问自答，先把「听 HDMI」关掉，或改用非耳麦的耳塞。
+**Side effect (worth noting)**: the meeting sound coming out of the headset is picked up a little by the H340 microphone and may trigger the wake word or barge-in. If self-question-and-answer happens during a meeting, turn "听 HDMI" off first, or switch to earbuds that are not a headset.
 
-### 4.13 会议要"实时"：把 8 秒压到 1~2 秒
+### 4.13 Meetings need to be "real time": squeeze 8 seconds down to 1~2
 
-**原来的延迟账**（实测）：一段一律 6.0 秒（`max_s` 硬切）→ 段内平均干等 3 秒 → ASR 0.38 秒 → **翻译 0.3~1 秒串行跑在识别线程里**（期间采集帧在队列里干等）→ 前端 600ms 轮询。从说完到看见字 **7~8 秒**，同传已经跟不上听感。
+**The original latency accounting** (measured): every segment was a flat 6.0 seconds (`max_s` hard cut) → on average 3 seconds of dead wait inside the segment → ASR 0.38 seconds → **translation 0.3~1 second running serially in the recognition thread** (meanwhile captured frames wait in the queue) → front-end 600ms polling. From finishing speaking to seeing text: **7~8 seconds**, and simultaneous interpretation can no longer keep up with the listening experience.
 
-**四处改动**
+**Four changes**
 
-| 改动 | 原来 | 现在 | 作用 |
+| Change | Before | Now | Effect |
 |---|---|---|---|
-| 段长上限 `--max-s` | 6.0s | **3.0s** | 延迟的硬上限，砍一半 |
-| 静音断句 `--hold` | 0.55s | **0.42s** | 一句话说完更快收尾 |
-| 出字方式 | 等译完再出整行 | **原文秒出，译文补丁后到** | 看字只等 ASR |
-| 线程模型 | 采集线程里同步 ASR+翻译 | **采集 / ASR / 翻译三条独立队列** | 任何一环变慢都不卡采集 |
-| 前端轮询 | 600ms | **250ms** | 感知上更跟手 |
+| Segment cap `--max-s` | 6.0s | **3.0s** | hard upper bound on latency, halved |
+| Silence cut `--hold` | 0.55s | **0.42s** | one sentence closes faster after it ends |
+| How text appears | wait for the translation, then output the whole line | **original text instantly, translation arrives as a patch** | seeing text only waits for ASR |
+| Thread model | synchronous ASR + translation in the capture thread | **three independent queues: capture / ASR / translation** | any stage slowing down does not block capture |
+| Front-end polling | 600ms | **250ms** | feels more responsive |
 
-**实测（放音乐连续有声）**：`lag_ms`（段结束 → 原文可见）**96~190ms**，其中 `asr_ms` 占全部；`trans_ms` 217~756ms 随后补上；`q_asr=0 / q_tr=0` 说明没有任何积压。从说完到看见原文约 **0.6~1 秒**（0.42s 静音判定 + ASR + 轮询），译文再晚 0.2~0.8 秒。
+**Measured (continuous audio, music playing)**: `lag_ms` (segment end → original text visible) **96~190ms**, with `asr_ms` accounting for all of it; `trans_ms` 217~756ms follows; `q_asr=0 / q_tr=0` shows there is no backlog anywhere. From finishing speaking to seeing the original text is about **0.6~1 second** (0.42s silence decision + ASR + polling), with the translation another 0.2~0.8 seconds later.
 
-**两段式的实现要点**
+**Implementation points of the two-stage design**
 
-- `Captioner.submit()` 只入队，采集循环永不等识别；队列满时**丢最老的一段**而不是让字幕越拖越远（迟到 10 秒的字幕等于没有）。
-- 识别完立刻 append 一行 `trans="" / pending=true` 的字幕，前端显示「译文中…」占位。
-- 翻译线程算完就地回填 `line["trans"]`（历史、新开页面都完整），同时把 `{seq, trans}` 推进补丁队列，`/api/poll` 的 `upd` 字段下发一次即清空。
-- 前端按 `seq` 合并补丁，重绘时保住滚动位置（贴底就跟滚，中间阅读就不动）。
+- `Captioner.submit()` only enqueues; the capture loop never waits for recognition; when the queue is full **the oldest segment is dropped** rather than letting the captions fall further and further behind (a caption 10 seconds late is as good as none).
+- As soon as recognition finishes, append a caption line with `trans="" / pending=true`; the front end shows a 「译文中…」 ("translating…") placeholder.
+- When the translation thread finishes it backfills `line["trans"]` in place (history and newly opened pages are complete) and at the same time pushes `{seq, trans}` into the patch queue, which is delivered once as the `upd` field of `/api/poll` and then cleared.
+- The front end merges patches by `seq` and preserves the scroll position when redrawing (stuck to the bottom → follow; reading in the middle → do not move).
 
-**顺带修掉的两个质量问题**
+**Two quality problems fixed along the way**
 
-1. **硬切切在音节中间**：`天真好` 被切成 `天真` 就会译成「天空」。现在到 `--soft-cut` 上限时会在尾巴 0.7 秒内**回退到能量最低的一帧**下刀，剩下的帧留给下一段（段长变成 2.3~3.0 秒波动，但错字少很多）。
-2. **短句译文串语言**：切短后单句常常是半句，模型会留「的/了」或中英日混杂。翻译 prompt 改成硬性要求「译文必须是纯目标语言，一个原文词都不许留」，并把**前两句原文作为【上文】**一起送进去，人称和术语才对得上。
-3. **语气词被当成实词**（`strip_fillers()`）：会议里满口「嗯、呃、えーと、あの」，模型会把它译成「はい」「ええ」「那个」，整句语义被带偏。现在**送翻译前**先删纯语气词，**页面显示的原文保持逐字**（逐字稿本身有价值）。
+1. **Hard cut landing in the middle of a syllable**: `天真好` cut into `天真` gets translated as 「天空」 ("sky"). Now when it reaches the `--soft-cut` limit it **backs off to the frame with the lowest energy** within the last 0.7 seconds to make the cut, leaving the remaining frames for the next segment (segment length now fluctuates 2.3~3.0 seconds, but far fewer misrecognitions).
+2. **Short sentences' translations mix languages**: after cutting shorter, a single sentence is often half a sentence and the model leaves 「的/了」 or mixes Chinese/English/Japanese. The translation prompt was changed to a hard requirement that "the translation must be purely in the target language, not a single source word may remain", and the **previous two sentences' source text is sent in as 【上文】** (previous context), so that person and terminology line up.
+3. **Filler words treated as content words** (`strip_fillers()`): meetings are full of 「嗯、呃、えーと、あの」 ("uh, um, eto, ano") and the model translates them into 「はい」「ええ」「那个」, dragging the whole sentence's meaning off course. Now **before sending to translation** pure fillers are removed, while **the original text shown on the page stays verbatim** (a verbatim transcript has value in itself).
 
-清洗规则刻意保守，靠「前后必须是标点或句界」而不是靠词表猜：`那个项目` 的「那个」、`あの人` 的「あの」后面跟的是实词，天然不匹配，所以不在名单里也不会误伤（`that is her eraser` 里的 `er` 同理）。整句都是语气词（如「哦。」）时**退回原文**，绝不返回空串。
+The cleaning rules are deliberately conservative, relying on "must be preceded/followed by punctuation or a sentence boundary" rather than guessing from a word list: the 「那个」 in `那个项目` ("that project") and the 「あの」 in `あの人` ("that person") are followed by content words, so they naturally do not match, and therefore do no damage even though they are not on the list (same for the `er` in `that is her eraser`). When the whole sentence is filler (e.g. 「哦。」) it **falls back to the original text** and never returns an empty string.
 
-**参数**
+**Parameters**
 
 ```bash
---max-s 3.0        # 延迟硬上限；开会别超过 4 秒
---hold 0.42        # 静音多久断句；再小会把词切成两段
---min-s 0.25       # 短于这个直接丢（咔哒声）
---soft-cut 0.7     # 硬切前回退找低谷的搜索窗
---asr-workers 1    # ASR 每段只 0.1~0.2 秒，1 个够
---tr-workers 1     # 生产用 1：实测 1 与 2 首字无差别（4.21），少一个排队环节
---ctx-lines 1      # 生产用 1：带一句上文，首字比 2 省 ~90ms（4.21）
-                   # 译文默认流式（首字 260ms）；--no-stream-trans 退回整句
---tr-prompt full   # system prompt 档位；short 是 35B 短版，实测更慢（见 4.20）
+--max-s 3.0        # hard latency cap; do not exceed 4 seconds in a meeting
+--hold 0.42        # how much silence before cutting a segment; any smaller splits words in two
+--min-s 0.25       # drop anything shorter than this (clicks)
+--soft-cut 0.7     # search window for backtracking to a trough before a hard cut
+--asr-workers 1    # ASR takes only 0.1~0.2 seconds per segment, 1 is enough
+--tr-workers 1     # 1 in production: measured no first-token difference between 1 and 2 (4.21), one queueing stage less
+--ctx-lines 1      # 1 in production: carry one sentence of context, first token saves ~90ms versus 2 (4.21)
+                   # translation streams by default (first token 260ms); --no-stream-trans reverts to whole sentences
+--tr-prompt full   # system prompt tier; short is the 35B short version, measured slower (see 4.20)
 ```
 
-状态里新增 `lag_ms / asr_ms / trans_ms / ttft_ms / q_asr / q_tr / dropped`，页面顶部直接显示「延迟 x.x s · 首字 xx ms · 译完 x.x s」。判断是否跟得上只看两个数：**队列恒为 0 就说明实时**，一旦 `q_tr` 持续上涨就是翻译跟不上，加 `--tr-workers`。
+The status now also has `lag_ms / asr_ms / trans_ms / ttft_ms / q_asr / q_tr / dropped`, and the top of the page shows 「延迟 x.x s · 首字 xx ms · 译完 x.x s」 (latency x.x s · first token xx ms · translated x.x s) directly. To judge whether it keeps up, look at only two numbers: **queues permanently at 0 means real time**; the moment `q_tr` keeps rising the translation cannot keep up, so add `--tr-workers`.
 
-> 想看「译文中」变成逐字冒，见 **4.15**（译文流式 + SSE 推送，首字 260ms）。
+> To see 「译文中」 ("translating…") turn into text appearing character by character, see **4.15** (streaming translation + SSE push, first token 260ms).
 
-**回归测试**：`test_caption_pipe.py`（打桩 ASR 与翻译，不依赖模型），7 个用例覆盖两段式出字、补丁去重、上文传递、投递不阻塞、队列溢出丢最旧、短段上限、低谷切点、清屏。
+**Regression test**: `test_caption_pipe.py` (ASR and translation stubbed, does not depend on models), 7 cases covering two-stage text output, patch de-duplication, context passing, non-blocking delivery, queue overflow dropping the oldest, short-segment cap, trough cut point, clear screen.
 
-### 4.14 换模型前先量这三个数（语音场景判据）
+### 4.14 Three numbers to measure before changing models (criteria for the voice scenario)
 
-Jetson 上做过一轮推理引擎对比（llama.cpp vs Magnitude，1B / 27B × 8K / 32K），结论在 memmy 里。但**那套数字是 agent run 口径**，直接拿来选语音助理的模型会得出相反答案：
+We did a round of inference-engine comparison on the Jetson (llama.cpp vs Magnitude, 1B / 27B × 8K / 32K); the conclusions are in memmy. But **those numbers are in agent-run terms**, and taking them directly to choose a model for a voice assistant gives the opposite answer:
 
-| 维度 | agent run（评测口径） | 个人语音助理 |
+| Dimension | agent run (benchmark terms) | Personal voice assistant |
 |---|---|---|
-| 并发 | 几十次调用串起来 | **1 个用户、1 路** |
-| 单次输出 | 200–800 token | 一句话，20–80 token |
-| 上下文 | 20K–60K，只涨不缩 | 2–4K（人设 + 近几轮） |
-| 关键指标 | 聚合吞吐、单位成本 | **前缀命中 TTFT**、首句出声时间 |
-| 慢了的后果 | 跑得久一点 | 用户以为它没听见 |
+| Concurrency | dozens of calls chained together | **1 user, 1 stream** |
+| Single output | 200–800 tokens | one sentence, 20–80 tokens |
+| Context | 20K–60K, only grows | 2–4K (persona + last few turns) |
+| Key metric | aggregate throughput, unit cost | **prefix-hit TTFT**, time to first spoken sentence |
+| Consequence of being slow | it runs a bit longer | the user thinks it did not hear them |
 
-所以评测里最亮眼的两个数——Magnitude 在 N=8 时聚合 12.17 tok/s、批处理甜点 4 路——**对助理几乎无用**，因为根本没有 8 个并发。
+So the two most eye-catching numbers in the benchmark — Magnitude's 12.17 tok/s aggregate at N=8, and the batch sweet spot of 4 streams — **are almost useless for an assistant**, because there simply are no 8 concurrent requests.
 
-#### 三条硬线
+#### Three hard lines
 
-| 判据 | 线 | 理由 |
+| Criterion | Line | Reason |
 |---|---|---|
-| 前缀命中 TTFT | **< 300 ms** | 人设 system prompt 固定，每轮都命中缓存，这才是真实起点 |
-| 单请求 decode | **≥ 20 tok/s** | TTS 约 4~5 字/秒，低于 20 会出现「边想边说」的换气停顿 |
-| 首句出声（实测） | **< 600 ms** | 到首个句号或 12 字为止；这是用户感知「它听懂了」的那一刻 |
+| Prefix-hit TTFT | **< 300 ms** | the persona system prompt is fixed and hits the cache every turn; this is the real starting point |
+| Single-request decode | **≥ 20 tok/s** | TTS is about 4~5 characters/s; below 20 you get "thinking while speaking" breath pauses |
+| First sentence spoken (measured) | **< 600 ms** | up to the first full stop or 12 characters; this is the moment the user perceives "it understood me" |
 
-**别用 token 折算首句延迟**：中文分词约 1.3 字/token，7B 按 26 tok/s 折「20 token」是 769 ms，但真实首句只要 279 ms。第一版判据就是栽在这里（误判成不合格）。
+**Do not convert first-sentence latency from tokens**: Chinese tokenisation is about 1.3 characters/token, and at 26 tok/s for 7B "20 tokens" works out to 769 ms, yet the real first sentence takes only 279 ms. The first version of the criteria died exactly here (falsely judged as failing).
 
-#### 同机实测（Jetson AGX Orin 64GB，单请求、temperature=0、3 次取中位数）
+#### Measured on the same machine (Jetson AGX Orin 64GB, single request, temperature=0, median of 3 runs)
 
-| 模型 | decode tok/s | 前缀命中 TTFT | 冷 prefill TTFT | 进程冷启 | 内存峰值 | 首句出声 |
+| Model | decode tok/s | Prefix-hit TTFT | Cold prefill TTFT | Process cold start | Peak memory | First sentence spoken |
 |---|---|---|---|---|---|---|
-| Qwen2.5-7B-AWQ（vLLM，**当前在用**） | **26.0** | **88 ms** | 438 ms | —（常驻） | — | **279 ms** ✅ |
-| 27B Q4（llama.cpp） | 7.74 | 309 ms | 7.85 s | 15.4 s | 29.1 GB | ≈2.6 s ❌ |
-| 27B Q4（Magnitude） | 6.17 | 294 ms | 7.06 s | 148.4 s | 33.6 GB | ≈3.2 s ❌ |
-| 27B Q4（Magnitude + DFlash2） | 20.19 | 280 ms | 7.50 s | 97 s | 34.3 GB | ≈1.0 s △ |
-| 1B Q4（llama.cpp） | 111.8 | 26 ms | — | 2.1 s | 11.9 GB | ≈0.2 s ✅ |
+| Qwen2.5-7B-AWQ (vLLM, **currently in use**) | **26.0** | **88 ms** | 438 ms | — (resident) | — | **279 ms** ✅ |
+| 27B Q4 (llama.cpp) | 7.74 | 309 ms | 7.85 s | 15.4 s | 29.1 GB | ≈2.6 s ❌ |
+| 27B Q4 (Magnitude) | 6.17 | 294 ms | 7.06 s | 148.4 s | 33.6 GB | ≈3.2 s ❌ |
+| 27B Q4 (Magnitude + DFlash2) | 20.19 | 280 ms | 7.50 s | 97 s | 34.3 GB | ≈1.0 s △ |
+| 1B Q4 (llama.cpp) | 111.8 | 26 ms | — | 2.1 s | 11.9 GB | ≈0.2 s ✅ |
 
-**冷 prefill 和进程冷启是两件事**：前者每轮都可能遇到（上下文变了就要重算），后者只在服务重启时发生一次。27B 的 7.85 秒冷 prefill 本身就足以判死——用户说完话，光重算 prompt 就要 8 秒。
+**Cold prefill and process cold start are two different things**: the former can happen every turn (any change in context needs recomputation), the latter happens only once when the service restarts. The 27B's 7.85-second cold prefill is enough to condemn it on its own — the user finishes speaking and just recomputing the prompt takes 8 seconds.
 
-#### 按真实 prompt 扫：只有「看屏幕」会破线
+#### Scanning with the real prompt: only "look at screen" breaks the line
 
-上面的表用的是固定人设。换成 `voice_server.py` 里真实的 242 字 system prompt，按四种真实上下文各跑一遍（`tools/ttft_scenarios.py`，3 次中位数）：
+The table above used a fixed persona. Switching to the real 242-character system prompt in `voice_server.py` and running each of four real contexts once (`tools/ttft_scenarios.py`, median of 3 runs):
 
-| 场景 | 上下文 | 首字（warm） | 首字（cold） | 首句出声 | decode |
+| Scenario | Context | First token (warm) | First token (cold) | First sentence spoken | decode |
 |---|---|---|---|---|---|
-| 一问一答 | 172 tok | **86 ms** | 130 ms | 393 ms | 26.0 tok/s |
-| 6 轮历史 | 335 tok | **86 ms** | 224 ms | 319 ms | 26.0 tok/s |
-| 看屏幕 2K 字 | 1661 tok | 91 ms | **1008 ms** | 435 ms | 26.2 tok/s |
-| 看屏幕 4K 字 | 3273 tok | 104 ms | **1944 ms** | 449 ms | 26.0 tok/s |
+| One question, one answer | 172 tok | **86 ms** | 130 ms | 393 ms | 26.0 tok/s |
+| 6 turns of history | 335 tok | **86 ms** | 224 ms | 319 ms | 26.0 tok/s |
+| Look at screen, 2K chars | 1661 tok | 91 ms | **1008 ms** | 435 ms | 26.2 tok/s |
+| Look at screen, 4K chars | 3273 tok | 104 ms | **1944 ms** | 449 ms | 26.0 tok/s |
 
-两个结论：
+Two conclusions:
 
-1. **warm 首字几乎与上下文无关**（86→104 ms，172→3273 token 只涨 18 ms）。前缀缓存是真的在工作，日常多轮对话永远在这个量级——多聊十轮也不会变慢。
-2. **cold 首字随上下文线性涨**，斜率约 **0.58 ms/token**（换算冷 prefill ≈ 1700 tok/s）。所以**看屏幕是唯一会破 300 ms 的场景**：OCR 文本每帧都变，从 OCR 那段起全部要重算，1.6K 字就是 1 秒、3.3K 字就接近 2 秒。
+1. **The warm first token is almost independent of context** (86→104 ms; 172→3273 tokens adds only 18 ms). The prefix cache really is working, and everyday multi-turn dialogue stays at this magnitude forever — ten more turns will not make it slower.
+2. **The cold first token grows linearly with context**, with a slope of about **0.58 ms/token** (i.e. cold prefill ≈ 1700 tok/s). So **look-at-screen is the only scenario that breaks 300 ms**: the OCR text changes every frame, so everything from the OCR block onwards has to be recomputed, and 1.6K characters means 1 second while 3.3K characters is close to 2 seconds.
 
-这也解释了看屏幕的耗时构成（CPU 版：取帧 0.07 + OCR 4.3~5.6 + **LLM 首字 0.45~1.0** + 生成）。想再压，优先砍 OCR 送进 prompt 的字数（分区 OCR / 只取窗口主体），而不是换模型——换 27B 会让这一项从 1 秒变成 8 秒。
+This also explains the time composition of look-at-screen (CPU version: frame grab 0.07 + OCR 4.3~5.6 + **LLM first token 0.45~1.0** + generation). To compress it further, prioritise cutting the number of characters of OCR sent into the prompt (region-based OCR / only taking the main body of the window) rather than changing models — switching to 27B turns this item from 1 second into 8 seconds.
 
-**判决**：27B 裸跑进不了语音热路径——不是「慢一点」，而是首句要 3 秒才出声，把 4.13 那套 1~2 秒的成果全退回去。而 7B 的 279 ms 里，LLM 只占一小部分，瓶颈仍在断句（0.42s）和 ASR（0.19s），这才是健康结构。
+**Verdict**: 27B running bare cannot get into the voice hot path — it is not "a bit slower", it takes 3 seconds to speak the first sentence, which rolls back the whole 1~2 second result of 4.13. And in the 7B's 279 ms the LLM is only a small part; the bottleneck is still segmentation (0.42s) and ASR (0.19s), which is the healthy structure.
 
-#### 落档与引擎
+#### Tiers and engines
 
-- **热路径（唤醒应答、指令、闲聊、转场）：1B–4B 或 7B**。7B 是当前甜点，实测全项达标。
-- **冷路径（看屏幕 OCR 后推理、会议纪要后处理、长文档翻译）：9B–14B / 27B**，用户愿意等 5–10 秒。
-- 但 1B 只能当路由：实测让它讲「投机解码」，答成了金融术语。人格化对话会露怯。
-- **引擎用 llama.cpp 常驻，不用 Magnitude**：冷启 15.4s vs 148.4s（崩了要能 15 秒自愈）；Magnitude **没有 `n_ctx` 开关**，1B 也按 131072 固定分 KV、白吃 12.8GB，llama.cpp 用 `-c 4096` 能压到 3GB 出头——64GB 统一内存还要跟 ASR / RapidOCR / vLLM 抢；前缀命中 26ms vs 141ms 白拿。
-- Magnitude 唯一值得的场景是**非要在热路径用 27B**，靠 DFlash2 把 decode 拉到 20.19（2.6×）。
-- **多路并发交给 vLLM，别引入第三套栈**：助理真正的并发是「语音问答 + 字幕翻译 + 后台摘要」，连续批处理是 vLLM 的强项。
+- **Hot path (wake response, commands, small talk, transitions): 1B–4B or 7B**. 7B is the current sweet spot, measured as passing every item.
+- **Cold path (reasoning after OCR look-at-screen, meeting-minutes post-processing, long-document translation): 9B–14B / 27B**, where the user is willing to wait 5–10 seconds.
+- But 1B can only be a router: measured, when asked to talk about "speculative decoding" it answered with financial terminology. Personified dialogue exposes it.
+- **Use llama.cpp as a resident engine, not Magnitude**: cold start 15.4s vs 148.4s (after a crash you need to self-heal within 15 seconds); Magnitude **has no `n_ctx` switch**, so even 1B allocates KV for a fixed 131072 and wastes 12.8GB, while llama.cpp with `-c 4096` squeezes it to just over 3GB — and with 64GB of unified memory there is ASR / RapidOCR / vLLM competing for it; prefix hit 26ms vs 141ms for free.
+- The only scenario where Magnitude is worth it is **when you insist on using 27B in the hot path**, using DFlash2 to pull decode up to 20.19 (2.6×).
+- **Leave multi-stream concurrency to vLLM, do not introduce a third stack**: the assistant's real concurrency is "voice Q&A + caption translation + background summarisation", and continuous batching is vLLM's strength.
 
-#### 复测口径（防口径漂移）
+#### Re-measurement protocol (to prevent drift in the protocol)
 
 ```bash
-# 任意 OpenAI 兼容端点：vLLM / llama-server / Magnitude
+# any OpenAI-compatible endpoint: vLLM / llama-server / Magnitude
 ../asr-venv/bin/python tools/llm_probe.py --base http://127.0.0.1:8000/v1 --model qwen --runs 3
-# 加 --json 出结构化结果，退出码 0=全项达标、1=有项不达标，可直接进 CI
+# add --json for structured output; exit code 0 = all items pass, 1 = some item fails, so it can go straight into CI
 ```
 
-脚本做的事：预热一次（加载模型 / kernel 调优不计入）→ N 次同 prompt 测前缀命中态 → N 次在 prompt 前加唯一 nonce 测冷 prefill → 打印中位数与极差。判定全在脚本里，不用自己算。
+What the script does: warm up once (model loading / kernel tuning is not counted) → N runs with the same prompt to measure the prefix-hit state → N runs with a unique nonce prepended to the prompt to measure cold prefill → print the median and the range. All the judging is in the script, you do not compute anything yourself.
 
-口径要求（这几条比数字重要）：
+Protocol requirements (these matter more than the numbers):
 
-1. **同一份 GGUF，附 sha256**；换量化就别横向比。
-2. `temperature=0`、`seed=42`，每项 **≥3 次取中位数**，记录极差当**噪声下限**；差值必须大于极差才算真差异。
-3. **前缀命中态和冷 prefill 分开测**：冷 prefill 在 prompt 最前面加唯一 nonce，确认 `cache_n=0`。
-4. **投机解码两边对齐**：都开或都关，不许一边开一边比（llama.cpp 7d7f028 起自带 `--spec-type`，早期的「llama 没有等价实现」已经不成立）。
-5. **单请求测（`-np 1`）**；并发另起一组，别混在一张表里。
-6. 只测速度不测质量——**换引擎换不来聪明，只能换来吞吐**。
+1. **The same GGUF, with its sha256**; if you change the quantisation, do not compare across.
+2. `temperature=0`, `seed=42`, **≥3 runs each taking the median**, record the range as the **noise floor**; a difference must exceed the range to count as real.
+3. **Measure the prefix-hit state and cold prefill separately**: for cold prefill, prepend a unique nonce to the front of the prompt and confirm `cache_n=0`.
+4. **Align speculative decoding on both sides**: both on or both off, never one on while comparing (llama.cpp has shipped `--spec-type` since 7d7f028, so the earlier "llama has no equivalent implementation" no longer holds).
+5. **Measure single-request (`-np 1`)**, and start a separate group for concurrency; do not mix them in one table.
+6. Measure speed only, not quality — **changing the engine does not buy intelligence, only throughput**.
 
-### 4.15 译文流式 + SSE：把「等 0.8 秒一次性出现」变成「0.26 秒开始逐字冒」
+### 4.15 Streaming translation + SSE: from "appearing all at once after 0.8 seconds" to "starting to appear character by character at 0.26 seconds"
 
-4.13 那套把原文压到了 147ms，但**译文仍是整句一次性出现**（`trans 296~1210ms`）。用户问「能不能改成流式」——能，而且收益比预想大。
+The 4.13 work pushed the original text down to 147ms, but **the translation still appeared as a whole sentence at once** (`trans 296~1210ms`). The user asked "can it be made streaming" — yes, and the gain is bigger than expected.
 
-**先量清楚慢在哪**：vLLM 的 system prompt 被前缀缓存，所以
+**First measure exactly where it is slow**: vLLM's system prompt is prefix-cached, so
 
-| | 非流式（整句） | 流式首字 | 流式全量 |
+| | Non-streaming (whole sentence) | Streaming first token | Streaming full |
 |---|---|---|---|
-| 短句「元首和平宣言。」 | 368ms | **93ms** | 370ms |
-| 长句（20 字） | 756ms | **88ms** | 759ms |
-| 最长句 | 1309ms | **88ms** | 1309ms |
-| 6 例均值 | 701ms | **96ms** | 690ms |
+| Short sentence 「元首和平宣言。」 | 368ms | **93ms** | 370ms |
+| Long sentence (20 chars) | 756ms | **88ms** | 759ms |
+| Longest sentence | 1309ms | **88ms** | 1309ms |
+| Mean of 6 cases | 701ms | **96ms** | 690ms |
 
-**关键**：首字只要 ~96ms，而整句要 700ms —— 慢的是**逐 token 生成**，不是 prefill。所以流式不只是「看起来更快」，它让**用户看到第一个字的时间提前 275~1221ms**，总耗时完全不变。
+**The key point**: the first token takes only ~96ms while the whole sentence takes 700ms — what is slow is **per-token generation**, not prefill. So streaming is not merely "it looks faster": it makes **the time until the user sees the first character 275~1221ms earlier**, with the total duration completely unchanged.
 
-#### 实测端到端（真实 HDMI 会议语音，810 段运行中）
+#### Measured end to end (real HDMI meeting audio, 810 segments in a running session)
 
-| 指标 | 改造前 | 改造后 |
+| Metric | Before the change | After the change |
 |---|---|---|
-| 段末 → 原文 | 147ms | 147ms |
-| 段末 → **首字译文** | 830~1360ms（= 等整句） | **260ms** |
-| 段末 → 译文全出 | 830~1360ms | 808ms |
+| Segment end → original text | 147ms | 147ms |
+| Segment end → **first translated token** | 830~1360ms (= waiting for the whole sentence) | **260ms** |
+| Segment end → full translation | 830~1360ms | 808ms |
 
-感知延迟降了 **3~5 倍**，而 GPU 占用没变（同一个请求，只是不阻塞等它写完）。
+Perceived latency dropped **3~5×**, while GPU usage did not change (the same request, it just no longer blocks waiting for it to finish writing).
 
-#### 实现要点
+#### Implementation points
 
-1. **`translate_stream()`**：SSE 解析 vLLM 的 `data:` 流，每收到 delta 就回调。返回 `(全文, ttft_ms, total_ms)`。异常时**保留已收到的部分**——半句译文比空白有用。
-2. **推完整累积文本，不推增量**：前端 `applyUpd` 本来就是 `l.trans = u.trans` 整行替换，推累积串就不用改渲染逻辑。实测 13/13 段的每条中间态都是最终译文的**严格前缀**，所以替换不会闪烁。
-3. **同一 seq 合并补丁**（`_push_update`）：前端 250ms 轮询，流式每 80ms 一个增量，不合并一次 poll 会拿到同一行 3 条中间态、白重绘 2 次。
-4. **中间态不带 `trans_ms`，只有 `final` 才带**：否则页面上的「译 x.x s」会一路往上跳。
-5. **`--no-stream-trans` 可以退回整句**，只在排查问题时用。
+1. **`translate_stream()`**: parses vLLM's `data:` SSE stream and calls back on every delta received. Returns `(full_text, ttft_ms, total_ms)`. On an exception it **keeps the part already received** — half a sentence of translation is more useful than a blank.
+2. **Push the full accumulated text, not the delta**: the front end's `applyUpd` was already replacing the whole line with `l.trans = u.trans`, so pushing the accumulated string means no change to the rendering logic. Measured: for 13/13 segments every intermediate state was a **strict prefix** of the final translation, so replacement does not flicker.
+3. **Merge patches for the same seq** (`_push_update`): the front end polls every 250ms and streaming produces a delta every 80ms, so without merging one poll would receive 3 intermediate states of the same line and waste 2 redraws.
+4. **Intermediate states carry no `trans_ms`, only `final` does**: otherwise the 「译 x.x s」 (translated in x.x s) on the page would climb all the way up.
+5. **`--no-stream-trans` reverts to whole sentences**, used only when debugging.
 
-#### 输出侧：250ms 轮询 → SSE 推送
+#### Output side: 250ms polling → SSE push
 
-轮询本身贡献均摊 125ms。改成 `/api/events`（`text/event-stream`）后中间态一到就画，实测推送间隔最快 **51ms**。
+Polling itself contributes 125ms on average. After switching to `/api/events` (`text/event-stream`) intermediate states are drawn the moment they arrive, and the measured push interval reaches **51ms** at its fastest.
 
-**踩到一个多端坑**：`take_updates()` 是「取走即清空」，两个页面同时开会互相抢补丁，第二个永远停在「译文中…」。所以 SSE 端点**不用** `take_updates()`，而是每个连接自己维护 `{seq: trans}` 快照做差异比对。验证方式是两个客户端同时订阅，各收到 **97 个版本 / 15 段全部含中间态**，完全对称。
+**Hit a multi-client pitfall**: `take_updates()` is "take and clear", so two open pages fight over the patches and the second one stays at 「译文中…」 forever. So the SSE endpoint **does not use** `take_updates()`; instead each connection keeps its own `{seq: trans}` snapshot and diffs against it. Verification: with two clients subscribing at the same time, each received **97 versions / all 15 segments with intermediate states**, completely symmetric.
 
-前端保留轮询兜底：`EventSource` 出错就关掉自己，回落 `tick()`。
+The front end keeps polling as a fallback: if `EventSource` errors it closes itself and falls back to `tick()`.
 
-#### 顺带修的：`pushLines` 没去重
+#### Also fixed: `pushLines` did not de-duplicate
 
-SSE 断线重连时浏览器会用原 URL（`after` 不变），服务端会把旧行再发一遍。原来 `pushLines` 直接 `lines.push()`，会出现重复行。现在按 `idx` 去重。
+When SSE reconnects the browser uses the original URL (`after` unchanged) and the server sends the old lines again. `pushLines` used to do `lines.push()` directly, producing duplicate lines. Now it de-duplicates by `idx`.
 
-#### ASR 为什么没上 GPU（评估过，否掉）
+#### Why ASR was not put on the GPU (evaluated, rejected)
 
-翻译本来就跑在 GPU（vLLM），这是唯一该用 GPU 的地方。ASR 值得评估，但：
+Translation already runs on the GPU (vLLM); that is the only place that should use it. ASR was worth evaluating, but:
 
-- `sherpa-onnx` 的 wheel **纯 CPU 编译**（`ldd` 查不到 `libcudart`/`libnvinfer`）
-- `from_sense_voice(provider="cuda")` 会**静默 fallback**：`Please compile with -DSHERPA_ONNX_ENABLE_GPU=ON. Available providers: CPUExecutionProvider. Fallback to cpu!`
-- `provider="trt"` 直接拒绝：`Tensorrt support for Online models only`
+- `sherpa-onnx`'s wheel is **compiled for pure CPU** (`ldd` finds no `libcudart`/`libnvinfer`)
+- `from_sense_voice(provider="cuda")` **silently falls back**: `Please compile with -DSHERPA_ONNX_ENABLE_GPU=ON. Available providers: CPUExecutionProvider. Fallback to cpu!`
+- `provider="trt"` is rejected outright: `Tensorrt support for Online models only`
 
-要 GPU 化得自己重编 sherpa-onnx（要匹配 CUDA 13.2 的 onnxruntime，**而那个轮子不存在**，见 4.8），或者像 rec 那样自己写 fbank + CTC 的 TRT 推理。**而 ASR 只占 147ms，收益上限就是这 147ms**——相比流式省下的 600ms，完全不划算。
+Putting it on the GPU would mean rebuilding sherpa-onnx yourself (matching onnxruntime for CUDA 13.2, **and that wheel does not exist**, see 4.8), or writing TRT inference for fbank + CTC yourself as was done for rec. **And ASR only takes 147ms, so the ceiling on the gain is that 147ms** — compared with the 600ms saved by streaming, it is not worth it at all.
 
-**结论：GPU 已经用在正确的地方。** 字幕链路的下一分钱应该花在 ASR 精度上，不是速度上。
+**Conclusion: the GPU is already being used in the right place.** The next penny in the caption pipeline should be spent on ASR accuracy, not speed.
 
-### 4.16 断句：从「固定 3 秒切」改成「按自然停顿切」（2026-11-21）
+### 4.16 Segmentation: from "fixed 3-second cut" to "cut at natural pauses" (2026-11-21)
 
-**问题**：用户看字幕觉得「每 3 秒硬切一段」。查代码发现其实一直是自然停顿驱动的——`--hold 0.42` 判定静音、`--max-s 3.0` 只是兜底上限。但**实测证明用户的感觉是对的**：
+**The problem**: watching the captions, the user felt "it hard-cuts a segment every 3 seconds". Reading the code shows it was in fact always driven by natural pauses — `--hold 0.42` decides silence, and `--max-s 3.0` is only a fallback cap. But **measurement proves the user's feeling was right**:
 
-拿 62 秒真实会议音频（`pw-record` 从采集卡直录）跑离线分段，129 段统计：
+Taking 62 seconds of real meeting audio (recorded straight from the capture card with `pw-record`) and running offline segmentation, statistics over 129 segments:
 
-| 参数组 | 段数 | 静音切 | 撞上限 | 段长中位 | p75 |
+| Parameter set | Segments | Silence cut | Hit cap | Median segment length | p75 |
 |---|---|---|---|---|---|
-| max=3.0 hold=0.42（改造前） | 25 | **44%** | **56%** | 2.54s | 2.86s |
+| max=3.0 hold=0.42 (before the change) | 25 | **44%** | **56%** | 2.54s | 2.86s |
 | max=4.0 | 19 | 68% | 32% | 3.22s | 3.62s |
 | max=4.5 | 19 | 74% | 26% | 2.92s | 4.20s |
 | max=5.0 | 17 | 76% | 24% | 3.08s | 4.72s |
 | max=6.0 | 15 | 80% | 20% | 3.86s | 5.78s |
 | max=8.0 | 15 | **100%** | **0%** | 3.20s | 5.84s |
 
-**56% 的段是撞上限硬切的**——所以「固定 3 秒」在字面意义上成立一半以上。
+**56% of the segments were hard-cut by hitting the cap** — so "fixed 3 seconds" is literally true for more than half of them.
 
-**根因不是「用了时间」，是「停顿门限只有一个固定值 0.42s」**：新闻播报的词间小停顿常达 0.3~0.4s，正好够触发断句，于是切出半句；而一句话真说完的长停顿（0.6~1.2s）往往还没出现，3 秒上限先到了。两个门限都设死，必然两头不讨好。
+**The root cause is not "using time", it is "there is only one fixed value, 0.42s, for the pause threshold"**: in news-style speech the small pauses between words often reach 0.3~0.4s, just enough to trigger a cut, so it cuts out half a sentence; while the long pause that comes when a sentence really ends (0.6~1.2s) often has not arrived yet and the 3-second cap gets there first. With both thresholds fixed, it necessarily fails at both ends.
 
-**改法：门限按段长分层 + 放宽兜底上限。**
+**The change: layer the threshold by segment length + relax the fallback cap.**
 
 ```
-有声 < seg_mid(1.2s)  → 要等 hold_long(0.90s) 的长停顿才切     # 宁可与下句并一起，不切碎
-有声 < seg_long(2.4s) → 用基准 hold(0.45s)
-有声 ≥ seg_long(2.4s) → hold_short(0.30s) 就切                # 已经拖够长，延迟不能再涨
-max_s = 6.0                                                      # 兜底
+voiced < seg_mid(1.2s)  → must wait for a long pause of hold_long(0.90s) to cut   # rather merge with the next sentence than cut it into pieces
+voiced < seg_long(2.4s) → use the baseline hold(0.45s)
+voiced ≥ seg_long(2.4s) → cut at hold_short(0.30s)                              # already dragged long enough, latency must not grow further
+max_s = 6.0                                                                     # fallback
 ```
 
-#### 踩过的坑：用「静音切占比」当判据，结论是错的
+#### Pitfall stepped on: using "silence-cut share" as the criterion gives the wrong conclusion
 
-按那个指标，`max_s 7.0 + hold_short 0.25 + seg_long 1.8` 能做到 **100% 静音切、p75 只有 3.88s**，看起来完美。但跑真实音频一听，ASR 文本**比 4.5 方案更碎**：
+By that metric, `max_s 7.0 + hold_short 0.25 + seg_long 1.8` achieves **100% silence cut with a p75 of only 3.88s**, which looks perfect. But listening to it on real audio, the ASR text is **more fragmented** than with the 4.5 setting:
 
-| 4.5 方案（静音切 74%） | 7.0 + 0.25/1.8（静音切 100%） |
+| 4.5 setting (silence cut 74%) | 7.0 + 0.25/1.8 (silence cut 100%) |
 |---|---|
 | 所以去**扯**什么台湾会不会进行交易筹码？ | 所以去**者**什么，台湾会不会进行交易筹码？ |
 | 了不起在中美会晤中国大陆**再讲一下**。 | 了不起在中美会晤。＋做好到路再讲一下啊 |
 
-原因很直白：0.25 秒的停顿在口播里多半是**词间换气**，切在那儿就是半句。**「没撞上限」和「切在好位置」是两件事**，静音切占比只度量了前者。真正的判据只能是 ASR 文本读起来完不完整，靠人看。
+(`扯` "talk nonsense" turned into `者` "person"; `再讲一下` "talk a bit more" became the nonsense `做好到路再讲一下啊`.)
 
-#### 上限定 6.0 也是这么定的（同一段音频跑 `--wav` 对比文本）
+The reason is obvious: in speech, a 0.25-second pause is mostly **a breath between words**, and cutting there produces half a sentence. **"Did not hit the cap" and "cut at a good place" are two different things**, and the silence-cut share only measures the former. The only real criterion is whether the ASR text reads as complete, and that takes a human to look at.
 
-| max_s | 中位 | p75 | 文本 |
+#### The 6.0 cap was decided the same way (same audio run through `--wav`, comparing the text)
+
+| max_s | Median | p75 | Text |
 |---|---|---|---|
-| 4.5 | 2.92s | 4.20s | 「有开了等一长会又拍了开了我会」；「大会」被切成「大」+「会议」 |
-| 5.5 | 3.86s | 4.72s | 仍有两处拆句：「…我会嗯。」+「之后才有亚尔达会议。」 |
-| **6.0** | 3.86s | 5.78s | 「了不起在中美会晤中国大陆再讲一下啊，我认为就是这样了」合成一句 |
-| 7.0 | 3.86s | 5.78s | **出现幻觉**：同一处「等一长会议」变成「德拉兰会议」 |
+| 4.5 | 2.92s | 4.20s | 「有开了等一长会又拍了开了我会」; 「大会」 cut into 「大」 + 「会议」 |
+| 5.5 | 3.86s | 4.72s | still two split sentences: 「…我会嗯。」 + 「之后才有亚尔达会议。」 |
+| **6.0** | 3.86s | 5.78s | 「了不起在中美会晤中国大陆再讲一下啊，我认为就是这样了」 merged into one sentence |
+| 7.0 | 3.86s | 5.78s | **hallucination appears**: the same spot 「等一长会议」 becomes 「德拉兰会议」 |
 
-7.0 那一行是最关键的否定证据：**段太长时 ASR 开始编，不是越长约好**。6.0 是文本质量的最优点。
+The 7.0 row is the most important negative evidence: **when the segment is too long the ASR starts making things up — longer is not better**. 6.0 is the optimum for text quality.
 
-**效果：ASR 原文完整度明显变好**（同一段音频，`--wav` 离线跑）：
+**Effect: the completeness of the ASR original text clearly improves** (same audio, offline run with `--wav`):
 
-| 改造前（3s） | 改造后（6s 分层） |
+| Before the change (3s) | After the change (6s, layered) |
 |---|---|
 | 「这个都没有啊，怎么可能第一次。」+「结论那不可能的事嘛啊。」 | 「这个都没有啊，怎么可能第一次就有结论，那不可能的事。」 |
-| 「呃，三强会物三强的峰会我。」+「不认为。」 | 「三角的峰会我不认为。」（「我不认为」不再被拆开） |
+| 「呃，三强会物三强的峰会我。」+「不认为。」 | 「三角的峰会我不认为。」（「我不认为」 is no longer split apart） |
 | 「所以去什麼台不会行交易？」 | 「所以去扯什么台湾会不会进行交易筹码？」 |
 | 「了不起在中美会晤中国大陆在。」+「一下啊，我认为就是这样了。」 | 「了不起在中美会晤中国大陆再讲一下啊，我认为就是这样了。」 |
 
-第 3 行最说明问题：段太短时 ASR 听不出上下文，「什么台不会行交易」是乱码；段拉长到一句完整的话之后，识别成「什么台湾会不会进行交易筹码」。**断句错 → ASR 错 → 翻译更错**，这条链是串起来的。
+Row 3 illustrates it best: with too short a segment the ASR cannot use context and 「什么台不会行交易」 is gibberish; once the segment is stretched to a complete sentence it is recognised as 「什么台湾会不会进行交易筹码」. **Bad segmentation → bad ASR → even worse translation**, the chain is linked.
 
-**代价**：出字延迟中位 2.54→3.86s，p75 2.86→5.78s（离线 62s 样本）。线上实测中位 4.1s。这是「句子完整」换来的，改回 `--max-s 4.5` 即可退回中间态。
+**Cost**: median time-to-text goes 2.54→3.86s and p75 2.86→5.78s (offline 62s sample). Online measurement gives a median of 4.1s. This is what "complete sentences" costs; change back to `--max-s 4.5` to revert to the intermediate state.
 
-**顺带修的**：`--min-s 0.25` 会放过纯噪声段，SenseVoice 返回 `" 。"`，页面上就是一行空字幕，还白占一次翻译。现在 `recognize()` 用 `SUBSTANCE` 正则筛实质字符（中日韩文/假名/英数），只剩标点就丢弃。
+**Also fixed**: `--min-s 0.25` let pure noise segments through, SenseVoice returned `" 。"`, and the page showed an empty caption line while still burning a translation. Now `recognize()` uses the `SUBSTANCE` regex to filter substantial characters (CJK/kana/letters/digits) and discards anything that is only punctuation.
 
-**怎么自己调**：`tools/seg_ab.py` 只跑 Segmenter（不碰 ASR/翻译），几秒出结果，`--sets` 可传任意组参数：
+**How to tune it yourself**: `tools/seg_ab.py` runs only the Segmenter (it does not touch ASR/translation) and gives a result in seconds; `--sets` takes arbitrary sets of parameters:
 
 ```bash
 ./asr-venv/bin/python tools/seg_ab.py /tmp/meet60.wav
 ./asr-venv/bin/python tools/seg_ab.py /tmp/meet60.wav --sets "4.5:0.45:0.30:0.90,6.0:0.45:0.30:0.90"
 ```
 
-判据看**静音切占比**（越高越说明切在自然停顿上）和 **p75 段长**（直接等于出字延迟的尾巴）。
+The criteria are the **silence-cut share** (the higher it is, the more cuts land on natural pauses) and the **p75 segment length** (which is exactly the tail of the time-to-text).
 
-**还有什么没解决**：能量法分不出「词间停顿」和「句间停顿」，只能靠时长猜。真正的句界要靠语调下降或标点级语义模型，能量门限做不到。现在 26% 的段仍是硬切，靠 `soft-cut` 回退找能量低谷兜住。
+**What is still unsolved**: the energy method cannot tell "a pause between words" from "a pause between sentences"; it can only guess from duration. Real sentence boundaries need falling intonation or a punctuation-level semantic model, which an energy threshold cannot do. 26% of segments are still hard cuts, caught by `soft-cut` backing off to an energy trough.
 
-#### 但「自然停顿」这件事本身有物理上限
+#### But "natural pauses" itself has a physical ceiling
 
-`tools/pause_hist.py` 量了同一段 62 秒音频的停顿分布（门限口径与 Segmenter 一致）：
+`tools/pause_hist.py` measured the pause distribution of the same 62-second audio (same threshold convention as the Segmenter):
 
 ```
-停顿总个数 59   总时长 17.3s / 62.0s
-≥0.20s  35 个 59%
-≥0.30s  26 个 44%
-≥0.45s  17 个 29%
-≥0.60s  10 个 17%
-≥0.90s   0 个  0%     ← 一个都没有
+total pauses 59   total duration 17.3s / 62.0s
+≥0.20s  35  59%
+≥0.30s  26  44%
+≥0.45s  17  29%
+≥0.60s  10  17%
+≥0.90s   0   0%     ← not a single one
 ```
 
-**中文口播里根本没有 0.9 秒以上的停顿。** 最长的那几处也只有 0.8 秒出头（0.8s 档 4 个）。所以：
+**Chinese speech simply has no pauses of 0.9 seconds or more.** Even the longest ones are only just over 0.8 seconds (4 in the 0.8s bucket). Therefore:
 
-- `--hold-long 0.9` 在真实语料里**几乎永远不满足**。它的作用不是"经常在长停顿处切"，而是**防止把一句话的开头切成 0.5 秒的碎片**——短段宁可等，等到攒够 `--seg-mid` 换成 0.45 门限再说。
-- 真正把段拉长的是 `--max-s 3.0 → 4.5`，不是分层门限。分层解决的是"别切碎"，放宽上限解决的是"别硬切"。
-- 关键推论：**段长 4 秒时仍撞上限，不是参数没调好，是这句话本身就有 5~6 秒**。再往上放上限只能换来更长的等待。
+- `--hold-long 0.9` is **almost never satisfied** in real speech. Its job is not "often cut at a long pause" but **preventing the beginning of a sentence from being cut into 0.5-second fragments** — a short segment would rather wait until it has accumulated `--seg-mid` and switched to the 0.45 threshold.
+- What really lengthens the segments is `--max-s 3.0 → 4.5`, not the layered thresholds. Layering solves "do not cut into pieces", relaxing the cap solves "do not hard cut".
+- Key corollary: **if a 4-second segment still hits the cap, it is not that the parameters are badly tuned, it is that this sentence itself is 5~6 seconds long**. Raising the cap further only buys a longer wait.
 
-**要真正解决，得换掉"等一段说完"这个前提**：用流式 ASR（sherpa-onnx 的 online 模型，`provider="trt"` 只支持 online 模型就是佐证）边说边出字，延迟与段长脱钩，断句只用于切翻译的句子边界。代价是流式模型中文精度一般不如 SenseVoice 这个离线非流式模型，需要实测再定。
+**To really solve it you have to replace the premise of "wait until a segment finishes"**: use streaming ASR (sherpa-onnx's online models — the fact that `provider="trt"` only supports online models is corroborating evidence) to produce text while speaking, decoupling latency from segment length, with segmentation used only to cut sentence boundaries for translation. The cost is that the Chinese accuracy of streaming models is generally not as good as the offline non-streaming SenseVoice, and that needs measurement before deciding.
 
-### 4.17 译文守不住「纯目标语言」：prompt 重写 + 残留检测（2026-11-21）
+### 4.17 The translation cannot hold "pure target language": prompt rewrite + residue detection (2026-11-21)
 
-**症状**：中日互译时 7B 大量照抄原文。实测抓到的输出：
+**Symptom**: in Chinese-Japanese translation the 7B copies the source text a lot. Outputs actually captured:
 
 ```
 原文 我是主持人谭英文      → 我是主持人田英和      （整句中文照抄，等于没翻译）
@@ -967,352 +971,358 @@ max_s = 6.0                                                      # 兜底
      → Because it is easy for him to compare with South Korea.   （整句变英文）
 ```
 
-**为什么旧 prompt 守不住**：只说「译文必须是纯中文/纯日语，一个原文词都不许留」，全是抽象规则，没有反例。而**中日共用汉字**这个特殊性让模型有大量"看起来对"的偷懒空间——把中文原样输出成日语，每个字都是合法汉字，模型没有动机去改。
+(The first case is copied wholesale from the Chinese, i.e. not translated at all; the third mixes in a raw English word `pesticid` and leaves the Chinese 「认为」 ("think") in the Japanese; the fourth turns into a whole English sentence.)
 
-**改动**（`_tr_system()`，顺带把 `translate` 和 `translate_stream` 里两份完全重复的 prompt 合并）：
+**Why the old prompt could not hold**: it only said "the translation must be pure Chinese / pure Japanese, not a single word of the source may remain" — all abstract rules, no counter-examples. And the peculiarity that **Chinese and Japanese share kanji** gives the model a lot of room to be lazy in a way that "looks right" — outputting the Chinese as-is into Japanese, where every character is a legitimate kanji, leaves the model with no incentive to change anything.
 
-1. **先纠错再翻译**：显式授权模型按上下文改同音错字（`科意`→`刻意`、`三强贵物`→`三强会晤`）。不说的话它会忠实翻译错字。
-2. **给真实反例**：用实测抓到的坏输出当反面教材，比抽象规则有效——7B 的模仿倾向远强于规则遵循。
-3. **要求译完自查**：点名「残留假名/中文语法就整句重写」。
+**Changes** (`_tr_system()`, also merging the two completely duplicated prompts in `translate` and `translate_stream`):
 
-**实测对比**（`tools/tr_quality.py`，14 条真实用例，同一台 vLLM）：
+1. **Correct errors before translating**: explicitly authorise the model to fix homophone misrecognitions by context (`科意`→`刻意`, `三强贵物`→`三强会晤`). Without saying so it faithfully translates the wrong characters.
+2. **Give real counter-examples**: using the bad outputs actually captured as negative teaching material is more effective than abstract rules — the 7B's tendency to imitate is far stronger than its tendency to follow rules.
+3. **Require a self-check after translating**: explicitly "if any kana/Chinese grammar remains, rewrite the whole sentence".
 
-| 原文 | 旧 prompt | 新 prompt |
+**Measured comparison** (`tools/tr_quality.py`, 14 real cases, same vLLM):
+
+| Source | Old prompt | New prompt |
 |---|---|---|
-| 我是主持人谭英文 | 我是主持人田英和 ← 照抄 | 私は司会の谭英文です |
+| 我是主持人谭英文 | 我是主持人田英和 ← copied | 私は司会の谭英文です |
 | 深zのアプリで何点给深zに評価するか | 在深Z的应用中给深Z评分多少 | 该怎么评价深z这款应用？ |
 | 中方刻意给韩国好处 | 中国は韓国に特別な利益を与えた | 中国側は意図的に韓国に便宜を図った。 |
-| 中方科意、韓国に良いところを与える | 中方希望给韩国好的印象 ← 错字没纠 | 中方有意给予韩国一些好处。 |
-| 身体面にアメリカは坚持するべきです | 美国在身体方面应该坚持 ← 「坚持」照抄 | 在美国方面，美国应当坚持立场。 |
+| 中方科意、韓国に良いところを与える | 中方希望给韩国好的印象 ← the misrecognised character was not corrected | 中方有意给予韩国一些好处。 |
+| 身体面にアメリカは坚持するべきです | 美国在身体方面应该坚持 ← 「坚持」 copied | 在美国方面，美国应当坚持立场。 |
 
-**但长句仍然漏**：`…之后才有`（"才有"留着）、`…交易筹码`（"筹码"留着）、`…我认为就是这样了`（"认为"留着）。这部分没修好，原因见下。
+**But long sentences still leak**: `…之后才有` (the "才有" left in), `…交易筹码` (the "筹码" left in), `…我认为就是这样了` (the "认为" left in). This part is not fixed; the reason is below.
 
-#### 加了残留检测 + 单次重试，但对长句基本无效
+#### Added residue detection + a single retry, but essentially ineffective on long sentences
 
-`lang_clean()` 两条判据：
-- **日译中查假名**——零误报，可靠。
-- **中译日查简体专用字形**（`给/这/说/对/时/个`…，日语用繁体或不同字形）+ **整句无假名且 ≥6 字**（一句话长度的日语不可能没有助词假名）。
+`lang_clean()` has two criteria:
+- **Japanese→Chinese checks for kana** — zero false positives, reliable.
+- **Chinese→Japanese checks for simplified-only glyphs** (`给/这/说/对/时/个`…, Japanese uses traditional or different glyphs) + **no kana in the whole sentence and ≥6 characters** (a sentence-length Japanese sentence cannot lack particle kana).
 
-检出脏就带强化指令重试一次，仍脏保留首版（半句混语言也比空白强，且不能无限重试拖住翻译线程）。计数在 `/api/status` 的 `tr.retry / tr.fixed`。
+If dirt is detected it retries once with a reinforced instruction; if still dirty it keeps the first version (a half-sentence of mixed language is better than a blank, and it cannot retry endlessly and hold up the translation thread). The counters are `tr.retry / tr.fixed` in `/api/status`.
 
-**盲区（实测 14 条真实用例，脏译文一条都没检出）**：「才有」「筹码」「认为」全是**中日同形词**——日语也能这么写，字符层面查不出来。想查准只能做「译文是否包含原文 2 字以上片段 + 同形词白名单」，白名单极脆弱，误伤代价是每句多跑一次翻译。
+**Blind spot (measured on 14 real cases: not a single dirty translation was detected)**: 「才有」「筹码」「认为」 are all **words with identical forms in Chinese and Japanese** — Japanese can be written the same way, so nothing can be found at the character level. To detect it reliably you would have to do "does the translation contain a fragment of ≥2 characters from the source + a whitelist of same-form words", and the whitelist is extremely fragile; the cost of a false positive is an extra translation run per sentence.
 
-**结论：这是 7B 的能力上限，不是 prompt 没写好。** 连"整句照抄"这种最明显的错误，改 prompt 后也只是从 50% 降到 20% 左右。真要解决得换模型：这台机上有 `qwen3627b`（19G）、`Qwen3.8-27B`（16G）、`qwen35a3b`（35B-A3B MoE，23G）。**MoE 那个最优**——激活参数只有 3B，速度接近 7B，质量接近 35B。但当前 vLLM 已占 34G/61G，起新实例只剩 26G 余量，需要停机窗口切换，且会同时影响语音助手（8095 也用同一个 `qwen`）。
+**Conclusion: this is the capability ceiling of 7B, not a badly written prompt.** Even for the most obvious error, whole-sentence copying, changing the prompt only brings it from about 50% down to about 20%. Really solving it needs a different model: on this machine there are `qwen3627b` (19G), `Qwen3.8-27B` (16G), `qwen35a3b` (35B-A3B MoE, 23G). **The MoE one is the best** — only 3B active parameters, speed close to 7B, quality close to 35B. But vLLM currently occupies 34G/61G, leaving only 26G of headroom to start a new instance, which needs a maintenance window to switch, and would affect the voice assistant at the same time (8095 also uses the same `qwen`).
 
-### 4.18 换 35B-A3B 的 A/B：质量赢了，延迟输了（2026-11-21）
+### 4.18 A/B on switching to 35B-A3B: quality won, latency lost (2026-11-21)
 
-上一节把「7B 守不住纯目标语言」归到能力上限，于是停机实测换模型。**三臂同一天跑完**，同一组 14 句（含 10 条实测坏例）+ 62 秒真实音频。
+The previous section attributed "7B cannot hold pure target language" to a capability ceiling, so we took downtime and actually measured switching models. **All three arms were run on the same day**, with the same set of 14 sentences (including 10 measured bad cases) + 62 seconds of real audio.
 
-| 臂 | 运行时 | 模型 | 首字中位 | 全文中位 | 已知残留 |
+| Arm | Runtime | Model | Median first token | Median full text | Known residue |
 |---|---|---|---|---|---|
-| **A** | vLLM | Qwen2.5-7B-AWQ | **88ms** | **571ms** | 7 处（`才有`/`筹码`/`SUCH`/`pesticid`/`认为`/整句英文） |
-| **B** | SGLang 0.6.0 | Qwen3.5-35B-A3B GPTQ-Int4 | 419ms | 933ms | **0 处** |
-| **C** | vLLM | Qwen3.5-35B-A3B w4a16 | 400ms | 2300ms | 未测（同模型） |
+| **A** | vLLM | Qwen2.5-7B-AWQ | **88ms** | **571ms** | 7 places (`才有`/`筹码`/`SUCH`/`pesticid`/`认为`/whole-sentence English) |
+| **B** | SGLang 0.6.0 | Qwen3.5-35B-A3B GPTQ-Int4 | 419ms | 933ms | **0 places** |
+| **C** | vLLM | Qwen3.5-35B-A3B w4a16 | 400ms | 2300ms | not measured (same model) |
 
-**B 的质量是真的翻身**，7 处已知失败一次全部消失：
+**B's quality really turned around**; all 7 known failures disappeared at once:
 
-| 原文 | A（7B） | B（35B-A3B） |
+| Source | A (7B) | B (35B-A3B) |
 |---|---|---|
 | 这就投扯太远的了… | ここでは **SUCH** 問題を提起する可能性は低い | そもそもこのような場で提案されることはあり得ません |
 | 了不起在中美会晤…我认为就是这样了 | **了 pesticid**在中国と米国の会見で…と**认为** | せいぜい米中首脳会談で中国側が改めて触れる程度でしょう |
 | 因为他的很容易跟韩国做对比是 | **Because it is easy for him to compare with South Korea.** | それは韓国との対比が容易だからです |
 | Love冷落日本 | 日本の愛は冷たくなった | アメリカが日本を冷遇している |
 
-#### 为什么 35B 的首字压不下去：前缀缓存吃不到
+#### Why the 35B's first token cannot be pushed down: the prefix cache is unreachable
 
-这是本次最有价值的发现，比延迟数字本身重要。
+This is the most valuable finding of this round, more important than the latency numbers themselves.
 
-字幕每句都用**同一份 390 字 system prompt**，7B 靠前缀缓存把它变成免费（533ms → 94ms）。35B 拿不到：
+Every caption sentence uses the **same 390-character system prompt**, and 7B turns it into something free through the prefix cache (533ms → 94ms). 35B cannot get it:
 
-- **vLLM**：日志自己说了
+- **vLLM**: the log says it itself
   `Mamba cache mode is set to 'align' when prefix caching is enabled`
   `Prefix caching in Mamba cache 'align' mode ... support for Mamba layers is experimental`
   `Setting attention block size to 1056 tokens to ensure attention page size >= mamba page size`
-  → 缓存复用粒度被 mamba page 顶到 **1056 token**，我们的 prompt 才 ~300 token，**永远命中不了**。实测 `Prefix cache hit rate: 0.0%`，每句都要重新 prefill 300 token，首字被顶到 400ms。
-- **SGLang**：会缓存（1022ms → 375ms），但 375ms 是它的下限，仍然拿不回来。
+  → the cache-reuse granularity is pushed up to **1056 tokens** by the mamba page, while our prompt is only ~300 tokens, so it **can never hit**. Measured `Prefix cache hit rate: 0.0%`, every sentence has to re-prefill 300 tokens, and the first token is pushed to 400ms.
+- **SGLang**: it does cache (1022ms → 375ms), but 375ms is its floor and it still cannot get it back.
 
-**所以延迟不是「35B 算得慢」，是「每句重付一遍 prompt 的账」。** 推论：如果非用 35B，最有效的一招不是调 kernel，而是**把 `_tr_system` 从 390 字砍到 100 字左右**——35B 不需要 7B 那套 few-shot 示例。这一招还没试。
+**So the latency is not "35B computes slowly", it is "paying the prompt bill again for every sentence".** Corollary: if you must use 35B, the most effective move is not tuning kernels but **cutting `_tr_system` from 390 characters to around 100** — 35B does not need 7B's few-shot examples. This move has not been tried yet.
 
-#### 三个坑（都在这次踩到）
+#### Three pitfalls (all stepped on this time)
 
-1. **chat template 默认开思考**（`enable_thinking` 未定义就走 thinking 分支）。`max_tokens=200` 全烧在思考上，`content` 一直是空串——线上表现是「每行间隔 9~10 秒、一个字译文都没有」。修法：请求体带 `chat_template_kwargs: {"enable_thinking": false}`，`caption_server` 已加 `--llm-think` 开关（默认关）。Qwen2.5 模板不认这个变量，传了无害。
-2. **文件里的 vLLM 命令原样不能跑**：`--gpu-memory-utilization 0.9` + `--max-model-len 262144` 在 61G 统一内存上会把 OCR/ASR 挤死；`--disable-log-requests` 在当前镜像里已移除（会直接 `unrecognized arguments` 退出）。
-3. **首次请求 50 秒**：MoE kernel 自动调优。日志有 `Using default MoE kernel config. Performance might be sub-optimal!`——缺 `E=256,N=256,device_name=Orin,dtype=int4_w4a16.json`（文件里 qwen36b 那版命令会从 `/root/.cache` 拷进镜像）。冒烟脚本的超时要按 60 秒设，否则第一发必假失败。
+1. **The chat template enables thinking by default** (with `enable_thinking` undefined it takes the thinking branch). `max_tokens=200` all burns on thinking and `content` stays an empty string — the online symptom is "9~10 seconds between lines and not one character of translation". Fix: put `chat_template_kwargs: {"enable_thinking": false}` in the request body; `caption_server` now has a `--llm-think` switch (off by default). The Qwen2.5 template does not recognise this variable, and passing it does no harm.
+2. **The vLLM command in the file cannot be run as-is**: `--gpu-memory-utilization 0.9` + `--max-model-len 262144` on 61G of unified memory squeezes OCR/ASR to death; `--disable-log-requests` has been removed in the current image (it exits directly with `unrecognized arguments`).
+3. **First request takes 50 seconds**: MoE kernel auto-tuning. The log has `Using default MoE kernel config. Performance might be sub-optimal!` — it is missing `E=256,N=256,device_name=Orin,dtype=int4_w4a16.json` (the qwen36b version of the command in the file copies it from `/root/.cache` into the image). The smoke-test script's timeout must be set to 60 seconds, otherwise the first shot always fails falsely.
 
-**这一节的结论后来被 4.19 推翻了：** 换运行时（Magnitude）就能拿到 token 粒度的前缀缓存，35B 不用改 prompt 也能上。下面保留当时的判断和证据，因为「vLLM 上 35B 为什么慢」的根因分析仍然成立。
+**The conclusion of this section was later overturned by 4.19:** changing the runtime (Magnitude) gives token-granularity prefix caching, and 35B can come up without changing the prompt. The judgement and evidence of the time are kept below, because the root-cause analysis of "why 35B is slow on vLLM" still holds.
 
-### 4.19 用 Magnitude 加载 35B-A3B：同一台机器上换运行时就把账算平了（2026-11-21）
+### 4.19 Loading 35B-A3B with Magnitude: changing the runtime on the same machine squares the books (2026-11-21)
 
-4.18 的结论是「35B 质量赢、延迟输」，输在**前缀缓存拿不到**。那就不该调 kernel，该换运行时——换成 **Magnitude**（YC S25，Rust 写的本地推理引擎，自带 kernel 自动调优，GGUF 路线，OpenAI 兼容）。
+The conclusion of 4.18 was "35B wins on quality, loses on latency", and it lost on **not being able to get the prefix cache**. So the thing to do is not tune kernels but change the runtime — to **Magnitude** (YC S25, a local inference engine written in Rust, with kernel auto-tuning built in, GGUF route, OpenAI compatible).
 
-**一条命令就坐实了差别**：同一份 390 字 system prompt 连发，Magnitude 每个 chunk 都带 `timings`，直接报
+**One command settles the difference**: sending the same 390-character system prompt repeatedly, Magnitude carries `timings` in every chunk and reports directly
 
 ```
 第1发 prompt_n=296 cache_n=0   prompt=1130ms
 第2发 prompt_n=1   cache_n=295 prompt=25ms   ← 前缀按 token 粒度复用
 ```
 
-`cache_n` 比「看首字」可靠得多：它明确告诉你**有多少 token 是从 KV 前缀缓存复用的**。vLLM 那边这个数是 0（1056 token 的复用粒度），Magnitude 是 295/296。
+`cache_n` is far more reliable than "look at the first token": it tells you explicitly **how many tokens were reused from the KV prefix cache**. On the vLLM side that number is 0 (a 1056-token reuse granularity); on Magnitude it is 295/296.
 
-#### 五臂实测（同一组 14 句、同一份 `_tr_system`、同一请求形状）
+#### Five-arm measurement (same set of 14 sentences, same `_tr_system`, same request shape)
 
-| 臂 | 运行时 | 模型 | 首字中位 | 全文中位 | 已知残留 |
+| Arm | Runtime | Model | Median first token | Median full text | Known residue |
 |---|---|---|---|---|---|
-| A（旧现役） | vLLM | Qwen2.5-7B-AWQ | 88ms | 571ms | 7 处 |
+| A (old production) | vLLM | Qwen2.5-7B-AWQ | 88ms | 571ms | 7 places |
 | B | SGLang 0.6.0 | 35B-A3B GPTQ | 419ms | 933ms | 0 |
-| C | vLLM | 35B-A3B w4a16 | 400ms | 2300ms | 未测 |
+| C | vLLM | 35B-A3B w4a16 | 400ms | 2300ms | not measured |
 | E9B | Magnitude | Qwen3.5-9B Q4 | 157ms | 929ms | 0 |
-| **D（现役）** | **Magnitude** | **Qwen3.5-35B-A3B UD-Q4_K_XL** | **89ms** | **487ms** | **0** |
+| **D (current production)** | **Magnitude** | **Qwen3.5-35B-A3B UD-Q4_K_XL** | **89ms** | **487ms** | **0** |
 
-D 臂在**短句**上比 A 还快，质量等于 B。62 秒真实音频 17 行，A 的 7 处残留（`才有`/`筹码`/`SUCH`/`pesticid`/`认为`/整句英文/`日本の愛は冷たくなった`）全部消失，只剩一处把 ASR 错字 `Love`（"美国"被听错）当成了专有名词保留。
+Arm D is even faster than A on **short sentences**, and its quality equals B. On 62 seconds of real audio, 17 lines, all 7 of A's residues (`才有`/`筹码`/`SUCH`/`pesticid`/`认为`/whole-sentence English/`日本の愛は冷たくなった`) disappeared, leaving only one place where the ASR misrecognition `Love` (a mishearing of "美国") was kept as a proper noun.
 
-#### 但线上首字是 ~490ms，不是 89ms——这条规律必须记住
+#### But the online first token is ~490ms, not 89ms — this rule must be remembered
 
-上了线才发现：`ttft` 中位 490ms。用 `CAP_DEBUG=1` 打出服务端自报的 `timings` 才看清：
+Only after going live did we find out: median `ttft` 490ms. Printing the server-reported `timings` with `CAP_DEBUG=1` made it clear:
 
 ```
 [tr] hdr=531ms ttft=531ms | srv prompt_n=49 cache_n=290 prompt_ms=491
 ```
 
-缓存命中（`cache_n=290`）没问题，慢在**新 token 的 prefill**。量出来的关系是：
+The cache hit (`cache_n=290`) is fine; what is slow is the **prefill of the new tokens**. The measured relationship is:
 
 ```
-TTFT ≈ 25ms + 6~8ms × 新 token 数
+TTFT ≈ 25ms + 6~8ms × number of new tokens
 ```
 
-- 短句（8~20 token）→ 90~150ms，所以 A/B 那种 14 句测试很漂亮
-- **线上真实段是 5~6 秒日语句子（60~80 token）→ 450~700ms**
-- 再叠上 `【上文】` 的几十 token（每句都变、不进缓存）→ 这就是 490ms 的来源
+- Short sentence (8~20 tokens) → 90~150ms, which is why the 14-sentence test in A/B looked so good
+- **Real online segments are 5~6 second Japanese sentences (60~80 tokens) → 450~700ms**
+- Plus the few dozen tokens of 【上文】 (which change every sentence and do not enter the cache) → that is where the 490ms comes from
 
-根因是 MoE 的 prefill 对**小批量**极不友好：60 个 token 会把 40 层里几乎所有专家权重都读一遍（22.9G），而解码时只读激活的那 3B。所以 **MoE 是「解码便宜、prefill 贵」，dense 是反过来的**。这也解释了 vLLM 上 35B 首字同样是 400ms——不是 vLLM 的错，是这类模型的物理特性。
+The root cause is that MoE prefill is extremely unfriendly to **small batches**: 60 tokens make it read almost all the expert weights across 40 layers (22.9G), whereas at decode time it reads only the 3B that are active. So **MoE is "cheap to decode, expensive to prefill", and dense is the opposite**. This also explains why the 35B's first token on vLLM is also 400ms — it is not vLLM's fault, it is the physical characteristic of this class of model.
 
-**净效果：全文译完的耗时和 7B 持平（1071ms vs 1085ms），只有首字后移了约 300ms。** 字幕滞后 0.5 秒完全可接受，所以这次换了。
+**Net effect: the time to translate the whole thing is on par with 7B (1071ms vs 1085ms), with only the first token moving later by about 300ms.** A caption lag of 0.5 seconds is perfectly acceptable, so we switched.
 
-#### 三个新坑
+#### Three new pitfalls
 
-1. **思考关不掉会把译文吞掉**（和 4.18 第 1 条同一个病）。Qwen3.5 认 `chat_template_kwargs: {"enable_thinking": false}`（关掉后 reasoning 从 640 字归 0、`content` 18 字正常）；但 **LFM2.5 不认这个变量**，照样先吐 600 多字 reasoning、`content` 恒空——第一次拿 LFM 试的时候差点误判成「Magnitude 不支持关思考」。`reasoning_effort: "none"` 对 LFM 直接 400，对 Qwen 能过。
-2. **`--ctx-lines 0` 会变成「带全部上文」**：`prev[-self.ctx_lines:]` 在 0 时等于 `[0:]`，把整段历史塞进 prompt（`prompt_n` 从 80 涨到 138、首字多花 300ms）。已在 `_ctx_before()` 里显式挡住并加了单测。
-3. **Magnitude 自己的下载器比直连慢 3~5 倍**：`catalog pull` 约 10MB/s，同样文件 `curl` 直连 HF 能到 15MB/s，23GB 走了 41 分钟。它把权重写成 `blobs/lfs-sha256-<hash>` 格式，**不要手搓 HF 缓存目录去塞**，会认不出来。
+1. **If thinking cannot be turned off the translation gets swallowed** (the same disease as item 1 in 4.18). Qwen3.5 recognises `chat_template_kwargs: {"enable_thinking": false}` (once off, reasoning goes from 640 characters to 0 and `content` is a normal 18 characters); but **LFM2.5 does not recognise this variable** and still emits 600-plus characters of reasoning first with `content` permanently empty — the first time we tried LFM we almost concluded wrongly that "Magnitude does not support turning thinking off". `reasoning_effort: "none"` gives LFM a straight 400, while Qwen accepts it.
+2. **`--ctx-lines 0` becomes "carry all context"**: `prev[-self.ctx_lines:]` equals `[0:]` when it is 0, stuffing the whole history into the prompt (`prompt_n` rose from 80 to 138, first token costing 300ms more). Now explicitly blocked in `_ctx_before()` with a unit test added.
+3. **Magnitude's own downloader is 3~5× slower than a direct connection**: `catalog pull` is about 10MB/s, while `curl` straight to HF reaches 15MB/s for the same file, so 23GB took 41 minutes. It writes weights in `blobs/lfs-sha256-<hash>` format — **do not hand-build an HF cache directory to stuff them in**, it will not recognise them.
 
-#### 部署形态：现在只跑 35B（vLLM 已停）
+#### Deployment shape: only 35B runs now (vLLM is stopped)
 
-35B（27.9G）+ 系统 ≈ 33G/61G，余 28G。**vLLM 7B 已在 2026-11-21 11:53 停掉**（`docker stop vllm-qwen`；它的 restart policy 是 `no`，不会自己回来，也没有对应 systemd unit）。容器没删，回滚只要 `docker start vllm-qwen`。共存时期的配置留档：vLLM 压 `--gpu-memory-utilization 0.25`（约 15G）+ 35B + 系统 ≈ 48G/61G；7B 的 KV 池原 19.94G/373k token，我们只用几千，压下来没有损失。
+35B (27.9G) + system ≈ 33G/61G, leaving 28G. **vLLM 7B was stopped on 2026-11-21 at 11:53** (`docker stop vllm-qwen`; its restart policy is `no`, so it will not come back by itself, and there is no corresponding systemd unit). The container was not deleted; rolling back only needs `docker start vllm-qwen`. Configuration from the coexistence period, for the record: vLLM squeezed to `--gpu-memory-utilization 0.25` (about 15G) + 35B + system ≈ 48G/61G; the 7B's KV pool was originally 19.94G/373k tokens and we only used a few thousand, so squeezing it down cost nothing.
 
 ```
-magnitude-dockerd.service   独立 dockerd（独立 data-root，不碰主 daemon 的三个生产容器）
-magnitude.service           起容器 → 等 /health → 显式 load 35B → 等 Ready（冷启动 ~150s）
+magnitude-dockerd.service   separate dockerd (separate data-root, does not touch the main daemon's three production containers)
+magnitude.service           start the container → wait for /health → explicitly load 35B → wait for Ready (cold start ~150s)
 caption-bench.service       --llm-base http://127.0.0.1:10100/inference/v1 --llm-model <id> --llm-key <key>
 ```
 
-两个 unit 已 enable，并且 **2026-11-21 11:54 已经真正交给 systemd 管了**：停掉手工 dockerd → `systemctl start magnitude-dockerd` → `systemctl start magnitude`，冷启 **77 秒**到 Ready，两个业务服务接回后字幕首字 p50 474ms、`NRestarts` 不再增长。`/opt/meeting-copilot` 在 `/etc/fstab` 里，`local-fs.target` 先于 dockerd，开机顺序没问题。
+Both units are enabled, and **on 2026-11-21 11:54 they were genuinely handed over to systemd**: stop the manual dockerd → `systemctl start magnitude-dockerd` → `systemctl start magnitude`, cold start **77 seconds** to Ready; after the two business services reconnected, the caption first token was p50 474ms and `NRestarts` stopped growing. `/opt/meeting-copilot` is in `/etc/fstab`, and `local-fs.target` comes before dockerd, so the boot order is fine.
 
-迁移步骤（照抄可用）：
+Migration steps (copy and use):
 
 ```bash
-# 1 业务静默
+# 1 quiet the business services
 sudo systemctl stop caption-bench voice-bench
-# 2 停容器（data-root 不动，容器状态保留）
+# 2 stop the container (the data-root is untouched, container state is preserved)
 DOCKER_HOST=unix:///opt/meeting-copilot/data/magnitude-data/docker.sock \
   docker stop -t 20 magnitude-bench
-# 3 停手工 dockerd
+# 3 stop the manual dockerd
 sudo pkill -TERM -f 'magnitude-data/daemo[n].json'
-# 4 交给 systemd（dockerd 起来后再 load 模型）
+# 4 hand over to systemd (load the model after dockerd is up)
 sudo systemctl start magnitude-dockerd && sudo systemctl start magnitude
-# 5 接回业务
+# 5 reconnect the business services
 sudo systemctl start caption-bench voice-bench
 ```
 
-> ⚠️ **踩过的坑 1：`pkill -f` 会杀掉自己**。写 `pkill -f 'dockerd --config-file .../daemon.json'` 时，
-> 这条 ssh 远程 shell 的命令行里也含同样的字符串，`pkill` 把 shell 一起干掉，表现为 `Exit 255` 突然断连。
-> 用 `daemo[n].json` 这种字符类写法，让正则匹配不到自己的命令行。
+> ⚠️ **Pitfall 1 stepped on: `pkill -f` kills itself**. When you write `pkill -f 'dockerd --config-file .../daemon.json'`,
+> the command line of this ssh remote shell also contains the same string, so `pkill` kills the shell as well, which
+> shows up as `Exit 255` and a sudden disconnect.
+> Use a character-class form like `daemo[n].json` so the regex cannot match its own command line.
 >
-> ⚠️ **踩过的坑 2：手工起的 dockerd 会让 unit 无限失败重启**（上午累计重试 **4631 次**，日志刷满、白烧 CPU）。
-> 根因是 `dockerd.pid` 已存在、systemd 每次都被 `process with PID xxx is still running` 挡回，`Restart=on-failure` 每 5 秒再来一次。
-> `NRestarts` 是累计计数，迁移后不会归零，**判断是否还在循环只能看它涨不涨 + `ActiveEnterTimestamp` 变不变**。
+> ⚠️ **Pitfall 2 stepped on: a manually started dockerd makes the unit fail and restart endlessly** (4631 cumulative retries
+> that morning, the log flooded and CPU burned for nothing).
+> The root cause is that `dockerd.pid` already exists and systemd is turned back every time by `process with PID xxx is still running`,
+> with `Restart=on-failure` coming back every 5 seconds.
+> `NRestarts` is a cumulative counter and does not reset after the migration, so **the only way to tell whether it is still
+> looping is whether it keeps growing + whether `ActiveEnterTimestamp` changes**.
 
-**回滚到 7B**：`docker start vllm-qwen` → 等 `/v1/models`（约 66s，首次可能 250s）→ 把 `caption-bench` / `voice-bench` 里的 `--llm-*` 换回 `--llm-model qwen`（base 默认 8000），重启这两个服务。
+**Rolling back to 7B**: `docker start vllm-qwen` → wait for `/v1/models` (about 66s, possibly 250s the first time) → change `--llm-*` in `caption-bench` / `voice-bench` back to `--llm-model qwen` (base defaults to 8000), and restart those two services.
 
-### 4.20 砍短 system prompt 想把首字塞进 200ms：短版反而更慢（2026-11-21）
+### 4.20 Cutting the system prompt short to squeeze the first token under 200ms: the short version is slower (2026-11-21)
 
-4.19 把线上首字 490ms 归到「新 token 的 prefill」上。最顺手的猜想是：`_tr_system` 有 390 字（≈290 token），是每句请求里最大的一块固定文本，砍到 ~95 字（≈70 token）应该能省一大截。
+4.19 attributed the online first token of 490ms to "prefill of the new tokens". The most obvious guess was: `_tr_system` is 390 characters (≈290 tokens), the largest block of fixed text in every request, so cutting it to ~95 characters (≈70 tokens) should save a lot.
 
-`--tr-prompt short` 就是这么加上的（`_tr_system_short()`，只留纯目标语言 / 纠同音错字 / 半句译半句三条硬规则，示例和语气词规则全砍）。停机跑四格，结论是**反的**：
+That is how `--tr-prompt short` was added (`_tr_system_short()`, keeping only three hard rules — pure target language / correct homophone misrecognitions / half a sentence translates as half a sentence — with all examples and filler-word rules cut). Took downtime and ran four cells; the conclusion is the **opposite**:
 
-| 格 | prompt_n（本轮真处理） | cache_n（复用） | 首字 p50 | 首字 p90 | 全文 p50 | <200ms |
+| Cell | prompt_n (actually processed this round) | cache_n (reused) | First token p50 | First token p90 | Full text p50 | <200ms |
 |---|---|---|---|---|---|---|
 | full/ctx2 | 61 | 290 | 300ms | 345ms | 648ms | 0/24 |
 | short/ctx2 | 124 | **0** | 367ms | 416ms | 749ms | 0/24 |
 | full/ctx0 | 26 | 290 | 244ms | 264ms | 553ms | 0/24 |
 | short/ctx0 | 89 | **0** | 340ms | 615ms | 687ms | 0/24 |
 
-（12 条真实日文段 × 每格 2 轮，安静机器，`tools/ttft_prompt_ab.py`）
+(12 real Japanese segments × 2 rounds per cell, quiet machine, `tools/ttft_prompt_ab.py`)
 
-**短版的 `cache_n` 恒为 0。** 290 token 的前缀每句都命中，70 token 的前缀一次都不命中；于是短版虽然 system 少了 220 token，却把整个 prompt（含上文）重新 prefill 一遍，比长版多花 60~70ms。
+**The short version's `cache_n` is always 0.** The 290-token prefix hits every sentence, and the 70-token prefix never hits even once; so although the short version has 220 fewer tokens of system text, it re-prefills the whole prompt (including context), costing 60~70ms more than the long version.
 
-不是「前缀太短就不能缓存」。同一个 prompt 连发时两档都命中得很干净：
+It is not that "too short a prefix cannot be cached". When the same prompt is sent repeatedly both settings hit cleanly:
 
 ```
 full   第1发 1223ms cache=0/298 → 第2发 72ms cache=297/1
 short  第1发  457ms cache=0/92  → 第2发 67ms cache=91/1
 ```
 
-差别只在**用户内容每句都变**的情况（线上真实形态）：长前缀稳定复用 290 token，短前缀直接归零。机制没查到（Magnitude 不开放），但表现很稳定，24 次请求里 24 次为 0。**能用长就用长——它不要钱。**
+The difference appears only when **the user content changes every sentence** (the real online shape): the long prefix reuses 290 tokens stably, the short prefix drops to zero outright. We did not find the mechanism (Magnitude is closed), but the behaviour is very stable: 24 out of 24 requests were 0. **If you can use the long one, use the long one — it costs nothing.**
 
-#### 首字进不了 200ms，这是硬地板
+#### The first token cannot get under 200ms; this is a hard floor
 
-把 `prompt_n` 和首字摆在一起看，模型是
+Putting `prompt_n` and the first token side by side, the model is
 
 ```
-TTFT ≈ 65ms + 3.5~6.5ms × 新 token
+TTFT ≈ 65ms + 3.5~6.5ms × new tokens
 ```
 
-- 新 token = 1（原样重发）→ 72ms
-- 新 token = 26（砍掉上文，只剩本句）→ 244ms
-- 新 token = 61（现网形态：本句 + 两句上文）→ 300ms
+- new tokens = 1 (resend as-is) → 72ms
+- new tokens = 26 (drop the context, keep only this sentence) → 244ms
+- new tokens = 61 (the current online shape: this sentence + two sentences of context) → 300ms
 
-**要进 200ms，新 token 得压到 20~30 个以内**，也就是一句 15 个字上下、还不带上文。真实会议一段 5~6 秒、60~80 字，物理上到不了。所以「首字 200ms」这个目标应该放弃，转去看别的：
+**To get under 200ms the new tokens have to be squeezed to within 20~30**, i.e. a sentence of about 15 characters and no context. A real meeting segment is 5~6 seconds and 60~80 characters, so physically it cannot be reached. So the target of "first token 200ms" should be abandoned and attention turned elsewhere:
 
-- 唯一还降得动的是上文：`ctx0` 省 56ms（300→244），代价是质量塌（`だ。` → `的。`，独立半句丢了主语就译成垃圾）——不值得
-- ~~线上 490ms 与离线 300ms 的 190ms 是调度问题~~ → **4.21 证明不是**：那 190ms 只是「线上句子更长、上文更长」，折算成 token 后线上与离线完全对得上（65ms + 4.5~6.7ms/token）
+- The only thing still reducible is the context: `ctx0` saves 56ms (300→244), at the cost of quality collapsing (`だ。` → `的。`; a standalone half sentence loses its subject and translates into garbage) — not worth it
+- ~~The 190ms between the online 490ms and the offline 300ms is a scheduling problem~~ → **4.21 proves it is not**: that 190ms is just "online sentences are longer and the context is longer", and after converting to tokens online and offline match exactly (65ms + 4.5~6.7ms/token)
 
-**落地**：`--tr-prompt` 默认仍是 `full`，短版留在代码里给 dense 模型备用——dense 的 prefill 按 token 线性计费，「砍 prompt」这条路对 9B/7B 才是成立的，MoE 上不成立。
+**Landed as**: `--tr-prompt` still defaults to `full`; the short version stays in the code for dense models — dense prefill is billed linearly per token, so the "cut the prompt" path only holds for 9B/7B, not for MoE.
 
-### 4.21 ctx-lines 砍到 1（-90ms）、workers 砍到 1（无差别）、9B 长句上输给 35B（2026-11-21 上午）
+### 4.21 ctx-lines cut to 1 (-90ms), workers cut to 1 (no difference), 9B loses to 35B on long sentences (2026-11-21 morning)
 
-**先把字段语义钉死**（写反过一次，害后面所有推导都错）：Magnitude 的 `prompt_n` 是**本轮真处理的 token 数**，`cache_n` 是**从 KV 前缀复用掉的**，两者相加才是整个 prompt 的长度。所以「新 token = prompt_n − cache_n」是错的，**新 token 就是 `prompt_n`**。
+**First pin down the field semantics** (I got this backwards once and it made every later derivation wrong): Magnitude's `prompt_n` is **the number of tokens actually processed this round**, `cache_n` is **what was reused from the KV prefix**, and only their sum is the length of the whole prompt. So "new tokens = prompt_n − cache_n" is wrong — **new tokens are simply `prompt_n`**.
 
-#### 1. `--ctx-lines 2 → 1`：实测省 ~90ms，不是 200ms
+#### 1. `--ctx-lines 2 → 1`: measured ~90ms saved, not 200ms
 
-线上打开 `Environment=CAP_DEBUG=1` 直接读引擎自报的 `prompt_ms`，同一段新闻流、前后各采一轮（48 vs 52 条）：
+Turning on `Environment=CAP_DEBUG=1` online and reading the engine-reported `prompt_ms` directly, on the same news stream with one round captured before and one after (48 vs 52 items):
 
-| 配置 | 新 token p50 | 引擎 prompt_ms p50 | 首字 p50 | 首字 p90 |
+| Configuration | New tokens p50 | Engine prompt_ms p50 | First token p50 | First token p90 |
 |---|---|---|---|---|
 | `--ctx-lines 1` | 53 | 403ms | **435ms** | 811ms |
 | `--ctx-lines 2` | 73 | 485ms | **524ms** | 761ms |
 
-少 20 个 token、省 89ms ⇒ **斜率约 4.5ms/token**。按 6.7ms/token 估出来的「砍一句上文省 200ms」偏乐观：要真省 200ms，上一句得有 45 字以上。短句新闻（上一句 20 字上下）就是 90ms 的量级。
+20 fewer tokens, 89ms saved ⇒ **slope about 4.5ms/token**. The "cut one sentence of context saves 200ms" estimated at 6.7ms/token is optimistic: to really save 200ms the previous sentence would have to be more than 45 characters. For short news sentences (the previous sentence around 20 characters) it is on the order of 90ms.
 
-#### 2. `--tr-workers 1 vs 2`：没有差别
+#### 2. `--tr-workers 1 vs 2`: no difference
 
-ctx1 下 workers=1 → 435ms，workers=2 → 475ms，但两轮的 `prompt_n` 也不同（53 vs 61，新闻内容换了）。按 4.5ms/token 归一化之后**两者相等**。GGUF 引擎不靠 worker 数压首字；全程 `q_tr=0`、`lag≈300ms`，1 个翻译线程就够。定稿用 1（少一个排队环节）。
+Under ctx1, workers=1 → 435ms, workers=2 → 475ms, but the `prompt_n` of the two rounds also differ (53 vs 61, the news content changed). After normalising at 4.5ms/token **the two are equal**. A GGUF engine does not use worker count to push down the first token; `q_tr=0` and `lag≈300ms` throughout, one translation thread is enough. Settled on 1 (one queueing stage less).
 
-#### 3. 9B vs 35B 在 62 秒真实音频上正面对比（`tools/wav_seg_ab.py`）
+#### 3. 9B vs 35B head to head on 62 seconds of real audio (`tools/wav_seg_ab.py`)
 
-16 段真实切段、同一份 ASR 文本、同一份上文、ctx-lines 1：
+16 real segments, the same ASR text, the same context, ctx-lines 1:
 
-| 臂 | 首字 p50 | 首字 p90 | 全文 p50 | 硬伤 |
+| Arm | First token p50 | First token p90 | Full text p50 | Hard defect |
 |---|---|---|---|---|
-| **35B（现役）** | **293ms** | 407ms | **693ms** | — |
-| 9B | 326ms | 378ms | 1085ms | 第 6 句直接复读第 5 句的译文 |
+| **35B (current production)** | **293ms** | 407ms | **693ms** | — |
+| 9B | 326ms | 378ms | 1085ms | sentence 6 directly repeats sentence 5's translation |
 
-9B **两个指标都输**，全文慢 56%，还出现复读幻觉。之前 9B 那个漂亮的 157ms 是短句（8~20 token）给的；长句上「dense 的 prefill 更便宜」并没有兑现（它解码也更慢）。**35B 留住，9B 这条线可以关上。**
+9B **loses on both metrics**, 56% slower on the full text, and it also produced a repetition hallucination. The earlier flattering 157ms for 9B came from short sentences (8~20 tokens); on long sentences "dense prefill is cheaper" did not cash in (and it decodes more slowly too). **Keep 35B; the 9B line can be closed.**
 
-> 这里 35B 首字 293ms 是 caption-bench 停机时测的；线上同参数 435ms。差的 140ms 是采集 / ASR / 草稿线程抢 CPU，不是引擎——所以「离线好看、线上难看」要看是谁在抢，而不是怀疑模型。
+> The 35B first token of 293ms here was measured while caption-bench was stopped; online with the same parameters it is 435ms. The 140ms difference is capture / ASR / draft threads competing for CPU, not the engine — so when "it looks good offline and bad online", look at who is competing rather than doubting the model.
 
-**质量没掉**：ctx2 与 ctx1 同 16 句逐句对照，5 句完全相同，11 处差异全是同义替换（`凝縮`→`必要となる`、`対比`→`比較`），没有语义漂移、没有掉语言。`Love冷落日本` 那句两档都填错主体（ASR 把「美国」听成 `Love`），与 ctx 无关。
+**Quality did not drop**: comparing ctx2 and ctx1 sentence by sentence over the same 16 sentences, 5 are identical and all 11 differences are synonymous substitutions (`凝縮`→`必要となる`, `対比`→`比較`), with no semantic drift and no language dropping. The `Love冷落日本` sentence got the subject wrong in both settings (ASR heard "美国" as `Love`), unrelated to ctx.
 
-**落地**：`caption-bench` 定稿 `--tr-workers 1 --ctx-lines 1`；`CAP_DEBUG` 采完就关（日志一行一条，开着跑一天几十 MB）。
+**Landed as**: `caption-bench` settled on `--tr-workers 1 --ctx-lines 1`; `CAP_DEBUG` is turned off after sampling (one line per entry, tens of MB a day if left on).
 
-### 4.22 语音助手也切到 35B-A3B（2026-11-21 中午）
+### 4.22 The voice assistant also switches to 35B-A3B (2026-11-21 midday)
 
-**换之前为什么是 7B**：不是选出来的，是历史顺序。`voice-bench` 最初只服务语音对话，那时机器上只有 vLLM 的 Qwen2.5-7B-AWQ（8000 端口）；后来字幕也是先接到 8000、才在 4.19 换成 Magnitude 的 35B。语音助手就一直留在 7B 上没人动。真正拦住换的是两条**当时没验证的担心**：MoE 的 prefill 贵（怕首字变慢）、GGUF 引擎只有单槽（怕两个服务互相排队）。
+**Why it was 7B before the switch**: not because it was chosen, but because of historical order. `voice-bench` initially only served voice dialogue, and at that time the machine only had vLLM's Qwen2.5-7B-AWQ (port 8000); later the captions were also connected to 8000 first, and only in 4.19 moved to Magnitude's 35B. The voice assistant just stayed on 7B and nobody touched it. What really blocked the switch were two **fears that had not been verified at the time**: MoE prefill is expensive (afraid the first token would get slower), and the GGUF engine has only one slot (afraid the two services would queue behind each other).
 
-#### 1. 四个真实场景量一遍（`tools/voice_llm_ab.py`）
+#### 1. Measure four real scenarios (`tools/voice_llm_ab.py`)
 
-语音助手和字幕的负载形态完全不同：字幕 system 长（290 token，命中缓存）+ 内容短 + 输出短；助手 system 短 + **可能带几百字 OCR** + 输出长（160 token）。所以字幕的结论不能直接搬。
+The voice assistant and the captions have completely different load shapes: captions have a long system (290 tokens, cache hit) + short content + short output; the assistant has a short system + **possibly several hundred characters of OCR** + long output (160 tokens). So the caption conclusion cannot be carried over directly.
 
-`reply-lang=zh`，每场景 3 次、**每次换问句**（同一句重复发会让整条 prompt 命中缓存，`prompt_n` 直接掉到 1，首字假到 78ms）：
+`reply-lang=zh`, 3 runs per scenario, **changing the question each time** (sending the same sentence repeatedly makes the whole prompt hit the cache, `prompt_n` drops straight to 1 and the first token is a fake 78ms):
 
-| 场景 | 7B 首字 | 7B 全文 | 35B 首字 | 35B 全文 |
+| Scenario | 7B first token | 7B full text | 35B first token | 35B full text |
 |---|---|---|---|---|
-| chat-short（纯问答） | 98ms | 461ms | 272ms | 887ms |
-| chat-multi（带 3 轮历史） | 104ms | 1070ms | 426ms | 905ms |
-| ocr-mid（屏幕 ~100 字） | 102ms | 1899ms | 314ms | **1488ms** |
-| ocr-long（屏幕一段口播稿） | 102ms | 2925ms | 472ms | **2127ms** |
+| chat-short (pure Q&A) | 98ms | 461ms | 272ms | 887ms |
+| chat-multi (with 3 turns of history) | 104ms | 1070ms | 426ms | 905ms |
+| ocr-mid (~100 chars on screen) | 102ms | 1899ms | 314ms | **1488ms** |
+| ocr-long (a full spoken script on screen) | 102ms | 2925ms | 472ms | **2127ms** |
 
-- **首字慢 170~370ms**（固定成本：35B 要预热的权重更多），但**长回答全文快 25~35%**——MoE 解码只激活 3B，7B dense 每个 token 都要跑完整个模型。
-- 体感延迟 = 首字 + 首句合成。45 字左右的首句：35B 约 1.2s，7B 约 0.95s。差 250ms，能听出来，但换来的是下面这条。
-- **质量差距是压倒性的**：7B 在「日语 system + 中文回答」下会出 `会議的时间确认 needed。`（中日混杂）、`優先度が一番高いのは…-topic1-と判断します`（垃圾 token）、`necesita дополнительной информации`（西语）。35B 12 条里一处没有。
+- **First token 170~370ms slower** (a fixed cost: 35B has more weights to warm up), but **long answers are 25~35% faster in full text** — MoE decode activates only 3B, while 7B dense has to run the whole model for every token.
+- Perceived latency = first token + first-sentence synthesis. For a first sentence of about 45 characters: 35B about 1.2s, 7B about 0.95s. A 250ms difference, audible, but what it buys is the next item.
+- **The quality gap is overwhelming**: with a Japanese system and a Chinese answer, 7B produces `会議的时间确认 needed。` (Chinese-Japanese mixture), `優先度が一番高いのは…-topic1-と判断します` (garbage token), `necesita дополнительной информации` (Spanish). 35B had none of that in 12 cases.
 
-#### 2. 并发不是问题（这点推翻了换之前的担心）
+#### 2. Concurrency is not a problem (this overturned the fear held before the switch)
 
-`magnitude serve --help` 只有一个 `-h`，看起来像单槽。实测：一边让助手反复跑 ocr-long 长输出、一边打字幕短请求，**字幕首字只从 204ms 涨到 233ms（+29ms）**。引擎能并发调度，两个服务共用 10100 不会互相排队。线上字幕首字 p50 维持在 435~474ms，`q_tr=0`、`dropped=0`。
+`magnitude serve --help` shows only one `-h`, which looks like a single slot. Measured: while making the assistant repeatedly run long ocr-long outputs, at the same time typing short caption requests, **the caption first token only went from 204ms to 233ms (+29ms)**. The engine can schedule concurrently, and the two services sharing 10100 do not queue behind each other. Online the caption first token p50 stayed at 435~474ms, with `q_tr=0` and `dropped=0`.
 
-#### 3. 卡住的坑：语言指令挂哪儿，比写什么更重要
+#### 3. The pitfall that got stuck: where the language instruction is attached matters more than what it says
 
-语音助手的价值是「日语会议里用中文播报」（`--reply-lang zh`）。但 35B 换上去后 **12 条回答全是日语（0/12）**，7B 是 8/12。`tools/voice_lang_fix.py` 四种写法，两个场景 × 3 次：
+The voice assistant's value is "announce in Chinese during a Japanese meeting" (`--reply-lang zh`). But after switching to 35B, **all 12 answers were Japanese (0/12)**; 7B was 8/12. `tools/voice_lang_fix.py` tried four formulations, two scenarios × 3 runs:
 
-| 写法 | 35B 中文率 | 7B 中文率 |
+| Formulation | 35B Chinese rate | 7B Chinese rate |
 |---|---|---|
-| 指令挂 system 末尾（**原实现**） | **0/6** | 3/6 |
-| 指令挂 user 消息末尾 | **6/6** | 6/6 |
-| system 开头加硬声明 | 0/6 | 5/6 |
-| user 末尾 + system 开头都挂 | 5/6 | 6/6 |
+| Instruction at the end of the system (**original implementation**) | **0/6** | 3/6 |
+| Instruction at the end of the user message | **6/6** | 6/6 |
+| Hard declaration at the start of the system | 0/6 | 5/6 |
+| Both at the end of the user message and the start of the system | 5/6 | 6/6 |
 
-放 user 末尾立刻就好了——**指令要贴着生成位置**。35B 尤其明显：它「太懂语境」，用户说日语、屏幕是日语，就把远处的中文指令忽略掉；7B 只是机械跟随最后一句。
+Putting it at the end of the user message fixed it immediately — **the instruction has to sit next to the generation position**. It is especially pronounced with 35B: it "understands the context too well", so when the user speaks Japanese and the screen is Japanese it ignores a distant Chinese instruction; 7B just mechanically follows the last sentence.
 
-但只挂 user 还不够：把 system 拆成「纯对话版」（去掉屏幕规则）之后，system 变成**通篇日语、一个中文字都没有**，语言指令又被压回去（3/3 全日语）。所以最终做法是**双挂**：system 末尾一份 + user 末尾一份。改完 4/4 全中文。
+But attaching to the user message alone is not enough: after splitting the system into a "pure dialogue version" (removing the screen rules), the system becomes **entirely Japanese with not one Chinese character**, and the language instruction gets pushed back down again (3/3 all Japanese). So the final approach is **attach both**: one at the end of the system + one at the end of the user message. After the change, 4/4 were all Chinese.
 
-#### 4. 顺手修掉一个 35B 特有的坏习惯
+#### 4. Also fixed a bad habit specific to 35B
 
-没传 `look`（没看图）时，35B 会答「屏幕文字中没有显示今天的会议时间」——明明这轮根本没抓帧，听起来像在推卸。加一句「没有[屏幕文字]时不要提屏幕」的**否定指令压不住**（2/2 照旧）。
+When `look` was not passed (no image was looked at), 35B would answer 「屏幕文字中没有显示今天的会议时间」 ("the screen text does not show today's meeting time") — even though this turn grabbed no frame at all, which sounded like shirking. Adding a **negative instruction** "do not mention the screen when there is no [屏幕文字]" **could not suppress it** (2/2 unchanged).
 
-根因是 system 里反复出现「[屏幕文字]」这个词，模型就会引用它。最终改成**动态 system**：`voice_server.Llm` 拆成 `system_core`（纯对话）和 `system + screen_rule`（带屏幕规则），`stream()` 里按 `"[屏幕文字]" in text` 二选一。**不给它这个词，问题就没了。**
+The root cause is that the word 「[屏幕文字]」 appears repeatedly in the system, so the model refers to it. The final fix is a **dynamic system**: `voice_server.Llm` is split into `system_core` (pure dialogue) and `system + screen_rule` (with screen rules), and `stream()` picks one by `"[屏幕文字]" in text`. **Do not give it the word and the problem is gone.**
 
-#### 5. 改动与回滚
+#### 5. Changes and rollback
 
-- `voice_server.py`：`Llm(api_key, think)`（Magnitude 要 Bearer、Qwen3.5 必须关思考）、`available()` 带鉴权头、`system_core`/`screen_rule` 动态 system、语言指令双挂、新增 `--llm-key` / `--llm-think`
-- `deploy/voice-bench.service`：`--llm-base .../10100/inference/v1` + 35B 的 model id + key
-- 新工具：`tools/voice_llm_ab.py`（四场景多臂对比 + `--concurrent` 抢占测试 + 语言遵循统计）、`tools/voice_lang_fix.py`（四种指令写法对照）
-- **回滚**：`docker start vllm-qwen` → unit 里把三行 `--llm-*` 换回 `--llm-model qwen`（base 默认 8000）→ 重启 voice-bench。**vLLM 容器 11:53 已停**（空转占 15G），但没删，回滚照上面两步走。
+- `voice_server.py`: `Llm(api_key, think)` (Magnitude needs Bearer, Qwen3.5 must have thinking off), `available()` with an auth header, `system_core`/`screen_rule` dynamic system, language instruction attached in both places, new `--llm-key` / `--llm-think`
+- `deploy/voice-bench.service`: `--llm-base .../10100/inference/v1` + the 35B model id + key
+- New tools: `tools/voice_llm_ab.py` (four-scenario multi-arm comparison + `--concurrent` preemption test + language compliance statistics), `tools/voice_lang_fix.py` (comparison of four instruction formulations)
+- **Rollback**: `docker start vllm-qwen` → change the three `--llm-*` lines in the unit back to `--llm-model qwen` (base defaults to 8000) → restart voice-bench. **The vLLM container was stopped at 11:53** (idling and occupying 15G) but not deleted; rollback follows the two steps above.
 
-### 4.23 「下一句一来，上一句整行消失」：全量重绘的滚动锚点漂移（2026-11-21 中午）
+### 4.23 "As soon as the next sentence arrives, the previous whole line disappears": scroll anchor drift from full redraw (2026-11-21 midday)
 
-**现象**（用户报）：上一句是长文、译文还在逐字流，下一句一来，上一句**整行（原文+译文）都不见了**，且只有长句才明显。
+**Symptom** (reported by the user): when the previous sentence is long text and its translation is still streaming character by character, as soon as the next sentence arrives the previous sentence's **whole line (original + translation) disappears**, and it is only obvious with long sentences.
 
-#### 1. 先证明不是数据问题
+#### 1. First prove it is not a data problem
 
-两条独立证据，都在线上跑出来的：
+Two independent pieces of evidence, both produced online:
 
-- `tools/sse_regress.py` 订阅 `/api/events` 120 秒：**407 个事件、206 行、回退 0 次、变空 0 次**。每个 seq 的译文都是严格前缀增长。
-- `/api/status` 的 `tr: {retry: 1, fixed: 0}`：219 段里只有 1 次触发「残留检测 → 同步重译」，而且没救回来（`fixed=0` 就不会整行替换）。所以不是重译把长句换掉了。
+- `tools/sse_regress.py` subscribing to `/api/events` for 120 seconds: **407 events, 206 lines, 0 regressions, 0 becoming empty**. Every seq's translation grew as a strict prefix.
+- `tr: {retry: 1, fixed: 0}` in `/api/status`: out of 219 segments only 1 triggered "residue detection → synchronous retranslation", and it was not recovered (`fixed=0` means no whole-line replacement). So it is not retranslation replacing the long sentence.
 
-服务端也确实没有任何清空 `trans` 的路径（只有 `cap.clear()`，它只挂在 `/api/control` 的「清屏」按钮上），`cap.lines` 是 `deque(maxlen=400)`，当前 219 行没到上限。
+And there is genuinely no path on the server that clears `trans` (only `cap.clear()`, which is attached only to the "清屏" (clear screen) button on `/api/control`), and `cap.lines` is a `deque(maxlen=400)`, with the current 219 lines not reaching the limit.
 
-#### 2. 根因：`innerHTML` 全量重建 + 像素 `scrollY` 回填
+#### 2. Root cause: full `innerHTML` rebuild + pixel `scrollY` restore
 
-旧 `render()` 每收到一次推送（流式时约 80ms 一次）就做一遍：
+The old `render()` did this on every push received (about every 80ms when streaming):
 
 ```js
 const y = window.scrollY;
 const atBottom = (window.innerHeight + y + 80) >= document.body.scrollHeight;
-m.innerHTML = lines.slice(-30).map(...)   // 30 行整个重建
+m.innerHTML = lines.slice(-30).map(...)   // rebuild all 30 lines
 window.scrollTo(0, atBottom ? document.body.scrollHeight : y);
 ```
 
-长句的译文正在逐字变高，重建后 `#main` 的**总高度变了，但 `y` 还是那个像素值**——同一个 `y` 指向的已经是别的内容，用户正在读的那一行被推出视口。句子越长、高度变化越大，所以只有长句明显。加上每 80ms 重建 30 行 DOM，浏览器还要重排整棵树，掉帧会放大这个观感。
+The long sentence's translation is growing line by line, so after the rebuild the **total height of `#main` has changed but `y` is still that same pixel value** — the same `y` now points at different content, and the line the user is reading is pushed out of the viewport. The longer the sentence, the bigger the height change, which is why only long sentences show it. On top of that, rebuilding 30 lines of DOM every 80ms makes the browser reflow the whole tree, and dropped frames amplify the impression.
 
-**注意这不是「数据被删」，是「视口锚点漂移」**——所以刷新页面、或者往回滚一点，那行其实还在。判断一个"内容消失"的 bug 属于哪一类，先看这个：数据层能复现出回退就是后端，复现不出就是渲染。
+**Note that this is not "the data was deleted", it is "the viewport anchor drifted"** — so refreshing the page, or scrolling back a little, shows that the line is still there. To judge which class a "content disappeared" bug belongs to, check this first: if the data layer can reproduce a regression it is the backend; if it cannot, it is rendering.
 
-#### 3. 修法：改成增量渲染
+#### 3. The fix: switch to incremental rendering
 
-每行一个**常驻 DOM 节点**（`dom: seq -> {root, head, o, tr}`），每次只写变化的文本节点：
+Give each line a **resident DOM node** (`dom: seq -> {root, head, o, tr}`), and only write the text nodes that change:
 
-- 译文流式增长时，**只有当前那一行的文本节点变长**，上面 29 行一个字都不碰、几何位置不动
-- 新行用 `appendChild` 追加；顺序只在真的乱序时才重排（`appendChild` 对已有节点是"移动"，不重建、不丢内容）
-- 滚动只在「真的来了新行」且「原本贴底」时才执行；**译文在原行里变长不再触发滚动**——这正是把视线顶走的地方
-- 草稿行也是常驻节点，`draft` 为空时 `remove()`，不再拼字符串
+- When the translation streams and grows, **only the current line's text node gets longer**; the 29 lines above are not touched at all and their geometry does not move
+- New lines are appended with `appendChild`; ordering is only rearranged when it is genuinely out of order (`appendChild` on an existing node is a "move", not a rebuild, and does not lose content)
+- Scrolling only happens when "a new line really arrived" and "we were already stuck to the bottom"; **the translation growing inside an existing line no longer triggers a scroll** — that is exactly what was shoving the view away
+- The draft line is also a resident node, `remove()`d when `draft` is empty, no more string concatenation
 
-#### 4. 验证方式：把页面 JS 抽出来用 DOM mock 跑
+#### 4. How it was verified: extract the page JS and run it against a DOM mock
 
-`tools/dom_render_test.js`：从 `caption_server.py` 抽出 `<script>`，注入一个极简 DOM（`createElement` / `appendChild` / `remove` / `querySelector` / `nextElementSibling`），直接断言**节点身份**而不只是文字：
+`tools/dom_render_test.js`: extracts the `<script>` from `caption_server.py`, injects a minimal DOM (`createElement` / `appendChild` / `remove` / `querySelector` / `nextElementSibling`), and asserts on **node identity** directly, not just the text:
 
-- 长句流式 20 次后，第 30 行的 DOM 节点**还是同一个对象**（`===`）、文本一个字没变
-- 新行到来后，前面的行节点不被重建，上一句译文完整保留
-- 上下两句交错推送时互不踩，`final` 后译文保留且光标类名消失
-- 草稿行插入/移除不影响已有行；清屏回到「等待翻译…」
+- After 20 streamed updates of a long sentence, line 30's DOM node is **still the same object** (`===`), and its text has not changed by one character
+- After a new line arrives the preceding line nodes are not rebuilt, and the previous sentence's translation is preserved in full
+- When two sentences push interleaved they do not step on each other; after `final` the translation is kept and the cursor class name disappears
+- Inserting/removing the draft line does not affect existing lines; clearing returns to 「等待翻译…」 ("waiting for translation…")
 
-18 项全过。**而且在 Jetson 上从线上 `caption_server.py` 重新抽 JS 再跑一遍**——验的是线上文件，不是本地副本：
+All 18 items passed. **And it was re-extracted from the online `caption_server.py` and run again on the Jetson** — verifying the online file, not a local copy:
 
 ```bash
 python3 -c "import re,pathlib;s=pathlib.Path('caption_server.py').read_text();\
@@ -1320,33 +1330,33 @@ pathlib.Path('tools/_page_check.js').write_text(re.search(r'<script>(.*?)</scrip
 node tools/dom_render_test.js
 ```
 
-> 坑：改了页面 JS 一定要重抽 `tools/_page_check.js`，否则测的是旧代码。本地脚本会比对 sha1 提示不一致。
+> Pitfall: after changing the page JS you must re-extract `tools/_page_check.js`, otherwise you are testing the old code. The local script compares sha1 and warns when they differ.
 
-**代价**：这次改动只在前端，但 `PAGE` 是模块级常量，**必须重启 caption-bench 才生效**，重启会清空已积累的行。
+**Cost**: this change is front-end only, but `PAGE` is a module-level constant, so **caption-bench must be restarted for it to take effect**, and a restart clears the lines accumulated so far.
 
-### 4.24 字幕改成「最新一条在最上，旧行往下滚」（2026-11-21 下午）
+### 4.24 Captions changed to "newest at the top, older lines scroll down" (2026-11-21 afternoon)
 
-用户要求：最新一条显示在最上面，新字出来时整屏往下推。2026-11-21 中午那版是「追加在底部 + 滚到底」。
+The user's requirement: the newest line is displayed at the top, and when new text appears the whole screen pushes down. The version from midday 2026-11-21 was "append at the bottom + scroll to the bottom".
 
-改动只在页面渲染层（`caption_server.py` 的 `PAGE`）：
+The change is only in the page rendering layer (`PAGE` in `caption_server.py`):
 
-| 位置 | 旧（追加到底部） | 新（最新在最上） |
+| Location | Old (append at the bottom) | New (newest at the top) |
 |---|---|---|
-| `syncLine()` 建节点 | `appendChild` | `insertBefore(node, firstElementChild)` |
-| `syncDraft()` | 挂到末尾 | 挂到最前（草稿是最新一条） |
-| 顺序校验 | 按 seq 升序 | `orderOk()`：草稿在前，其余 **seq 从大到小** |
-| 回收 | 窗口滚动时删最早的 | 一样，只是它现在待在**底部** |
-| 滚动 | 贴底就 `scrollTo(bottom)` | **贴顶就不动**（新行插入自然把内容往下推）；往下翻时不补偿会顶跑，见下 |
+| Node creation in `syncLine()` | `appendChild` | `insertBefore(node, firstElementChild)` |
+| `syncDraft()` | attached at the end | attached at the front (the draft is the newest line) |
+| Order check | ascending by seq | `orderOk()`: draft first, the rest **seq descending** |
+| Reclaim | delete the earliest when the window scrolls | same, only now it sits at the **bottom** |
+| Scrolling | `scrollTo(bottom)` when stuck to the bottom | **do nothing when stuck to the top** (inserting a new line naturally pushes content down); when scrolled down, no compensation means the view gets shoved, see below |
 
-**滚动锚点要一起翻转**，否则会把 4.23 的 bug 反过来再犯一次：
+**The scroll anchor has to be flipped together with it**, otherwise the 4.23 bug gets committed again in reverse:
 
-- 贴顶（`scrollY <= 24`）：什么都不做，新行插到最前 → 内容整屏下移，这就是「往下滚」的观感。
-- 往下翻看旧行：锚定「原来的第一条」，插完用 `getBoundingClientRect().top` 的**差值**补偿 `scrollBy`。
-  方向容易写反：内容被推下去 `h` 像素，`top` 会**变大** `h`，所以要 `scrollBy(0, +h)`（多滚 `h`），
-  写成 `anchorTop - topNow` 会让滚动反向、视线跳得更厉害。
-- `#main` 加了 `overflow-anchor:none`：Chrome 自带的滚动锚定会在顶部插入时偷偷改 `scrollY`，和我们手算的补偿叠加会漂。
+- Stuck to the top (`scrollY <= 24`): do nothing; the new line is inserted at the front → the content shifts down a whole screen, which is the "scrolls down" impression.
+- Scrolled down reading older lines: anchor on "the original first line", and after insertion compensate with `scrollBy` using the **difference** in `getBoundingClientRect().top`.
+  It is easy to get the direction backwards: when the content is pushed down by `h` pixels, `top` **increases** by `h`, so you need `scrollBy(0, +h)` (scroll `h` more);
+  writing `anchorTop - topNow` makes the scroll go the wrong way and the view jump even more.
+- `#main` gets `overflow-anchor:none`: Chrome's built-in scroll anchoring secretly changes `scrollY` when inserting at the top, and it drifts when stacked on top of our hand-computed compensation.
 
-测试 `tools/dom_render_test.js` 同步改成 26 项，新增的关键几条：
+The test `tools/dom_render_test.js` was changed to 26 items in step, with these key new ones:
 
 ```
 [ok] 最新的一条在最上（35） / 最老的一条沉到底部（6）
@@ -1357,261 +1367,264 @@ node tools/dom_render_test.js
 [ok] 贴顶时不做补偿，新行自然把内容往下推
 ```
 
-DOM mock 为此补了 `insertBefore` / `getBoundingClientRect`（用「第几个孩子 × 100px」模拟布局）和 `window.scrollBy`。
-同样是**在 Jetson 上用线上文件重抽再跑**，26 项全过；后端 `test_caption_pipe.py` 14 组也全过。
+For this the DOM mock gained `insertBefore` / `getBoundingClientRect` (simulating layout as "which child × 100px") and `window.scrollBy`.
+Again it was **re-extracted from the online file on the Jetson and run**, and all 26 items passed; the backend `test_caption_pipe.py` 14 groups also all passed.
 
-> 注意：这个顺序是「倒序」。如果哪天要接着往下讲、需要顺着读，把上面四处翻回来即可（核心是 `orderOk` 的遍历方向和滚动锚点一起改）。
+> Note: this order is "reverse order". If some day you want to continue downwards and need to read forwards, flip the four places above back (the core is changing the `orderOk` traversal direction and the scroll anchor together).
 
-### 4.25 拿屏幕上的字纠正 ASR 专有名词：按需提示，不做全量注入（2026-11-21 下午）
+### 4.25 Using on-screen text to correct ASR proper nouns: hint on demand, no full injection (2026-11-21 afternoon)
 
-需求：「一边看着屏幕一边出字幕，用屏幕上的字改错」。可以做，但**不能把屏幕文字整段塞进翻译请求**——实测是负收益。
+The request: "produce captions while watching the screen, and fix errors with the words on the screen". This can be done, but **you must not stuff the whole block of screen text into the translation request** — measurement shows a negative return.
 
-#### 先量代价与效果（`tools/screen_hint_ab.py`，6 条真实段 × 三臂）
-| 臂 | 屏幕字数 | 首字 p50 | prompt_n | prompt_ms |
+#### First measure the cost and the effect (`tools/screen_hint_ab.py`, 6 real segments × three arms)
+
+| Arm | Screen characters | First token p50 | prompt_n | prompt_ms |
 |---|---|---|---|---|
 | none | 0 | 87ms\* | 1 | 25 |
 | h60 | 113 | 423ms | 134 | 352 |
 | h120 | 176 | 417ms | 160 | 361 |
 
-\* none 那一臂因为线上刚译过同样的句子，整条 prompt 命中缓存（`cache_n=351`），所以快得不可信；按 ctx1 现网形态折算，113 字 ≈ +72 token ≈ **+250~320ms/句**。
+\* The `none` arm hit the cache for the whole prompt because the same sentence had just been translated online (`cache_n=351`), so its speed is not credible; converted to the ctx1 online shape, 113 characters ≈ +72 tokens ≈ **+250~320ms per sentence**.
 
-**更要命的是效果**：h60 五句里有三句变差——「三社の会談」译成「这三家公司的首次会谈」、「この後ちょっと…」里凭空冒出「这位先生在这三家公司此次会谈中」、「特朗普那边则是特朗普那边的情况」重复。根因有两条：
-1. 采集卡拍的是演示者整块屏，**我们自己的字幕页面就开在上面**，屏幕文字里有上一句的中文译文 → 把译文当参考喂回去，自我循环；
-2. 屏幕下三分之一、标题栏、邮件列表这些字与本句毫无关系，模型会去「凑」。
+**Worse still is the effect**: three of h60's five sentences got worse — 「三社の会談」 ("the three-company talks") translated as 「这三家公司的首次会谈」 ("the first meeting of these three companies"), 「この後ちょっと…」 ("a bit after this…") sprouted 「这位先生在这三家公司此次会谈中」 ("this gentleman in these three companies' talks") out of nowhere, and 「特朗普那边则是特朗普那边的情况」 ("on Trump's side it is Trump's side's situation") repeated. There are two root causes:
+1. The capture card films the presenter's whole screen and **our own caption page is open on it**, so the screen text contains the previous sentence's Chinese translation → feeding the translation back in as reference is a self-loop;
+2. The bottom third of the screen, the title bar and the mail list have nothing to do with this sentence, and the model goes to "make it fit".
 
-#### 所以只做「命中才提示」
-`ScreenHints`（`caption_server.py`）：
-- 后台每 15 秒向 voice-bench 的 `/api/look` 要一次 OCR（**字幕服务不碰 `/dev/video0`**，那设备是独占的，voice-bench 常驻持有；它内部按画面指纹缓存，同一画面约 0.5s、新画面约 1.3s）
-- 过滤三类垃圾：页面 UI 词、邮箱/网址行、**与最近 30 条字幕有 8 字以上共同子串的行**（防自我循环）
-- 只抽三类候选：4 位以上数字、4~10 拍片假名、3~8 字汉字串；每个取读音（pyopenjtalk `run_frontend`，3ms/句），读音不在 4~14 拍的丢掉
-- 翻译前把本句切成词素，取 1~4 词素的读音窗口，与候选词读音做编辑距离：**≤1 且写法不同**才算命中，每段最多提示一个词
-- 命中才在请求体末尾加一句 `【屏幕词】「畔蒜泰助」——本句的「阪井泰介」若指同一事物，请改用屏幕写法。`（37 字 ≈ 25 token，约 +100ms，**只在这一段付**）；没命中一个 token 都不加 → 零代价、零污染
+#### So only "hint on a hit" is done
 
-**为什么不做拉丁字母**：OpenJTalk 会把 `CloudflareObservability` 逐字母读成 50 拍「しーえるおー…」，永远撞不上日语读音，实测 40 条候选全是邮箱/网址碎片。屏幕英文词若 ASR 也写对了本来就不用提示；被听成片假名那种情况该走 **ASR 热词**，不是这条路。
+`ScreenHints` (`caption_server.py`):
+- In the background, every 15 seconds it asks voice-bench's `/api/look` for one OCR (**the caption service does not touch `/dev/video0`**, that device is exclusive and voice-bench holds it resident; internally it caches by picture fingerprint, about 0.5s for the same picture and about 1.3s for a new one)
+- Filters three kinds of junk: page UI words, email/URL lines, and **lines sharing a common substring of 8+ characters with the last 30 captions** (to prevent the self-loop)
+- Extracts only three kinds of candidates: numbers of 4+ digits, katakana of 4~10 mora, kanji runs of 3~8 characters; takes the reading of each (pyopenjtalk `run_frontend`, 3ms per sentence), and drops readings outside 4~14 mora
+- Before translating, splits this sentence into morphemes, takes reading windows of 1~4 morphemes, and computes the edit distance against the candidate readings: only **≤1 and a different spelling** counts as a hit, at most one word hinted per segment
+- On a hit it appends one sentence to the end of the request body: `【屏幕词】「畔蒜泰助」——本句的「阪井泰介」若指同一事物，请改用屏幕写法。` ("[screen word] ... — if this sentence's ... refers to the same thing, please use the spelling on screen", 37 characters ≈ 25 tokens, about +100ms, **paid only on this segment**); with no hit not a single token is added → zero cost, zero pollution
 
-#### 现状与怎么验
-- unit 关掉时 `/api/status` 的 `screen` 为 `null`；开着时给 `polls/hits/terms/sample/last_ms/last_hint`
-- 页面标题栏多一个「屏幕 N 词 · 命中 M」，鼠标悬停看词表样本、最近命中与耗时——**看不到就等于没生效**，所以摆在明面上
-- 线上实测（`--screen-hints --screen-every 15`）：`q_tr=0`、`dropped=0`、lag≈290ms、首字 p50 473→443ms（噪声内，**没有可测代价**）；`terms` 14~40 条随屏幕变化
-- **真实命中还没出现过**：这段时间屏幕上是 Outlook 邮件列表、网页和聊天窗口，与会议内容无关，`hits` 一直是 0。逻辑由 `test_screen_hints`（15 组，含打桩读音器）覆盖
+**Why Latin letters are not handled**: OpenJTalk reads `CloudflareObservability` letter by letter as 50 mora of 「しーえるおー…」, which can never match a Japanese reading, and measurement showed all 40 candidates were email/URL fragments. If the English word on screen is also correctly written by the ASR there is no need to hint anyway; the case where it is heard as katakana should go through **ASR hotwords**, not this path.
 
-#### 手工造一次命中，确认链路真的有效（35B 实测）
-拿现网一条真实烂句，人为给一个屏幕词：
+#### Current state and how to verify
+- With the unit off, `screen` in `/api/status` is `null`; with it on it gives `polls/hits/terms/sample/last_ms/last_hint`
+- The page title bar gains a 「屏幕 N 词 · 命中 M」 (N screen words · M hits); hovering shows the term sample, the most recent hit and the timing — **if you cannot see it, it is not in effect**, which is why it is out in the open
+- Online measurement (`--screen-hints --screen-every 15`): `q_tr=0`, `dropped=0`, lag≈290ms, first token p50 473→443ms (within noise, **no measurable cost**); `terms` 14~40 entries, changing with the screen
+- **A real hit has not happened yet**: during this period the screen showed an Outlook mail list, web pages and chat windows, unrelated to the meeting content, and `hits` stayed at 0. The logic is covered by `test_screen_hints` (15 groups, including a stubbed reader)
+
+#### Manually create one hit to confirm the path really works (measured on 35B)
+
+Taking one real bad sentence from production and artificially giving it a screen word:
 ```
 原文（ASR）：同小委部同じベットネって違う夢見ているのか、見ないといけない。
 无提示   → 同小委部是否抱着同样的期待，还是必须去确认？          ttft 299ms / pn=33
 带提示   → 同小委员会是否做着不同的梦，必须加以确认。            ttft 364ms / pn=62
 提示内容： 【屏幕词】「小委員会」——本句的「同小委部」若指同一事物，请改用屏幕写法。
 ```
-**+29 个 token ⇒ +65ms**，专有名词确实被改对了。说明机制成立；缺的只是「屏幕上真的出现那个词」。
+**+29 tokens ⇒ +65ms**, and the proper noun really was corrected. So the mechanism holds; what is missing is only "that word actually appearing on screen".
 
-> 判定：这条路的**上限是「专有名词同音错字」**，救不了普通词的误听（`つぶさに` → `つぶさんに` 这种没救）。日常会议里 90% 的错字属于后者，所以别期待它能整体抬高质量。
+> Verdict: the **ceiling of this path is "homophone misrecognition of proper nouns"**, and it cannot save mishearing of ordinary words (`つぶさに` → `つぶさんに` and the like are hopeless). In everyday meetings 90% of the misrecognitions are the latter, so do not expect this to raise overall quality.
 
-### 4.26 页面停在「连接中…」、按钮全失效：PAGE 不是 raw 字符串把 JS 打断了（2026-11-21 下午）
+### 4.26 The page stuck at "连接中…" (connecting…) with all buttons dead: PAGE not being a raw string broke the JS (2026-11-21 afternoon)
 
-现象（4.25 上线后第一次刷新）：页面只有 header 和「等待声音…」，`已识别 0 段`、`延迟 —`、`-99 dB`、`连接中…`，三个按钮点了没反应；**而服务端完全正常**——`systemctl is-active` 是 active、`/api/status` 有 77 段、`level_db=-29`、`/api/poll` 直接返回 30KB JSON。
+Symptom (the first refresh after 4.25 went live): the page had only the header and 「等待声音…」 ("waiting for sound…"), with `已识别 0 段` (0 segments recognised), `延迟 —` (latency —), `-99 dB`, `连接中…` — and clicking the three buttons did nothing; **while the server side was completely fine** — `systemctl is-active` was active, `/api/status` had 77 segments, `level_db=-29`, and `/api/poll` returned 30KB of JSON directly.
 
-#### 定位
-截图里的四组值恰好是 **PAGE 里写死的初始 DOM**（`<span id="db">-99 dB</span>`、`<span id="live">连接中…</span>`）。既然连 `paint(true)`（脚本末尾，会把状态灯改成「运行中」）都没执行，就不是「网络断了 / SSE 连不上」，而是**整段 `<script>` 没跑起来**。把服务端吐出来的页面抓下来交给 node：
+#### Locating it
+
+The four groups of values in the screenshot are exactly the **initial DOM hard-coded in PAGE** (`<span id="db">-99 dB</span>`, `<span id="live">连接中…</span>`). Since even `paint(true)` (at the end of the script, which turns the status light to 「运行中」 "running") had not executed, it was not "the network is down / SSE cannot connect" but **the whole `<script>` had not run**. Grabbing the page the server emitted and handing it to node:
 
 ```
 node --check /tmp/page.js
 SyntaxError: Invalid or unexpected token   ← line 270
 ```
-罪魁是 4.25 新加的 tooltip：
+The culprit was the tooltip added in 4.25:
 ```python
-sc.title = ... + '\n错误：' + ...      # 源码里看着没问题
+sc.title = ... + '\n错误：' + ...      # looks fine in the source
 ```
-`PAGE` 当时是普通 `"""` 字符串，Python 先把 `'\n'` 吃成了**真换行**，于是浏览器拿到的 JS 是
+`PAGE` was an ordinary `"""` string at the time, so Python ate the `'\n'` into a **real newline** first, and the JS the browser received was
 ```js
 sc.title = (... + '
 错误：' + ...)
 ```
-单引号字符串被换行截断 → 脚本语法错误 → 一个字都不执行。**HTML 是静态的，所以画面看着「正常」，只有脚本死了。**
+The single-quoted string was cut by the newline → script syntax error → not a single character executed. **The HTML is static, so the screen "looked normal"; only the script was dead.**
 
-#### 修法（两层）
-1. `PAGE = r"""..."""` 改成 raw 字符串，JS 里的 `\n`/`\u0001` 原样进浏览器（`voice_server.py` 的 `HTML = r"""` 一直是 raw，所以那边从没踩过）
-2. `test_page_js_syntax`：把渲染后的 `<script>` 抽出来过 `node --check`，再兜一条「单引号每行必须成对」的检查（没有 node 的机器上跳过）
+#### The fix (two layers)
+1. Change `PAGE = r"""..."""` to a raw string, so `\n`/`\u0001` in the JS reach the browser as-is (`HTML = r"""` in `voice_server.py` has always been raw, which is why that side never stepped on it)
+2. `test_page_js_syntax`: extracts the rendered `<script>` and runs `node --check` on it, plus a fallback check that "single quotes must be paired on each line" (skipped on machines without node)
 
-#### 教训
-- 服务端 healthy ≠ 页面活着。**判断「页面是否真的跑了 JS」看那几处只有 JS 会改的初始值**（状态灯、dB、段数），不要只看服务端日志。
-- 只要往 `PAGE` 里写 JS 转义，先确认它是 raw；改完必须 `node --check` 一遍，别等刷新才发现。
-- 前端改动仍然需要**手动 F5**（`PAGE` 是常量，服务端重启不会帮浏览器刷新）。
+#### Lessons
+- A healthy server ≠ a live page. **To judge "did the page really run its JS", look at the initial values that only JS changes** (status light, dB, segment count), do not just look at the server log.
+- Whenever you write JS escapes into `PAGE`, first confirm it is raw; after changing it you must run `node --check` once, do not wait until a refresh to find out.
+- Front-end changes still need a **manual F5** (`PAGE` is a constant, and restarting the server does not refresh the browser for you).
 
-
-## 5. 命令行工具
+## 5. Command-line tools
 
 
 ```bash
-# 录音 8 秒，输出电平、噪声本底、语音段、转写
+# record 8 seconds, print level, noise floor, speech segments, transcription
 ../asr-venv/bin/python voice_probe.py --seconds 8 --threads 12
 
-# 处理已有 wav，只看切分不转写
+# process an existing wav, look only at segmentation, no transcription
 ../asr-venv/bin/python voice_probe.py --wav a.wav --no-asr
 
-# SenseVoice 基准（同一段音频，指定切分）
+# SenseVoice benchmark (same audio, specified segments)
 ../asr-venv/bin/python tools/bench_sensevoice.py --wav a.wav --segments 18.43-21.72,41.95-45.51
 
-# TTS：合成并报告首块延迟
+# TTS: synthesise and report first-chunk latency
 ../asr-venv/bin/python tts_probe.py --text "確認してください。" --out /tmp/a.wav
 
-# 换模型前跑这个：首字延迟 / 单请求 decode / 首句出声（判据见 4.14）
+# run this before changing models: first-token latency / single-request decode / first sentence spoken (criteria in 4.14)
 ../asr-venv/bin/python tools/llm_probe.py --base http://127.0.0.1:8000/v1 --model qwen --runs 3
 
-# 用真实 system prompt 扫四档上下文（一问一答 / 6 轮历史 / 看屏幕 2K·4K 字）
+# scan four context tiers with the real system prompt (one Q&A / 6 turns of history / look at screen 2K·4K chars)
 ../asr-venv/bin/python tools/ttft_scenarios.py --base http://127.0.0.1:8000/v1 --model qwen
 
-# 看一眼屏幕（取帧 + OCR，不调 LLM）；线程数别超 8，12 线程实测慢一倍
+# look at the screen once (frame grab + OCR, no LLM call); keep threads at 8 or below, 12 threads measured twice as slow
 curl -s -X POST -d '{"force":true}' localhost:8095/api/look
 
-# CPU vs TensorRT 的 rec 后端 A/B（判据：行数一致 + 均分差 < 0.01）
+# CPU vs TensorRT rec backend A/B (criteria: same line count + mean-score difference < 0.01)
 ../asr-venv/bin/python tools/trt_rec_probe.py --engine models/rec_fp16.engine --image /tmp/frame0.png
 
-# 重建 TRT engine（换 JetPack 后必须做，约 11~12 分钟；profile 怎么定见 4.8）
+# rebuild the TRT engine (mandatory after changing JetPack, about 11~12 minutes; how to set the profile, see 4.8)
 trtexec --onnx=<rapidocr>/models/ch_PP-OCRv4_rec_infer.onnx \
         --saveEngine=models/rec_fp16.engine --fp16 \
         --minShapes=x:1x3x48x256 --optShapes=x:6x3x48x320 --maxShapes=x:32x3x48x2048
 
-# 流式 vs 整句：翻译首字延迟对比（判据见 4.15）
+# streaming vs whole sentence: comparison of translated first-token latency (criteria in 4.15)
 ../asr-venv/bin/python tools/trans_stream_probe.py --base http://127.0.0.1:8000/v1 --model qwen
 
-# 验证字幕流式真的在推中间态（看补丁是不是最终译文的递增前缀）
+# verify caption streaming really pushes intermediate states (check that patches are increasing prefixes of the final translation)
 ../asr-venv/bin/python tools/stream_verify.py 40
 
-# SSE 推送验证：中间态数量 + 推送间隔（最快应到 ~50ms，不受 250ms 轮询限制）
+# SSE push verification: number of intermediate states + push interval (fastest should reach ~50ms, not limited by the 250ms poll)
 ../asr-venv/bin/python tools/sse_verify.py 45
 
-# 两个客户端同时订阅，确认多端不互相抢补丁
+# two clients subscribing at once, confirming multiple clients do not fight over patches
 ../asr-venv/bin/python tools/sse_multi_client.py
 
-# 端到端：段末 → 原文 / 首字译文 / 译文全出
+# end to end: segment end → original text / first translated token / full translation
 ../asr-venv/bin/python tools/e2e_latency.py 40
 
-# ---- 换模型 / 停机（判据见 4.18）----
-# 换 LLM 前后抓一臂：14 条真实句子 × N 次，记首字/全长/汉字率
+# ---- changing models / downtime (criteria in 4.18) ----
+# capture one arm before and after changing the LLM: 14 real sentences × N runs, recording first token / full length / kanji ratio
 ../asr-venv/bin/python tools/ab_translate.py --tag A --out /tmp/ab_A.json
 ../asr-venv/bin/python tools/ab_translate.py --compare /tmp/ab_A.json /tmp/ab_B.json
 
-# 换模型后的冒烟（超时要 ≥60s：首次请求在跑 MoE kernel 调优）
+# smoke test after changing models (timeout must be ≥60s: the first request is running MoE kernel tuning)
 ../asr-venv/bin/python tools/smoke_llm.py
 
-# 前缀缓存到底有没有生效（同一份 390 字 system prompt 连发 4 次，看首字掉不掉）
+# is the prefix cache actually working (send the same 390-character system prompt 4 times, see whether the first token drops)
 ../asr-venv/bin/python tools/cache_probe.py
-../asr-venv/bin/python tools/cache_probe.py --style short   # 短前缀还会不会命中（4.20）
+../asr-venv/bin/python tools/cache_probe.py --style short   # does a short prefix still hit (4.20)
 
-# 只量首字：prompt 长/短 × 带上文/不带上文 四格对照（判据看 cache_n，不是看首字）
+# first token only: prompt long/short × with/without context, four-cell comparison (judge by cache_n, not by the first token)
 curl -s http://127.0.0.1:8096/api/poll > /tmp/poll.json
 ../asr-venv/bin/python tools/ttft_prompt_ab.py --cases-from /tmp/poll.json --save-cases /tmp/cases.json
 ../asr-venv/bin/python tools/ttft_prompt_ab.py --cases /tmp/cases.json \
     --base http://127.0.0.1:10100/inference/v1 --model '<gguf id>' --key mag-xxx \
     --out /tmp/ttft_prompt.json
 
-# 同一段真实音频上多引擎正面比（ASR 只跑一次，多臂共用文本与上文；判据见 4.21）
+# head-to-head multi-engine comparison on the same real audio (ASR runs once, all arms share the text and context; criteria in 4.21)
 ../asr-venv/bin/python tools/wav_seg_ab.py --wav /tmp/meet60.wav --ctx-lines 1 \
     --arm '35B|http://127.0.0.1:10100/inference/v1|hf:...gguf|mag-xxx' \
     --arm '9B|http://127.0.0.1:10100/inference/v1|qwen3.5-9b:gguf:q4|mag-xxx' \
     --out /tmp/wav_ab.json
 
-# 只比 ctx-lines 时换个数字再跑一遍即可（0 / 1 / 2 各一轮，同 16 段）
+# to compare only ctx-lines, change the number and run again (0 / 1 / 2, one round each, same 16 segments)
 
-# 屏幕文字塞进翻译请求值不值（判据：首字代价 + 译文到底改了没有）
+# is stuffing screen text into the translation request worth it (criteria: first-token cost + whether the translation actually changed)
 curl -s localhost:8096/api/poll > /tmp/poll.json
 curl -s -X POST localhost:8095/api/look > /tmp/ocr.json
 ../asr-venv/bin/python tools/screen_hint_ab.py --poll /tmp/poll.json --ocr /tmp/ocr.json \
     --limit 6 --chars 60,120 --base http://127.0.0.1:10100/inference/v1 \
     --model '<gguf id>' --key mag-xxx --out /tmp/screen_ab.json
 
-# 屏幕词表能不能撞上 ASR 的同音错字（命中 0 条 = 这条路的输入根本不存在）
+# can the screen term list collide with ASR homophone misrecognitions (0 hits = the input for this path does not exist at all)
 ../asr-venv/bin/python tools/screen_terms_probe.py --poll /tmp/poll.json --ocr /tmp/ocr.json
 
-# Magnitude 专用：直接读引擎自报的 cache_n / prompt_ms / ttft，并验证思考开关
+# Magnitude only: read the engine-reported cache_n / prompt_ms / ttft directly, and verify the thinking switch
 ../asr-venv/bin/python tools/mag_sse_probe.py --model 'qwen3.5-9b:gguf:q4' --repeats 3
 
-# 线上首字为什么比引擎慢？给 unit 加上 Environment=CAP_DEBUG=1 后看这两段：
-#   hdr=拿到响应头  ttft=第一个字  | srv prompt_n/cache_n/prompt_ms 是引擎自己算的
+# why is the online first token slower than the engine? add Environment=CAP_DEBUG=1 to the unit and look at these two segments:
+#   hdr=response headers received  ttft=first character  | srv prompt_n/cache_n/prompt_ms is computed by the engine itself
 sudo journalctl -u caption-bench --since '-2min' | grep '\[tr\]'
 
-# Magnitude 的容器与模型（冷启动 ~150s，幂等，可反复跑）
+# Magnitude's container and model (cold start ~150s, idempotent, can be run repeatedly)
 sudo /usr/local/bin/magnitude-up.sh
 
-# SSE 协议诊断：非流式 vs 流式、[DONE] 之后连接关不关
+# SSE protocol diagnosis: non-streaming vs streaming, whether the connection is closed after [DONE]
 ../asr-venv/bin/python tools/sse_probe.py
 
-# 8000 端口换运行时（vLLM 7B / SGLang 35B / vLLM 35B），带就绪轮询和回滚
+# switch the runtime on port 8000 (vLLM 7B / SGLang 35B / vLLM 35B), with readiness polling and rollback
 ./tools/llm_switch.sh status
 MEM=0.62 CTX=8192 SPEC=0 ./tools/llm_switch.sh start-sgl
-./tools/llm_switch.sh start-vllm          # 回滚：复用原容器，实测 66s
+./tools/llm_switch.sh start-vllm          # rollback: reuse the original container, measured 66s
 
-# ---- 语音助手换模型（判据见 4.22）----
-# 四场景 × 多臂：纯问答 / 带历史 / 屏幕 100 字 / 屏幕一段口播稿
+# ---- changing the voice assistant's model (criteria in 4.22) ----
+# four scenarios × multiple arms: pure Q&A / with history / 100 characters on screen / a spoken script on screen
 ../asr-venv/bin/python tools/voice_llm_ab.py \
     --arm '7B|http://127.0.0.1:8000/v1|qwen|' \
     --arm '35B|http://127.0.0.1:10100/inference/v1|<gguf id>|mag-xxx' \
     --reps 3 --reply-lang zh
-# 加 --concurrent：助手长输出打满时，字幕首字被拖多少（实测仅 +29ms）
+# add --concurrent: how much the caption first token is dragged when the assistant's long output saturates (measured only +29ms)
 
-# 语言指令怎么写模型才听（挂 system 末尾 0/6，挂 user 末尾 6/6）
+# how the language instruction must be written for the model to obey (at the end of system 0/6, at the end of user 6/6)
 ../asr-venv/bin/python tools/voice_lang_fix.py \
     --arm '35B|http://127.0.0.1:10100/inference/v1|<gguf id>|mag-xxx'
 
-# 端到端一轮（含 TTS 播报），看 llm_first_ms 与回复语言
+# one end-to-end turn (including TTS playback), look at llm_first_ms and the reply language
 curl -s -N -X POST localhost:8095/api/turn \
      -H 'Content-Type: application/json' -d '{"text":"今日の会議は何時からですか？"}'
 
-# ---- 字幕页渲染（判据见 4.23）----
-# 数据层有没有回退/变空：订阅 SSE，逐 seq 比对是不是严格前缀增长
+# ---- caption page rendering (criteria in 4.23) ----
+# does the data layer regress/become empty: subscribe to SSE and compare seq by seq whether it grows as a strict prefix
 ../asr-venv/bin/python tools/sse_regress.py --sec 120
-# 页面渲染有没有把行重建/删掉：DOM mock 直接断言节点身份（在服务器上跑更硬）
+# does the page rendering rebuild/delete lines: a DOM mock asserts node identity directly (running on the server is harder evidence)
 python3 -c "import re,pathlib;s=pathlib.Path('caption_server.py').read_text();\
 pathlib.Path('tools/_page_check.js').write_text(re.search(r'<script>(.*?)</script>',s,re.S).group(1))"
 node tools/dom_render_test.js
 
-# 播放
+# playback
 aplay -D plughw:CARD=H340,DEV=0 /tmp/a.wav
 ```
 
-关键参数：
+Key parameters:
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `--hp` | 150 | 高通截止 Hz，0 关闭 |
-| `--margin` | 6 | VAD 门限 = 本底 + margin |
-| `--min-peak-margin` | 18 | 段峰值须高出本底的 dB，挡门限附近的小瞬态 |
-| `--min-gap` | 0.40 | 段内允许静音，短于此不断句 |
-| `--threads` | 0 | ctranslate2 线程，0=默认（实测仅 4） |
+| `--hp` | 150 | high-pass cutoff in Hz, 0 disables |
+| `--margin` | 6 | VAD threshold = noise floor + margin |
+| `--min-peak-margin` | 18 | how many dB the segment peak must be above the floor, to block small transients near the threshold |
+| `--min-gap` | 0.40 | silence allowed inside a segment; shorter than this does not cut |
+| `--threads` | 0 | ctranslate2 threads, 0=default (measured as only 4) |
 
-## 6. 验证
+## 6. Verification
 
 ```bash
-python -m unittest test_voice_probe    # 33 项，不需要麦克风和 whisper
-python -m unittest test_tts_routing    # 15 项，不需要模型权重
-python -m unittest test_wake           # 12 项，不需要麦克风
-python -m unittest test_barge          # 24 项，不需要麦克风
-python -m unittest test_vision         # 22 项，不需要采集卡（意图/脱敏/指纹/保护/常驻抓帧）
+python -m unittest test_voice_probe    # 33 items, no microphone or whisper needed
+python -m unittest test_tts_routing    # 15 items, no model weights needed
+python -m unittest test_wake           # 12 items, no microphone needed
+python -m unittest test_barge          # 24 items, no microphone needed
+python -m unittest test_vision         # 22 items, no capture card needed (intent/redaction/fingerprint/protection/resident frame grab)
 
-# 打断判定链端到端（真 VAD + 真 ASR + 真 TTS，合成音喂帧代替麦克风）
+# barge-in decision chain end to end (real VAD + real ASR + real TTS, synthetic audio fed as frames instead of the microphone)
 ../asr-venv/bin/python tools/barge_e2e.py
 
-# HDMI 采集卡探针（已内置预热丢弃，有画面会存 /tmp/hdmi_ok_*.jpg）
+# HDMI capture card probe (warm-up discarding built in; with a picture it saves /tmp/hdmi_ok_*.jpg)
 ./tools/hdmi_probe.sh 10 1
 ```
 
-`test_voice_probe` 覆盖：60Hz 抑制（−24dB 以上）、1kHz 基本无损、分帧电平与理论 RMS 对齐、迟滞切分（词间停顿不断句 / 长间隔断句 / 短促响声丢弃）、峰值余量边界、wav 单双声道与位深校验。
+`test_voice_probe` covers: 60Hz suppression (above −24dB), 1kHz essentially lossless, frame-level levels aligned with theoretical RMS, hysteresis segmentation (a pause between words does not cut / a long gap does cut / short sharp sounds dropped), peak margin boundaries, wav mono/stereo and bit-depth validation.
 
-`test_tts_routing` 覆盖：纯标点必须被拦成空串、纯数字按 hint 选音色（中文上下文不再落到日语）、小数点不被切句切碎。
+`test_tts_routing` covers: pure punctuation must be intercepted into an empty string, pure numbers pick the voice by hint (a Chinese context no longer falls through to Japanese), decimal points are not broken by sentence splitting.
 
-`test_barge` 覆盖：播报时钟累加与过期、取消后归零、串音判别（整句命中 / 截断片段 / 真插话 / 短指令 / 标点差异）、帧交接不混入旧环形缓冲、门限不被串音带偏。
+`test_barge` covers: playback clock accumulation and expiry, returning to zero after cancel, crosstalk discrimination (whole-sentence hit / truncated fragment / real interjection / short command / punctuation difference), frame handover not mixing in the old ring buffer, the threshold not being dragged off by crosstalk.
 
-## 7. 待办
+## 7. TODO
 
-1. **打断（barge-in）** —— ✅ 播报中插话即停（见 4.6），串音不误触
-2. **常驻监听** —— ✅ 唤醒词「小八你好」已接入（见 4.5），一轮结束后自动回到待唤醒
-3. **vLLM 开机自启** —— 现在它只是**回滚备份**（两个服务都走 Magnitude 的 35B），不随开机起；要回滚先 `docker start vllm-qwen`。服务端每轮探活，顺序不影响正确性，但会先降级成回显
-4. **首块延迟优化** —— 636ms 里有相当一部分是 pyopenjtalk 音素化，可考虑首句切短
-5. **单测补齐** —— `test_tts_routing.py` 已覆盖音色路由与切句，`voice_server.py` 的 Silero 判停仍缺
-6. **打断的真实人声校准** —— 目前用合成音验证判定链，真人语速/音量下的阈值还需要拿实际记录调一轮
-7. **采集卡接回业务** —— ✅ 1080p30 链路已通（见 4.7），✅ 抽帧 → OCR → 进对话已接上（见 4.8）；下一步可做分区 OCR（只识别窗口主体）把 6 秒压到 3 秒内
-8. **长时间采集的供电验证** —— 当前挂在扩展坞上（曾 166s 掉线），连续跑小时级采集前建议改直插机身口
-9. **4B–9B 甜点档** —— ✅ 已实测关闭：62s 真实音频上 9B 首字/全文双输（326/1085 对 35B 的 293/693）还复读，之前 157ms 只是短句给的（见 4.21）
-10. **把手改的 dockerd 交给 systemd** —— 需要一次 ~3 分钟窗口（停 dockerd → 容器停 → magnitude 冷启 150s，两服务都断）。当前已 stop 掉失败重启循环，等下次重启机器自然接管（见 4.19 的警告）
-11. **语音助手首字再降** —— 换 35B 后首字 343~627ms，比 7B 慢 170~370ms。可试：`history[-6:]` 砍到 `[-4:]`（新 token 少）、或给 35B 用更短的 system（MoE 上证否，见 4.20，但要重测语音场景）
+1. **Barge-in** — ✅ speaking during playback stops it (see 4.6), crosstalk does not false-trigger
+2. **Always-on listening** — ✅ wake word 「小八你好」 is wired in (see 4.5), and after a turn it returns to waiting for the wake word automatically
+3. **vLLM autostart at boot** — right now it is only a **rollback backup** (both services go through Magnitude's 35B) and does not start at boot; to roll back, first `docker start vllm-qwen`. The server probes liveness every turn, so the order does not affect correctness, but it will degrade to echo first
+4. **First-chunk latency optimisation** — a good part of the 636ms is pyopenjtalk phonemisation; consider cutting the first sentence shorter
+5. **Filling in unit tests** — `test_tts_routing.py` already covers voice routing and sentence splitting, but `voice_server.py`'s Silero end-of-speech is still missing
+6. **Calibrating barge-in on real human voice** — the decision chain is currently verified with synthetic audio; the thresholds under real speaking rate/volume still need one round of tuning against actual recordings
+7. **Connecting the capture card back into the business flow** — ✅ the 1080p30 link works (see 4.7), ✅ frame grab → OCR → into the dialogue is connected (see 4.8); the next step could be region OCR (recognising only the main body of the window) to press 6 seconds under 3
+8. **Power verification for long captures** — it currently hangs off the dock (which once dropped out at 166s); before running hour-scale continuous capture it is better to plug straight into the machine's port
+9. **The 4B–9B sweet spot tier** — ✅ measured and closed: on 62s of real audio 9B loses on both first token and full text (326/1085 vs 35B's 293/693) and also repeats, and the earlier 157ms was only from short sentences (see 4.21)
+10. **Handing the hand-started dockerd over to systemd** — needs a ~3-minute window (stop dockerd → stop the container → magnitude cold start 150s, both services down). The failing restart loop has already been stopped; wait for the next machine reboot to take over naturally (see the warning in 4.19)
+11. **Pushing the voice assistant's first token down further** — after switching to 35B it is 343~627ms, 170~370ms slower than 7B. Could try: cutting `history[-6:]` to `[-4:]` (fewer new tokens), or giving 35B a shorter system (rejected on MoE, see 4.20, but needs re-measuring for the voice scenario)

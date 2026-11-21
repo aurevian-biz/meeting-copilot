@@ -1,13 +1,16 @@
 #!/bin/bash
-# 安装四个 systemd unit，并把本机相关的占位符填掉。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+# Install the four systemd units and fill in the machine-specific placeholders.
 #
 #   sudo MC_DATA=/opt/meeting-copilot/data bash deploy/install-units.sh
-#   # 或者：export MC_DATA=... 后用 sudo -E bash deploy/install-units.sh
+#   # or: export MC_DATA=... then sudo -E bash deploy/install-units.sh
 #
-# 会做三件事：
-#   1. 生成 /etc/meeting-copilot/env（权限 0640）：模型地址、API key、音频出口
-#   2. 把 unit 里的 __HOME__ / __USER__ / __UID__ / __DATA__ 换成真实值
-#   3. systemctl daemon-reload + enable（不自动 start，免得半夜把 35B 拉起来）
+# Does three things:
+#   1. Write /etc/meeting-copilot/env (mode 0640): model endpoint, API key, audio sink
+#   2. Substitute the real values for __HOME__ / __USER__ / __UID__ / __DATA__ in the units
+#   3. systemctl daemon-reload + enable (no auto start, so the 35B isn't spun up at midnight)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +23,7 @@ CONF_DIR=/etc/meeting-copilot
 
 [ "$(id -u)" -eq 0 ] || { echo "要 root：sudo bash $0"; exit 1; }
 
-# ---- 1. env 文件
+# ---- 1. env file
 mkdir -p "$CONF_DIR"
 KEY=""
 if [ -f "$MC_DATA/magnitude-data/.magnitude/config.json" ]; then
@@ -32,13 +35,13 @@ if [ -f "$CONF_DIR/env" ]; then
     echo "存在 $CONF_DIR/env，保留原值（要改请直接编辑）"
 else
     cat > "$CONF_DIR/env" <<EOF
-# meeting-copilot 运行时配置。这个文件含 LLM 的 Bearer token，别提交到 git。
+# meeting-copilot runtime config. This file holds the LLM Bearer token — do not commit it to git.
 MC_DATA=$MC_DATA
-# Magnitude 的 OpenAI 兼容端点；用 vLLM 就改成 http://127.0.0.1:8000/v1
+# Magnitude's OpenAI-compatible endpoint; switch to http://127.0.0.1:8000/v1 when using vLLM
 LLM_BASE=http://127.0.0.1:10100/inference/v1
 LLM_MODEL=hf:unsloth/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
 LLM_KEY=$KEY
-# 「听 HDMI」和本地播报往哪个 sink 送。pactl list short sinks 里挑一个
+# Which sink receives "HDMI listening" and local playback. Pick one from pactl list short sinks
 MC_SINK=$SINK
 MC_UID=$RUN_UID
 MC_GID=$RUN_GID
@@ -47,7 +50,7 @@ EOF
     chgrp "$RUN_USER" "$CONF_DIR/env" 2>/dev/null || true
 fi
 
-# ---- 2. 装 unit
+# ---- 2. install units
 GH_REPO="$(git -C "$MC_HOME" remote get-url origin 2>/dev/null | sed 's|.*github.com/||; s|\.git$||')"
 [ -n "$GH_REPO" ] || GH_REPO="your-name/meeting-copilot"
 for f in caption-bench voice-bench magnitude magnitude-dockerd; do
@@ -62,7 +65,7 @@ done
 
 install -m 0755 "$HERE/magnitude-up.sh" /usr/local/bin/magnitude-up.sh
 
-# ---- 3. 生效
+# ---- 3. activate
 systemctl daemon-reload
 systemctl enable magnitude-dockerd.service magnitude.service voice-bench.service caption-bench.service >/dev/null
 

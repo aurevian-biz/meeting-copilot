@@ -1,9 +1,12 @@
-"""打断判定链的端到端验证：真 VAD + 真 ASR + 真 TTS。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-只有 hub 和 LLM 是替身：hub 用合成语音喂帧，代替麦克风；LLM 计数代替真实生成。
-这样不用人对着麦克风喊，也能验证「串音不打断、真人插话打断、静默无反应」。
+"""End-to-end check of the barge-in decision chain: real VAD + real ASR + real TTS.
 
-在 Jetson 上跑（需要部署目录里的 voice_server 和模型）：
+Only hub and LLM are stubbed: hub feeds frames from synthesised speech instead of the microphone; the LLM counts instead of really generating.
+That way no one has to shout into a mic to verify "bleed-through does not barge in, a real interjection does, silence gets no reaction".
+
+Run on the Jetson (needs voice_server and the models from the deployment directory):
     /opt/meeting-copilot/data/asr-venv/bin/python tools/barge_e2e.py
 """
 
@@ -89,7 +92,7 @@ def main():
         if not cond:
             fails.append(name)
 
-    # 1) 外放：麦克风听到的就是助理自己的声音，绝不能打断
+    # 1) Speaker output: the mic hears the assistant's own voice, must never barge in
     speak.begin("t1")
     speak.add(8.0, LINE)
     hub.feed(tts16k(LINE))
@@ -97,7 +100,7 @@ def main():
     check("外放串音", mon.hits == 0 and mon.echo_drops > 0 and not speak.cancelled,
           f"hits={mon.hits} echo={mon.echo_drops} cancelled={speak.cancelled}")
 
-    # 2) 真人插话：打断 + 起新一轮
+    # 2) Real interjection: barge in + start a new round
     h0 = mon.hits
     speak.begin("t2")
     speak.add(8.0, LINE)
@@ -107,7 +110,7 @@ def main():
     check("真插话", mon.hits == h0 + 1 and speak.cancelled and len(evs) == 1,
           f"hits={mon.hits} cancelled={speak.cancelled} 事件={len(evs)} llm={runner.calls}")
 
-    # 3) 静默：不该有任何反应
+    # 3) Silence: there should be no reaction at all
     h1, e1 = mon.hits, mon.echo_drops
     speak.begin("t3")
     speak.add(8.0, LINE)
@@ -116,7 +119,7 @@ def main():
     check("静默", mon.hits == h1 and mon.echo_drops == e1,
           f"hits={mon.hits} echo={mon.echo_drops}")
 
-    # 4) 已经播完：不再判定（播报时钟归零）
+    # 4) Playback finished: no more decisions (the playback clock is back to zero)
     speak.begin("t4")
     speak.add(0.1, LINE)
     time.sleep(0.3)

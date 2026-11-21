@@ -1,40 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""trt_rec.py — 把 OCR 的 rec 后端换成 TensorRT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-## 为什么需要它
+"""trt_rec.py — swap OCR's rec backend for TensorRT
 
-这台 Jetson 是 JetPack 7.2（L4T r39.2.1）+ CUDA **13.2**，而 onnxruntime 官方只发
-**cu12** 轮子。`pip` 上没有 cu13 包，`apt` 里也没有 `cuda-cudart-12-*`，所以
-`onnxruntime-gpu` 虽然能装、`get_available_providers()` 也会列出 CUDAExecutionProvider，
-但建 session 时会报 `No registered plugin EP device found`——EP 的 .so dlopen 失败。
-结论：**CUDA EP 这条路在这套系统上是死的**，别在这上面浪费时间。
+## Why this exists
 
-TensorRT 10.16 倒是随系统就有（`libnvinfer.so.10` + `trtexec` + python `tensorrt`），
-所以直接绕过 onnxruntime，用 TRT 跑 rec。
+This Jetson is JetPack 7.2 (L4T r39.2.1) + CUDA **13.2**, while onnxruntime officially ships only
+**cu12** wheels. `pip` has no cu13 package and `apt` has no `cuda-cudart-12-*`, so although
+`onnxruntime-gpu` installs and `get_available_providers()` lists CUDAExecutionProvider, building a
+session fails with `No registered plugin EP device found` — the EP's .so fails to dlopen.
+Conclusion: **the CUDA EP path is dead on this system**; do not waste time on it.
 
-## 效果（真机 132 行画面）
+TensorRT 10.16 does ship with the system (`libnvinfer.so.10` + `trtexec` + python `tensorrt`),
+so bypass onnxruntime entirely and run rec on TRT.
 
-| 后端 | rec 耗时 | OCR 合计 | 行数 | 均分 |
+## Results (132-line screen, real hardware)
+
+| Backend | rec time | OCR total | Lines | Mean score |
 |---|---|---|---|---|
 | CPU (onnxruntime) | 3.4s | 4.10s | 132 | 0.951 |
 | **TensorRT FP16** | — | **1.69s** | 132 | 0.949 |
 
-## 为什么只换 rec，不换 det/cls
+## Why only rec, not det/cls
 
-rec 占 OCR 的 88%，换它性价比最高。det（0.30s）和 cls（0.15s）以后再说，
-而且 det 的输入尺寸随画面变化，profile 更难定。
+rec is 88% of OCR, so swapping it has the best payoff. det (0.30s) and cls (0.15s) can wait,
+and det's input size varies with the picture, which makes the profile harder to pin down.
 
-## 为什么会有 CPU 回退
+## Why there is a CPU fallback
 
-rec 的批输入宽度 = 48 × 批内最大宽高比。屏幕上偶尔有一行特别长（路径、URL、
-一整段代码），会把整批撑到 1600+ 宽。实测 75 批里：**76% 就是基准 320**，
-超 1536 的只占 4%。与其为大到 3000+ 的极值重建 engine 拖慢常见路径，
-不如让超限的那几批退回 CPU——4% 的批走慢路，比 100% 的批用差 kernel 划算。
+rec's batch input width = 48 × the largest aspect ratio in the batch. Screens occasionally hold one very
+long line (a path, a URL, a whole block of code) that stretches the whole batch to 1600+ wide. Over 75
+measured batches, **76% are exactly the 320 baseline** and only 4% exceed 1536. Rather than rebuild the
+engine for 3000+ outliers and slow the common path, 4% of batches on the slow path beats 100% on a worse kernel.
 
-## engine 是跟 TensorRT 版本绑死的
+## The engine is pinned to the TensorRT version
 
-换 JetPack / 升级 TRT 后必须重建，重建命令见 README 4.8。
+Rebuild it after switching JetPack / upgrading TRT; the rebuild command is in README 4.8.
 """
 
 from __future__ import annotations
@@ -46,11 +49,11 @@ import numpy as np
 
 
 class TrtRecSession:
-    """把 TRT engine 伪装成 RapidOCR 的 OrtInferSession。
+    """Disguise a TRT engine as RapidOCR's OrtInferSession.
 
-    `TextRecognizer` 只用到 session 的三件事：
-      `__call__(batch) -> [logits]`、`have_key()`、`get_character_list()`。
-    后两个（读字符表）委托给原 ORT session，这里只接管前向。
+    `TextRecognizer` uses only three things from the session:
+      `__call__(batch) -> [logits]`, `have_key()`, `get_character_list()`.
+    The latter two (reading the character list) delegate to the original ORT session; only the forward pass is taken over.
     """
 
     def __init__(self, engine_path: str | Path, inner=None, verbose: bool = False):
@@ -86,19 +89,19 @@ class TrtRecSession:
         self.stream = stream
         self._mem: dict[tuple, tuple] = {}    # (in_shape,out_shape) -> (d_in,d_out,bytes_in,bytes_out)
 
-        # 统计：GPU 走了多少批、回退多少批、每次前向花了多久
+        # Stats: how many batches ran on GPU, how many fell back, how long each forward pass took
         self.calls = 0
         self.fallbacks = 0
         self.total_ms = 0.0
 
-    # ---------------------------------------------------------------- 工具
+    # ---------------------------------------------------------------- Helpers
     @staticmethod
     def _check(err, what: str):
         if int(err) != 0:
             raise RuntimeError(f"{what} 失败：{err}")
 
     def _buffers(self, in_shape, out_shape):
-        """按形状缓存显存。统一内存上每次 malloc 都不便宜，而这里是每批都调。"""
+        """Cache device memory by shape. Every malloc on unified memory costs, and this runs per batch."""
         key = (in_shape, out_shape)
         hit = self._mem.get(key)
         if hit is None:
@@ -113,14 +116,14 @@ class TrtRecSession:
             self._mem[key] = hit
         return hit
 
-    # ---------------------------------------------------------------- 前向
+    # ---------------------------------------------------------------- Forward
     def __call__(self, x: np.ndarray):
         t0 = time.perf_counter()
         x = np.ascontiguousarray(x, dtype=np.float32)
         shape = tuple(int(v) for v in x.shape)
 
         if not self.ctx.set_input_shape(self.in_name, shape):
-            # 超出 optimization profile：这一批退回 CPU，不影响正确性
+            # Outside the optimization profile: this batch falls back to CPU, correctness unaffected
             if self._inner is None:
                 raise RuntimeError(f"输入形状 {shape} 超出 profile，且没有 CPU 回退")
             self.fallbacks += 1
@@ -130,7 +133,7 @@ class TrtRecSession:
         d_in, d_out, n_in, n_out = self._buffers(shape, out_shape)
         rt = self._rt
 
-        # 注意：set_tensor_address 返回 bool，不是 cudaError_t
+        # Note: set_tensor_address returns bool, not cudaError_t
         if not self.ctx.set_tensor_address(self.in_name, int(d_in)):
             raise RuntimeError("set_tensor_address(in) 失败")
         if not self.ctx.set_tensor_address(self.out_name, int(d_out)):
@@ -152,14 +155,14 @@ class TrtRecSession:
         self.total_ms += (time.perf_counter() - t0) * 1000
         return [host]
 
-    # ------------------------------------------------ 委托给原 ORT session
+    # ------------------------------------------------ Delegated to the original ORT session
     def have_key(self):
         return bool(self._inner and self._inner.have_key())
 
     def get_character_list(self):
         return self._inner.get_character_list() if self._inner else None
 
-    # ---------------------------------------------------------------- 其他
+    # ---------------------------------------------------------------- Misc
     def status(self) -> dict:
         n = self.calls + self.fallbacks
         return {
@@ -183,7 +186,7 @@ class TrtRecSession:
 
 
 def attach(ocr_engine, engine_path: str | Path) -> TrtRecSession:
-    """把 TensorRT 挂到已经建好的 RapidOCR 实例上（原地替换 rec 的 session）。"""
+    """Attach TensorRT to an already-built RapidOCR instance (replaces rec's session in place)."""
     sess = TrtRecSession(engine_path, inner=ocr_engine.text_rec.session)
     ocr_engine.text_rec.session = sess
     return sess

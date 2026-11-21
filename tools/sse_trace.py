@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""抓一段 /api/events 的推送节奏：每个事件什么时候到、内容多长。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-用来回答「字幕到底是不是流式」这个体感问题：
-- 事件间隔 80ms 左右 → 译文在逐字流出，流式生效
-- 事件间隔 1s 级、每次一整句 → 前端没走推送，或根本没流式
+"""Capture the push rhythm of /api/events for a while: when each event lands and how long its content is.
+
+Meant to answer the hands-on question of whether captions really stream:
+- event gap around 80ms -> the translation drips out token by token, streaming works
+- event gap in the 1s range with one whole sentence per event -> the frontend is not on the push path, or there is no streaming at all
 """
 from __future__ import annotations
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""voice_probe 的单元测试。不依赖麦克风、faster-whisper、scipy。"""
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+"""Unit tests for voice_probe. No microphone, faster-whisper or scipy required."""
 from __future__ import annotations
 
 import math
@@ -24,7 +27,7 @@ def gain_db(x: np.ndarray, y: np.ndarray) -> float:
     return vp.db_of(y) - vp.db_of(x)
 
 
-# ---------------------------------------------------------------- 滤波
+# ---------------------------------------------------------------- filtering
 class TestHighpass(unittest.TestCase):
     def test_rejects_bad_cutoff(self):
         with self.assertRaises(ValueError):
@@ -34,15 +37,15 @@ class TestHighpass(unittest.TestCase):
 
     def test_coeffs_normalized(self):
         b, a = vp.biquad_highpass(150, SR)
-        # 高通在 Nyquist 处增益为 1：系数和为 0 意味着直流被完全挡住
+        # a highpass has unity gain at Nyquist: a coefficient sum of 0 means DC is fully blocked
         self.assertAlmostEqual(float(b.sum()), 0.0, places=6)
         self.assertAlmostEqual(float(a[0]), 1.0, places=9)
 
     def test_kills_50_60hz_hum(self):
-        """实测本机最强噪声点就是 60Hz + 120Hz，这条是核心保护。"""
+        """Measured on this machine, the worst noise peaks are 60Hz + 120Hz; this is the core protection."""
         x = tone(60, 3000)
         y = vp.highpass(x, 150, SR, stages=2)
-        # 4 阶在 60Hz 处理论约 -31dB
+        # a 4th-order filter is theoretically about -31dB at 60Hz
         self.assertLess(gain_db(x, y), -24.0, "60Hz 应被压 24dB 以上")
 
     def test_passes_speech_band(self):
@@ -58,7 +61,7 @@ class TestHighpass(unittest.TestCase):
 
     def test_no_cutoff_returns_input(self):
         x = tone(1000, 3000, 0.1)
-        # stages<1 会被钳成 1 节，但 main 里 hp<=0 是直接不调用，这里验证钳位不报错
+        # stages<1 is clamped to 1 stage, but main skips the call when hp<=0; this checks the clamp does not error
         y = vp.highpass(x, 150, SR, stages=0)
         self.assertEqual(y.shape, x.shape)
 
@@ -67,7 +70,7 @@ class TestHighpass(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(y)))
 
 
-# ---------------------------------------------------------------- 电平
+# ---------------------------------------------------------------- level
 class TestFrameDb(unittest.TestCase):
     def test_sine_rms_matches_theory(self):
         amp = 3000.0
@@ -83,7 +86,7 @@ class TestFrameDb(unittest.TestCase):
         self.assertEqual(vp.frame_db(np.zeros(10), SR).size, 0)
 
     def test_frame_count(self):
-        # 1s、frame20ms、hop10ms → 1 + (16000-320)/160 = 99
+        # 1s, 20ms frames, 10ms hop → 1 + (16000-320)/160 = 99
         f = vp.frame_db(np.zeros(SR), SR)
         self.assertEqual(f.size, 99)
 
@@ -103,11 +106,11 @@ class TestNoiseFloor(unittest.TestCase):
         self.assertAlmostEqual(vp.vad_threshold(-50, 6), -44.0)
 
     def test_threshold_has_floor(self):
-        # 全静音时本底 -120，门限不能跟着掉到 -114，要兜到 -60
+        # in total silence the floor is -120; the threshold must not follow it down to -114, it has to fall back to -60
         self.assertAlmostEqual(vp.vad_threshold(-120, 6), -60.0)
 
 
-# ---------------------------------------------------------------- 切分
+# ---------------------------------------------------------------- segmentation
 def frames_from(levels: list[float]) -> np.ndarray:
     return np.array(levels, dtype=float)
 
@@ -120,7 +123,7 @@ class TestSegmentSpeech(unittest.TestCase):
         self.assertEqual(vp.segment_speech(np.full(200, -60.0), -40), [])
 
     def test_single_utterance(self):
-        # 10ms/帧，50 帧 = 0.5s 语音
+        # 10ms per frame, 50 frames = 0.5s of speech
         f = frames_from([-60.0] * 20 + [-20.0] * 50 + [-60.0] * 20)
         segs = vp.segment_speech(f, -40)
         self.assertEqual(len(segs), 1)
@@ -128,19 +131,19 @@ class TestSegmentSpeech(unittest.TestCase):
         self.assertAlmostEqual(segs[0].duration, 0.50, places=3)
 
     def test_word_gap_is_bridged(self):
-        """词间停顿短于 min_gap 不能断句，否则一句话被切成碎片。"""
+        """An inter-word pause shorter than min_gap must not cause segmentation, or one sentence shatters into pieces."""
         f = frames_from([-20.0] * 30 + [-60.0] * 20 + [-20.0] * 30)
         segs = vp.segment_speech(f, -40, min_gap_s=0.40)
         self.assertEqual(len(segs), 1)
 
     def test_long_gap_splits(self):
-        # 中间静音 100 帧 = 1.0s > 0.4s
+        # 100 silent frames in the middle = 1.0s > 0.4s
         f = frames_from([-20.0] * 30 + [-60.0] * 100 + [-20.0] * 30)
         segs = vp.segment_speech(f, -40, min_gap_s=0.40)
         self.assertEqual(len(segs), 2)
 
     def test_short_blip_dropped(self):
-        """20 帧 = 0.2s 的响声（敲桌子）应被丢弃。"""
+        """A 20-frame = 0.2s burst (knocking on the desk) must be dropped."""
         f = frames_from([-60.0] * 10 + [-20.0] * 20 + [-60.0] * 10)
         self.assertEqual(vp.segment_speech(f, -40, min_speech_s=0.30), [])
 
@@ -163,7 +166,7 @@ class TestSegmentSpeech(unittest.TestCase):
         self.assertLess(segs[1].end, segs[2].start)
 
     def test_reported_noise_floor_case(self):
-        """复现本机实测：本底 -30.8，语音 -21，门限 -24.8 时能否切出来。"""
+        """Reproduces a local measurement: floor -30.8, speech -21, threshold -24.8 — can a segment still be cut?"""
         f = frames_from([-30.8] * 30 + [-21.0] * 50 + [-30.8] * 30)
         thr = vp.vad_threshold(vp.noise_floor(f), 6.0)
         segs = vp.segment_speech(f, thr)
@@ -171,7 +174,7 @@ class TestSegmentSpeech(unittest.TestCase):
 
 
 class TestPeakMargin(unittest.TestCase):
-    """增益下调后实测出现的误触发：0.41s、峰值 -41.5、本底 -56.6。"""
+    """A false trigger measured after the gain was lowered: 0.41s, peak -41.5, floor -56.6."""
 
     FLOOR = -56.6
     BLIP = [-56.6] * 20 + [-41.5] * 41 + [-56.6] * 20
@@ -190,13 +193,13 @@ class TestPeakMargin(unittest.TestCase):
         self.assertEqual(len(segs), 1)
 
     def test_without_floor_no_peak_filter(self):
-        """不传本底时保持旧行为，避免破坏已有调用。"""
+        """With no floor passed, keep the old behavior so existing callers are not broken."""
         thr = vp.vad_threshold(self.FLOOR, 6.0)
         segs = vp.segment_speech(frames_from(self.BLIP), thr, floor_db=None)
         self.assertEqual(len(segs), 1)
 
     def test_margin_boundary(self):
-        # 余量恰好 18dB 时应保留（判据是 < margin 才丢）
+        # a margin of exactly 18dB must be kept (only < margin is dropped)
         f = [-56.6] * 20 + [-38.6] * 41 + [-56.6] * 20
         thr = vp.vad_threshold(self.FLOOR, 6.0)
         segs = vp.segment_speech(frames_from(f), thr,
@@ -204,7 +207,7 @@ class TestPeakMargin(unittest.TestCase):
         self.assertEqual(len(segs), 1)
 
 
-# ---------------------------------------------------------------- 音频 IO
+# ---------------------------------------------------------------- audio IO
 class TestReadWav(unittest.TestCase):
     def _write(self, data: np.ndarray, sr: int = SR, ch: int = 1) -> Path:
         p = Path(tempfile.mkdtemp()) / "t.wav"

@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""测前缀缓存到底有没有生效：同一个固定 system prompt 连发 N 次，看首字。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-判据（同一个模型、同一个 prompt）：
-  · 命中缓存 → 第 2 发起首字明显下降，落在一个「每 token 解码时间」量级
-  · 没命中   → 每次都差不多，等于每句都重新 prefill 那几百 token
+"""Check whether the prefix cache actually works: send the same fixed system prompt N times in a row and watch the first token.
 
-实测参考：vLLM + 7B 从 533ms 掉到 94ms；vLLM + 35B-A3B 因为 mamba page
-把复用粒度顶到 1056 token，命中率恒为 0%，首字一直 400ms。
+Criteria (same model, same prompt):
+  · cache hit -> from request 2 on the first token drops markedly, landing around one "decode time per token"
+  · no hit    -> every request looks alike, i.e. those few hundred tokens are re-prefilled for every sentence
 
-两个模式：
-  warm  前缀完全相同的连续请求（线上真实形态：同一份 system prompt）
-  cold  每次在 system prompt 末尾加一个随机串，强制不命中，量「纯 prefill 成本」
+Measured reference: vLLM + 7B drops from 533ms to 94ms; vLLM + 35B-A3B has a reuse granularity of 1056 tokens
+because of the mamba page, so the hit rate stays at 0% and the first token sits at 400ms.
 
-用法：
-    ./asr-venv/bin/python tools/cache_probe.py                        # 默认 vLLM 8000
+Two modes:
+  warm  consecutive requests with a strictly identical prefix (the real production shape: one and the same system prompt)
+  cold  append a random string to the end of the system prompt each time, forcing a miss, to measure "pure prefill cost"
+
+Usage:
+    ./asr-venv/bin/python tools/cache_probe.py                        # vLLM 8000 by default
     ./asr-venv/bin/python tools/cache_probe.py --mode cold
     ./asr-venv/bin/python tools/cache_probe.py \
         --base http://127.0.0.1:10100/inference/v1 --model <id> \
@@ -95,7 +98,7 @@ def main() -> int:
         print(f"\n-- {mode} --")
         ttfts: list[int] = []
         for i in range(1, args.n + 1):
-            # cold：每次在末尾塞随机串，前缀必然不命中
+            # cold: append a random string at the end each time so the prefix never hits
             prompt = sysp if mode == "warm" else f"{sysp}\n[{uuid.uuid4().hex}]"
             ttft, total, out, tim = one(args.base, args.model, args.key, prompt,
                                         args.text, args.target, args.max_tokens)
@@ -105,7 +108,7 @@ def main() -> int:
             print(f"  第{i}发  ttft={ttft:4d}ms  total={total:5d}ms  "
                   f"cache={cn}/{pn}  {out[:40]}")
         if ttfts:
-            # 第 1 发常含建图/加载，中位数去掉它更接近稳态
+            # request 1 usually includes graph build/loading; dropping it gets the median closer to steady state
             body = ttfts[1:] or ttfts
             med[mode] = int(statistics.median(body))
             print(f"  首字中位（跳过第1发）={med[mode]}ms")

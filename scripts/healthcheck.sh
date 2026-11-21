@@ -1,5 +1,8 @@
 #!/bin/bash
-# 一条命令看清「现在这套东西活没活」。排查时先跑它，别先翻日志。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+# One command to see whether the whole stack is alive. Run this first when debugging, before digging through logs.
 set -uo pipefail
 
 MC_DATA="${MC_DATA:-/opt/meeting-copilot/data}"

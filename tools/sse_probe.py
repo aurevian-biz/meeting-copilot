@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""诊断 SGLang 的流式行为：非流式有没有内容、SSE 读完后连接会不会关。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-字幕用的是 `for raw in r:` 迭代，如果服务端发完 [DONE] 不结束 HTTP body，
-每个请求都会卡到 timeout，线上表现是「译文一直是空的」。这个脚本把时间点打出来。
+"""Diagnose SGLang streaming behaviour: whether the non-streaming path returns content, and whether the connection closes once SSE is drained.
+
+Captions iterate with `for raw in r:`; if the server sends [DONE] but never ends the HTTP body,
+every request hangs until timeout, which in production shows up as "the translation is always empty". This script prints the timings.
 """
 from __future__ import annotations
 

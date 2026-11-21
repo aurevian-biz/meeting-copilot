@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""按真实助理的 prompt 形态，扫一遍首字延迟（TTFT）。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-与 llm_probe.py 的区别：那个用固定人设，回答「这个模型能不能用」；
-这个直接用 voice_server 里真实的 system prompt，按四种真实上下文扫，
-回答「在什么情况下首字会变慢、会不会越过 300ms」。
+"""Sweep first token latency (TTFT) across the prompt shapes a real assistant sees.
 
-四种场景：
-  short   system + 1 句用户（≈日常一问一答）
-  hist6   system + 6 轮历史（voice_server 取 history[-6:]）
-  screen  system + 2000 字 OCR 文本（看屏幕）
-  screen4k system + 4000 字 OCR 文本（长文档 / 小字密排）
+How it differs from llm_probe.py: that one uses a fixed persona and answers "can this model be used at all";
+this one feeds voice_server's real system prompt and sweeps four realistic contexts,
+answering "under what conditions does the first token get slower, and does it cross 300ms".
 
-每档跑两种：
-  warm  同一 prompt 重复，前缀命中（日常多轮真实形态）
-  cold  prompt 最前面加唯一 nonce，逼它整段重算（最坏情况）
+Four scenarios:
+  short   system + 1 user sentence (about the everyday one-question exchange)
+  hist6   system + 6 turns of history (voice_server takes history[-6:])
+  screen  system + 2000 chars of OCR text (reading the screen)
+  screen4k system + 4000 chars of OCR text (long document / dense small print)
 
-用法：
+Each runs two ways:
+  warm  repeat the same prompt, prefix hits (the real shape of day-to-day multi-turn)
+  cold  prepend a unique nonce to the prompt, forcing a full recompute (worst case)
+
+Usage:
   python tools/ttft_scenarios.py --base http://127.0.0.1:8000/v1 --model qwen
 """
 from __future__ import annotations
@@ -29,7 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from llm_probe import post_stream  # noqa: E402  复用同一套流式测量
+from llm_probe import post_stream  # noqa: E402  reuse the same streaming measurement
 
 OCR_SAMPLE = (
     "会議資料 2026年度 第3四半期 進捗報告 議題 1 開発状況 2 品質指標 3 リスクと対策 "
@@ -39,7 +42,7 @@ OCR_SAMPLE = (
 
 
 def real_system() -> str:
-    """从 voice_server 取真实的 system prompt，避免两处文案走偏。"""
+    """Fetch the real system prompt from voice_server so the two copies of the text cannot drift apart."""
     from voice_server import Llm
 
     return Llm("http://127.0.0.1:8000/v1", "qwen").system
@@ -94,7 +97,7 @@ def main() -> int:
     for scene in scenes:
         msgs = build(scene, system)
         try:
-            run(args.base, args.model, msgs, cold=True)  # 预热，不计
+            run(args.base, args.model, msgs, cold=True)  # warm-up, not counted
         except Exception as e:  # noqa: BLE001
             print(f"{scene} 预热失败：{e}", file=sys.stderr)
             continue

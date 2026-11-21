@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""voice_probe.py —— USB 麦克风录音 + 高通 + 能量 VAD + 日文 ASR 的诊断工具。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-设计目标：在没有麦克风、没有 faster-whisper 的机器上也能跑单测。
-所有纯逻辑（滤波、分帧、噪声估计、切分）都是无依赖的 numpy 函数，
-录音与转写都放在 main 里，且延迟导入。
+"""voice_probe.py — diagnostics for USB mic capture + high-pass + energy VAD + Japanese ASR.
 
-为什么需要高通：
-    实测这台机器的 H340 耳机麦克风本底 -30.6 dBFS，频谱最强点 60Hz + 120Hz 谐波，
-    0-80Hz 占 38.4% 能量 —— 是工频/地环路哼声，不是房间噪声。
-    加 150Hz 高通后本底降到 -51.7 dBFS，信噪比从 9.8dB 提到 18dB 以上。
-    语音主区在 300Hz-3kHz，切掉 150Hz 以下对 ASR 无损。
+Design goal: unit tests must run on a machine with no mic and no faster-whisper.
+All pure logic (filtering, framing, noise estimation, segmentation) is dependency-free numpy,
+while recording and transcription live in main and are imported lazily.
 
-用法：
-    # 处理已有 wav（不需要麦克风）
+Why a high-pass is needed:
+    Measured on this machine: the H340 headset mic has a noise floor of -30.6 dBFS, its strongest
+    spectral peaks at 60Hz + 120Hz harmonics, and 0-80Hz holds 38.4% of the energy — that is
+    mains/ground-loop hum, not room noise. With a 150Hz high-pass the floor falls to -51.7 dBFS
+    and SNR rises from 9.8dB to above 18dB. Speech sits at 300Hz-3kHz, so cutting below 150Hz is lossless for ASR.
+
+Usage:
+    # process an existing wav (no mic needed)
     python voice_probe.py --wav a.wav --no-asr
 
-    # 从麦克风录 8 秒并转写
+    # record 8 seconds from the mic and transcribe
     python voice_probe.py --seconds 8
 
-    # 连续录 30 秒，边录边切分
+    # record 30 seconds continuously, segmenting as it goes
     python voice_probe.py --seconds 30 --asr
 """
 from __future__ import annotations
@@ -40,7 +43,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paths  # noqa: E402
 
-# ---------------------------------------------------------------- 常量
+# ---------------------------------------------------------------- Constants
 DEFAULT_DEVICE = "plughw:CARD=H340,DEV=0"
 DEFAULT_RATE = 16000
 FRAME_MS = 20
@@ -48,9 +51,9 @@ HOP_MS = 10
 FULL_SCALE = 32768.0
 
 
-# ---------------------------------------------------------------- 滤波
+# ---------------------------------------------------------------- Filtering
 def biquad_highpass(fc: float, sr: int, q: float = 0.70710678) -> tuple[np.ndarray, np.ndarray]:
-    """RBJ cookbook 二阶高通系数（已按 a0 归一化）。纯数学，不依赖 scipy。"""
+    """RBJ cookbook 2nd-order high-pass coefficients (already normalised by a0). Pure math, no scipy."""
     if not 0 < fc < sr / 2:
         raise ValueError(f"截止频率必须落在 (0, {sr / 2}) 内，收到 {fc}")
     w0 = 2.0 * math.pi * fc / sr
@@ -62,7 +65,7 @@ def biquad_highpass(fc: float, sr: int, q: float = 0.70710678) -> tuple[np.ndarr
 
 
 def apply_biquad(x: np.ndarray, b: np.ndarray, a: np.ndarray) -> np.ndarray:
-    """直接 II 型转置结构的差分方程。样本量小（几十万），纯 Python 循环够快。"""
+    """Transposed direct form II difference equation. Sample counts are small (hundreds of thousands), a plain loop is fast enough."""
     x = np.asarray(x, dtype=np.float64)
     y = np.empty_like(x)
     x1 = x2 = y1 = y2 = 0.0
@@ -78,7 +81,7 @@ def apply_biquad(x: np.ndarray, b: np.ndarray, a: np.ndarray) -> np.ndarray:
 
 
 def highpass(x: np.ndarray, fc: float, sr: int, stages: int = 2) -> np.ndarray:
-    """级联多节高通。两节（4 阶）在 60Hz 处约 -31dB，足以压掉工频哼声。"""
+    """Cascaded multi-stage high-pass. Two stages (4th order) give about -31dB at 60Hz, enough to suppress mains hum."""
     y = np.asarray(x, dtype=np.float64)
     for _ in range(max(1, stages)):
         b, a = biquad_highpass(fc, sr)
@@ -86,9 +89,9 @@ def highpass(x: np.ndarray, fc: float, sr: int, stages: int = 2) -> np.ndarray:
     return y
 
 
-# ---------------------------------------------------------------- 分帧与电平
+# ---------------------------------------------------------------- Framing and level
 def frame_db(x: np.ndarray, sr: int, frame_ms: int = FRAME_MS, hop_ms: int = HOP_MS) -> np.ndarray:
-    """逐帧 RMS，单位 dBFS。返回 (帧数,)。"""
+    """Per-frame RMS in dBFS. Returns (frame count,)."""
     fl = max(1, int(sr * frame_ms / 1000))
     hop = max(1, int(sr * hop_ms / 1000))
     if x.shape[0] < fl:
@@ -109,18 +112,18 @@ def db_of(x: np.ndarray) -> float:
 
 
 def noise_floor(frames_db: np.ndarray, pct: float = 10.0) -> float:
-    """用低分位数当本底。均值会被语音段拉高，分位数不会。"""
+    """Use a low percentile as the noise floor. The mean gets pulled up by speech; a percentile does not."""
     if frames_db.size == 0:
         return -999.0
     return float(np.percentile(frames_db, pct))
 
 
 def vad_threshold(floor_db: float, margin_db: float = 6.0, hard_min: float = -60.0) -> float:
-    """门限 = 本底 + 余量，但不低于 hard_min（防止全静音时门限过低）。"""
+    """Threshold = noise floor + margin, but never below hard_min (prevents too low a threshold in total silence)."""
     return max(floor_db + margin_db, hard_min)
 
 
-# ---------------------------------------------------------------- 语音切分
+# ---------------------------------------------------------------- Speech segmentation
 @dataclass
 class Segment:
     start: float
@@ -141,16 +144,16 @@ def segment_speech(
     floor_db: float | None = None,
     min_peak_margin_db: float = 18.0,
 ) -> list[Segment]:
-    """带迟滞的语音段切分。
+    """Speech segmentation with hysteresis.
 
-    三条判据分工不同，缺一条就会错：
-      min_gap_s        —— 段内允许的静音（词间停顿），短于此不算断句
-      min_speech_s     —— 段的净语音长度下限，短于此当噪声丢弃
-      min_peak_margin  —— 段峰值必须高出本底足够多，挡掉「门限附近的小瞬态」
+    Three criteria do different jobs; drop any one and it goes wrong:
+      min_gap_s        — silence allowed inside a segment (pauses between words); shorter does not split
+      min_speech_s     — lower bound on the net speech length of a segment; shorter is discarded as noise
+      min_peak_margin  — segment peak must clear the floor by enough, blocking "small transients near the threshold"
 
-    第三条是实测逼出来的：采集增益从满刻度调到 0dB 后，本底降了 8dB，
-    原本够不着的门限附近冒出一段 0.41s、峰值仅 -41.5dB 的误触发。
-    纯能量门限只要增益一变就会失准，所以必须再加一道「相对本底的峰值余量」。
+    The third gate came out of measurement: after the capture gain went from full scale to 0dB the floor
+    dropped 8dB, and a 0.41s false trigger with a peak of only -41.5dB appeared near the previously
+    unreachable threshold. A pure energy threshold drifts with gain, so an extra "peak margin over the floor" gate is needed.
     """
     if frames_db.size == 0:
         return []
@@ -175,7 +178,7 @@ def segment_speech(
             if start_idx is None:
                 start_idx = i
             elif last_voiced_idx is not None and i - last_voiced_idx > gap_frames:
-                # 间隔超限：封口前一段，另起新段
+                # gap over limit: close the previous segment and start a new one
                 close(start_idx, last_voiced_idx)
                 start_idx = i
             last_voiced_idx = i
@@ -191,7 +194,7 @@ def segment_speech(
 
 def _make_seg(frames_db: np.ndarray, i0: int, i1: int, hop: float,
               min_speech_s: float, threshold_db: float) -> Segment | None:
-    """把帧区间还原成时间，并按阈值以上帧数反推净语音长度做过滤。"""
+    """Turn a frame range back into time, and derive net speech length from frames above the threshold, for filtering."""
     net = float(np.count_nonzero(frames_db[i0:i1 + 1] >= threshold_db)) * hop
     if net < min_speech_s:
         return None
@@ -199,9 +202,9 @@ def _make_seg(frames_db: np.ndarray, i0: int, i1: int, hop: float,
     return Segment(start=round(i0 * hop, 3), end=round((i1 + 1) * hop, 3), peak_db=round(peak, 1))
 
 
-# ---------------------------------------------------------------- 音频 IO
+# ---------------------------------------------------------------- Audio IO
 def read_wav(path: str | Path) -> tuple[np.ndarray, int]:
-    """读 16bit PCM wav，返回 float64 单声道数组与采样率。"""
+    """Read 16-bit PCM wav; returns a float64 mono array and the sample rate."""
     with wave.open(str(path), "rb") as w:
         if w.getsampwidth() != 2:
             raise ValueError(f"只支持 16bit PCM，收到 {w.getsampwidth() * 8}bit")
@@ -213,7 +216,7 @@ def read_wav(path: str | Path) -> tuple[np.ndarray, int]:
 
 
 def record(device: str, seconds: float, sr: int = DEFAULT_RATE) -> np.ndarray:
-    """用 arecord 采集。不走 sounddevice/portaudio —— Jetson 上少一个依赖少一个坑。"""
+    """Capture with arecord. No sounddevice/portaudio — one dependency fewer, one trap fewer on Jetson."""
     if shutil.which("arecord") is None:
         raise RuntimeError("找不到 arecord（apt install alsa-utils）")
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -228,19 +231,19 @@ def record(device: str, seconds: float, sr: int = DEFAULT_RATE) -> np.ndarray:
         tmp.unlink(missing_ok=True)
 
 
-# ---------------------------------------------------------------- 转写
+# ---------------------------------------------------------------- Transcription
 def transcribe_segments(segments: list[Segment], audio: np.ndarray, sr: int,
                         model_name: str = "large-v3-turbo", language: str = "ja",
                         model_dir: str = str(paths.ASR_DIR),
                         cpu_threads: int = 0) -> list[dict]:
-    """逐段转写。模型延迟加载 —— 单测环境没有 faster-whisper 也能 import 本模块。
+    """Transcribe segment by segment. The model loads lazily — this module imports without faster-whisper.
 
-    language="auto" 时交给模型自动判断。强制指定语言是双刃剑：
-    对付已知语言更准，但内容与语言不匹配时 Whisper 会退化成幻觉
-    （典型产物就是「ご視聴ありがとうございました」）。
+    With language="auto" the model decides for itself. Forcing a language is double-edged:
+    more accurate for a known language, but when the content does not match it, Whisper degrades into
+    hallucination (the classic output being 「ご視聴ありがとうございました」).
 
-    cpu_threads=0 表示交给 ctranslate2 默认值（实测只有 4 线程，
-    Orin 有 12 核，手动拉满能带来接近线性的加速）。
+    cpu_threads=0 hands over to the ctranslate2 default (measured at only 4 threads,
+    while Orin has 12 cores; maxing it out gives near-linear speedup).
     """
     from faster_whisper import WhisperModel
 
@@ -264,8 +267,8 @@ def transcribe_segments(segments: list[Segment], audio: np.ndarray, sr: int,
         )
         segs = list(segs)
         text = "".join(s.text for s in segs).strip()
-        # 幻觉判据：whisper 在非语音上会输出固定句式（「ご視聴ありがとうございました」），
-        # 这类结果的共同特征是 no_speech_prob 高而 avg_logprob 低，用它做闸门比黑名单可靠。
+        # Hallucination cue: on non-speech Whisper emits fixed phrasing (「ご視聴ありがとうございました」),
+        # and such results share high no_speech_prob with low avg_logprob — a more reliable gate than a blocklist.
         no_speech = max((getattr(s, "no_speech_prob", 0.0) for s in segs), default=0.0)
         logprob = (sum(getattr(s, "avg_logprob", 0.0) for s in segs) / len(segs)) if segs else 0.0
         suspect = no_speech > 0.6 and logprob < -1.0
@@ -285,7 +288,7 @@ def transcribe_segments(segments: list[Segment], audio: np.ndarray, sr: int,
     return out
 
 
-# ---------------------------------------------------------------- 报告
+# ---------------------------------------------------------------- Report
 def report(audio: np.ndarray, sr: int, raw_db: float, filt_db: float,
            floor_db: float, thr: float, segments: list[Segment], results: list[dict]) -> str:
     lines = []

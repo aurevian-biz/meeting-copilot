@@ -1,95 +1,95 @@
-# 怎么用
+# Usage
 
-## 会议字幕（8096）
+[**English**](usage.md) · [中文](usage.zh.md) · [日本語](usage.ja.md)
 
-打开 `http://<本机IP>:8096`，点右上角 **开始 / 停止 / 清屏**：
+## Meeting captions (8096)
 
-- **开始 / 停止**：控制采集与断句；`clear` 会清掉行并重置 seq（前端也会清空本地 DOM）
-- **听 HDMI**：把采集卡收到的声音回放到耳机，开会时当监听口用
-- **音量条 / dB**：实时电平与门限，条变绿说明超过门限、正在出声
-- **状态灯**：`连接中…` → `运行中` / `已停止` / `断开`
-- **屏幕 N 词 · 命中 M**：鼠标悬停看词表样本、最近命中、看一次屏幕的耗时
-- **最新一条在最上**：草稿行占最顶，往下翻看历史时不会被新行顶跑
+Open `http://<device-ip>:8096` and click **开始 / 停止 / 清屏** ("Start / Stop / Clear") in the top right:
 
-### 页面没反应时的判断顺序
+- **开始 / 停止**: controls capture and segmentation; `clear` wipes the lines and resets seq (the frontend also clears its local DOM)
+- **听 HDMI** ("Listen to HDMI"): plays the audio the capture card receives to your headphones, for monitoring during the meeting
+- **音量条 / dB** ("volume bar / dB"): live level and threshold; when the bar turns green it is above the threshold and sound is coming through
+- **状态灯** ("status light"): `连接中…` ("connecting…") → `运行中` / `已停止` / `断开`
+- **屏幕 N 词 · 命中 M** ("screen N terms · M hits"): hover to see term samples, recent hits, and how long one screen look takes
+- **最新一条在最上** ("newest on top"): the draft line occupies the very top, so scrolling back through history is never pushed away by new lines
 
-状态灯停在「连接中…」、dB 是 `-99`、段数 `0`、按钮点了没反应 —— 这几个值全是
-HTML 里写死的初始值，说明**脚本根本没执行**，不是网络问题。按顺序查：
+### What to check when the page doesn't respond
 
-1. `curl -s localhost:8096/api/status` 有没有数据（服务端活着 ≠ 页面活着）
-2. 浏览器控制台有没有 `SyntaxError`
-3. `.venv/bin/python test_caption_pipe.py`（其中 `test_page_js_syntax` 会 `node --check`）
-4. 改过前端就 **F5**：`PAGE` 是模块级常量，重启服务不会帮浏览器刷新 HTML
+The status light stays at 「连接中…」, dB reads `-99`, segment count is `0`, clicking the buttons does nothing — all of these are initial values hard-coded in the HTML, which means **the script never ran**; it is not a network problem. Check in this order:
 
-## 语音助手（8095）
+1. Does `curl -s localhost:8096/api/status` return any data? (server alive ≠ page alive)
+2. Any `SyntaxError` in the browser console?
+3. `.venv/bin/python test_caption_pipe.py` (`test_page_js_syntax` among them runs `node --check`)
+4. Changed the frontend? **F5**: `PAGE` is a module-level constant, so restarting the service won't refresh the HTML in your browser
 
-打开 `http://<本机IP>:8095`：
+## Voice assistant (8095)
 
-- 直接点按钮说话，或说唤醒词 **「小八你好」** 触发常驻监听
-- 播报中插话会打断（`barge-in`），串音不会误触
-- 「看屏幕」按钮（或语音提问）触发一次 OCR，把屏幕文字喂给 LLM
-- 浏览器第一次要**手动点一下**才能播放声音：浏览器自动播放策略会拦住，
-  播报走本机 `pw-play`（`--local-speak`），不依赖浏览器自动播放
+Open `http://<device-ip>:8095`:
 
-## 常用参数
+- Press the button and speak, or say the wake word **「小八你好」** ("Xiao Ba, hello") to trigger the always-on listener
+- Speaking while it is playing back interrupts it (`barge-in`); crosstalk does not false-trigger
+- The **「看屏幕」** ("Look at the screen") button (or a spoken question) fires one OCR pass and feeds the screen text to the LLM
+- The browser needs **one manual click** the first time before it will play audio: autoplay policy blocks it. Playback goes through the local `pw-play` (`--local-speak`) and does not depend on browser autoplay
 
-### 字幕断句（默认值是实测调出来的，别随手改）
+## Common flags
 
-| 参数 | 默认 | 说明 |
+### Caption segmentation (the defaults were tuned against measurements — don't change them casually)
+
+| Flag | Default | Notes |
 |---|---|---|
-| `--max-s` | 6.0 | 硬切上限。4.5s 时 26% 的段被切断（「大会」切两半）；**超过 7s 会出现幻觉** |
-| `--hold` | 0.45 | 基准静音门限；分层停顿另有 `--hold-short 0.3` / `--hold-long 0.9` |
-| `--seg-mid` / `--seg-long` | 1.2 / 2.4 | 短句、中句、长句用不同的停顿门限 |
-| `--soft-cut` | 0.7 | 硬切前在尾巴里回退找能量低谷的搜索窗（秒） |
-| `--min-s` | 0.25 | 短于此直接丢（咔哒声、咳嗽） |
-| `--ctx-lines` | 1（unit 里） | 上文行数；每句都变，砍掉省约 90ms |
-| `--tr-workers` | 1（unit 里） | 加 worker 对单句延迟无差别，只多抢显存 |
-| `--tr-prompt` | full | 短版反而更慢，见 [llm-serving.md](llm-serving.md) |
-| `--screen-hints` / `--screen-every` | 关 / 15s | 按需屏幕词提示，见下 |
-| `--wav` | — | 不采集，直接跑一个 wav 文件（离线复现断句问题） |
+| `--max-s` | 6.0 | Hard-cut ceiling. At 4.5s, 26% of segments get cut (the word 「大会」, "conference", is sliced in two); **past 7s you get hallucinations** |
+| `--hold` | 0.45 | Baseline silence threshold; tiered pauses also have `--hold-short 0.3` / `--hold-long 0.9` |
+| `--seg-mid` / `--seg-long` | 1.2 / 2.4 | Short, medium and long sentences use different pause thresholds |
+| `--soft-cut` | 0.7 | Before a hard cut, the search window (seconds) for backtracking into the tail to find an energy trough |
+| `--min-s` | 0.25 | Anything shorter is dropped outright (clicks, coughs) |
+| `--ctx-lines` | 1 (in unit) | Number of context lines; it changes every sentence, so cutting it saves about 90ms |
+| `--tr-workers` | 1 (in unit) | Extra workers make no difference to single-sentence latency, they only fight over VRAM |
+| `--tr-prompt` | full | The short version is actually slower, see [llm-serving.md](llm-serving.md) |
+| `--screen-hints` / `--screen-every` | off / 15s | On-demand screen term hints, see below |
+| `--wav` | — | No capture; run a single wav file instead (reproduce segmentation problems offline) |
 
-### 屏幕词提示（可选）
+### Screen term hints (optional)
 
-`--screen-hints` 打开后，每 `--screen-every` 秒向 voice-bench 的 `/api/look` 要一次 OCR，
-抽候选词，只有**本句 ASR 文本里出现「读音相似、写法不同」的词**时才给翻译递一句提示：
+With `--screen-hints` on, every `--screen-every` seconds the server asks voice-bench's `/api/look` for one OCR pass and extracts candidate terms. Only when **a word with similar pronunciation but a different spelling appears in this sentence's ASR text** does it pass one hint to translation:
 
 ```
 【屏幕词】「畔蒜泰助」——本句的「阪井泰介」若指同一事物，请改用屏幕写法。
 ```
 
-- 命中约 +25 token（+65ms），只在这一段付；没命中一个 token 都不加
-- **别把整段屏幕文字塞进翻译**：实测 +70 token / +250ms，且 6 句里 3 句变差
-  （我们的字幕页面本身就在屏幕上，会自我循环）
-- 上限是「专有名词同音错字」，救不了普通误听（`つぶさに` → `つぶさんに`）
-- 别让拉丁词进词表：OpenJTalk 会逐字母读成 50 拍，永远撞不上
+(The hint text itself is emitted in Chinese.)
 
-## 状态怎么看
+- A hit costs about +25 tokens (+65ms), paid only on that segment; a miss adds not a single token
+- **Don't stuff the whole screen text into translation**: measured at +70 tokens / +250ms, and 3 of 6 sentences got worse (our caption page is itself on the screen, so it loops on itself)
+- The ceiling is "homophone misspellings in proper nouns"; it cannot rescue ordinary mishearing (`つぶさに` → `つぶさんに`)
+- Keep Latin words out of the term list: OpenJTalk reads them letter by letter as 50 morae and they never match
+
+## How to read status
 
 ```bash
 curl -s localhost:8096/api/status | python -m json.tool
 ```
 
-重点字段：
+Key fields:
 
-| 字段 | 含义 | 健康值 |
+| Field | Meaning | Healthy value |
 |---|---|---|
-| `q_asr` | 等 ASR 的段数 | 0 |
-| `q_tr` | 等翻译的段数 | 0；**涨 = 翻译跟不上** |
-| `dropped` | 队列丢段数 | 0 |
-| `ttft_ms` | 译文首字延迟 | 400~600ms |
-| `trans_ms` | 整句译完 | ~1000ms |
-| `lag_ms` | 端到端延迟 | ~290ms |
-| `screen` | 词表状态 | `terms / hits / polls / last_ms / last_err` |
-| `monitor` | 回放状态 | `on / starts / error` |
+| `q_asr` | segments waiting for ASR | 0 |
+| `q_tr` | segments waiting for translation | 0; **rising = translation can't keep up** |
+| `dropped` | segments dropped from the queue | 0 |
+| `ttft_ms` | first-token latency of the translation | 400~600ms |
+| `trans_ms` | whole sentence translated | ~1000ms |
+| `lag_ms` | end-to-end latency | ~290ms |
+| `screen` | term list state | `terms / hits / polls / last_ms / last_err` |
+| `monitor` | playback state | `on / starts / error` |
 
-一条命令看全貌：`bash scripts/healthcheck.sh`。
+One command for the whole picture: `bash scripts/healthcheck.sh`.
 
-## 离线复现
+## Offline reproduction
 
-不想对着麦克风反复说话时，用 wav 文件跑同一条断句链：
+When you don't want to keep talking into the microphone, run the same segmentation chain on a wav file:
 
 ```bash
 .venv/bin/python caption_server.py --wav sample.wav --no-draft
 .venv/bin/python tools/wav_seg_ab.py --wav sample.wav --a 0.45 --b 0.7
-.venv/bin/python tools/sse_regress.py     # 数据层：0 回退、0 变空
+.venv/bin/python tools/sse_regress.py     # data layer: 0 regressions, 0 empty
 ```

@@ -1,19 +1,22 @@
-"""目录约定：所有默认路径都从这里来，别在代码里写死绝对路径。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-安装脚本会把模型放到数据目录下。如果你把模型放在外置盘（推荐：ASR 模型 3.2G、
-TTS 137M、TensorRT engine 和会话语料都别占根盘），只要设一个环境变量就行：
+"""Directory conventions: every default path comes from here — never hard-code absolute paths in code.
+
+The install script puts models under the data directory. If you keep models on an external disk (recommended:
+ASR 3.2G, TTS 137M, TensorRT engines and meeting corpora should not eat the root disk), one env var is enough:
 
     export MC_DATA=/media/ssd/meeting-copilot-data
 
-布局（括号里是默认值）：
+Layout (defaults in parentheses):
 
-    MC_HOME  代码目录（= 本文件所在目录）
-    MC_DATA  数据根（= $MC_HOME/data）
+    MC_HOME  code directory (= the directory holding this file)
+    MC_DATA  data root (= $MC_HOME/data)
         asr-models/        SenseVoice / Silero VAD / KWS zipformer
-        tts-models/        Piper 日语、中文音色
-        models/            rec_fp16.engine 之类的 TensorRT 产物
-        work-voice/        voice_server 的临时录音
-        magnitude-data/    Magnitude 的 dockerd data-root（35B 权重在这里）
+        tts-models/        Piper Japanese and Chinese voices
+        models/            TensorRT artifacts such as rec_fp16.engine
+        work-voice/        voice_server's temporary recordings
+        magnitude-data/    Magnitude's dockerd data-root (the 35B weights live here)
 """
 from __future__ import annotations
 

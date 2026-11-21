@@ -1,72 +1,81 @@
-# 模型清单：装了什么、为什么是它、能不能换
+# Model list: what is installed, why that one, and whether you can swap it
 
-全部离线，一共 3.4G。表里的「替代方案」都是**真试过并否掉**的，不是没考虑。
+[**English**](models.md) · [中文](models.zh.md) · [日本語](models.ja.md)
 
-## 1. 总表
+Everything is offline — 3.4G in total. The "alternatives" in the table are ones we
+**actually tried and rejected**, not ones we never considered.
 
-| 用途 | 模型 | 大小 | 来源 | 延迟（Orin） |
+## 1. Overview
+
+| Purpose | Model | Size | Source | Latency (Orin) |
 |---|---|---|---|---|
-| ASR | **SenseVoice-Small**（sherpa-onnx 打包，int8） | 1.1G（int8 权重仅 239M） | [k2-fsa/sherpa-onnx releases](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models) | RTF 0.04，一句 3.3s 音频约 290ms |
-| 判停 VAD | **Silero VAD** | 636K | 同上 | 每帧微秒级 |
-| 唤醒词 | **KWS zipformer 3.3M**（wenetspeech） | 36M | [kws-models](https://github.com/k2-fsa/sherpa-onnx/releases/tag/kws-models) | RTF 0.03，纯 CPU |
-| TTS 日语 | **Piper `ja_JP-hi_fi_captain-medium`** | 74M | [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) | 首块 636ms，RTF 0.135 |
-| TTS 中文 | **Piper `zh_CN-huayan-medium`** | 61M | 同上 | RTF 0.08~0.19 |
-| OCR | **RapidOCR (PP-OCRv4 det/cls/rec)** | 16M | pip 包自带 | CPU 4.1s/140 行；TensorRT rec 1.7s |
-| LLM | **Qwen3.5-35B-A3B**（UD-Q4_K_XL GGUF） | 22.9G | Magnitude 拉取 | 首字 300~470ms，见 [llm-serving.md](llm-serving.md) |
+| ASR | **SenseVoice-Small** (packaged by sherpa-onnx, int8) | 1.1G (int8 weights only 239M) | [k2-fsa/sherpa-onnx releases](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models) | RTF 0.04, about 290ms for one 3.3s utterance |
+| Endpointing VAD | **Silero VAD** | 636K | same as above | microseconds per frame |
+| Wake word | **KWS zipformer 3.3M** (wenetspeech) | 36M | [kws-models](https://github.com/k2-fsa/sherpa-onnx/releases/tag/kws-models) | RTF 0.03, CPU only |
+| TTS Japanese | **Piper `ja_JP-hi_fi_captain-medium`** | 74M | [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) | first chunk 636ms, RTF 0.135 |
+| TTS Chinese | **Piper `zh_CN-huayan-medium`** | 61M | same as above | RTF 0.08~0.19 |
+| OCR | **RapidOCR (PP-OCRv4 det/cls/rec)** | 16M | bundled with the pip package | CPU 4.1s/140 lines; TensorRT rec 1.7s |
+| LLM | **Qwen3.5-35B-A3B** (UD-Q4_K_XL GGUF) | 22.9G | pulled by Magnitude | first token 300~470ms, see [llm-serving.md](llm-serving.md) |
 
-`scripts/download-models.sh` 一行下载前六个；LLM 由推理运行时自己拉。
+`scripts/download-models.sh` fetches the first six in one line; the LLM is pulled by the
+inference runtime itself.
 
-## 2. 为什么是这些
+## 2. Why these
 
-### ASR：SenseVoice 而不是 Whisper
+### ASR: SenseVoice instead of Whisper
 
-同一段日语（3.29s），SenseVoice 与 faster-whisper 对比：
+Same Japanese clip (3.29s), SenseVoice against faster-whisper:
 
 | | SenseVoice | Whisper large-v3-turbo |
 |---|---|---|
-| 中文场景 | 准确 | 会把日语听成中文（**直接翻错语言**） |
-| 延迟 | RTF 0.04 | 慢一个量级 |
-| 中日英韩粤 | 一个模型全包 | 要 large 才勉强 |
+| Chinese scenarios | accurate | hears Japanese as Chinese (**gets the language flat wrong**) |
+| Latency | RTF 0.04 | an order of magnitude slower |
+| JA/ZH/EN/KO/YUE | one model covers all | needs large to just barely cope |
 
-**致命问题不是速度而是语言判定**：会议是日语，Whisper 在小段音频上经常判成中文，
-后面再好的翻译也没救。所以 `--lang auto` 交给 SenseVoice。
+**The fatal problem is not speed but language identification**: the meeting is in
+Japanese, and Whisper often decides short audio segments are Chinese — no amount of good
+downstream translation can fix that. So `--lang auto` is left to SenseVoice.
 
-### TTS：Piper 而不是 VOICEVOX / MeloTTS
+### TTS: Piper instead of VOICEVOX / MeloTTS
 
-Piper 是唯一在 aarch64 上「pip 装完就能用」的：CPU 跑、RTF 0.135、首块 636ms。
-代价是日语只有**一个音色**（`hi_fi_captain`，2 个说话人）。想要更好音质只能换
-VOICEVOX（要跑 GPU/HTTP 服务）或修 MeloTTS（aarch64 编译麻烦）。
+Piper is the only one that is "pip install and go" on aarch64: runs on CPU, RTF 0.135,
+first chunk 636ms. The price is that Japanese has only **one voice** (`hi_fi_captain`,
+2 speakers). For better audio quality you have to move to VOICEVOX (needs a GPU/HTTP
+service) or fix MeloTTS (painful to build on aarch64).
 
-三个安装坑（都踩过）：
+Three install traps (we hit all of them):
 
-1. `piper-phonemize` 在 aarch64 **没有 wheel** —— 但 `piper-tts>=1.8.0` 已经不依赖它
-2. 日语要 `pyopenjtalk`，官方包只有源码 —— 用 **`pyopenjtalk-plus`**（cp312 aarch64 有 wheel，模块名仍是 `pyopenjtalk`）
-3. CLI 写 wav 头会报 `# channels not specified` —— 用 Python API `PiperVoice.synthesize_wav()`
+1. `piper-phonemize` has **no wheel** for aarch64 — but `piper-tts>=1.8.0` no longer depends on it
+2. Japanese needs `pyopenjtalk`, and the official package ships source only — use **`pyopenjtalk-plus`** (there is a cp312 aarch64 wheel; the module name is still `pyopenjtalk`)
+3. The CLI fails with `# channels not specified` when writing the wav header — use the Python API `PiperVoice.synthesize_wav()`
 
-### 唤醒词：KWS zipformer 而不是「一直开 ASR」
+### Wake word: KWS zipformer instead of "keep ASR always on"
 
-常驻 ASR 要一直吃 CPU/GPU，且会把电视声音、咳嗽都当成话。KWS 模型只有 3.3M，
-纯 CPU RTF 0.03，只在命中「小八你好」时才唤醒 ASR。
+An always-on ASR eats CPU/GPU continuously and treats TV audio and coughs as speech. The
+KWS model is only 3.3M, runs on CPU at RTF 0.03, and wakes the ASR only when it hears
+「小八你好」.
 
-自定义唤醒词：KWS 是**拼音/音素**级别的，改词要重新准备 `keywords.txt`
-（见 sherpa-onnx 官方文档），不是改一行字符串。
+Custom wake words: KWS works at the **pinyin/phoneme** level, so changing the word means
+preparing a new `keywords.txt` (see the sherpa-onnx official docs), not editing one
+string.
 
-### OCR：RapidOCR 而不是 PaddleOCR
+### OCR: RapidOCR instead of PaddleOCR
 
-PaddleOCR 在 aarch64 + CUDA 13 上装不动（paddlepaddle 没有对应轮子）。
-RapidOCR 是同一套 PP-OCRv4 模型的 onnxruntime 封装，pip 装完就能跑。
+PaddleOCR will not install on aarch64 + CUDA 13 (no matching paddlepaddle wheels).
+RapidOCR is an onnxruntime wrapper around the same PP-OCRv4 models; pip install and it
+runs.
 
-## 3. 换模型前先量这三个数
+## 3. Measure these three numbers before swapping models
 
-换 ASR / LLM / TTS 都别凭感觉，先量：
+Whether you swap ASR / LLM / TTS, don't go by feel — measure first:
 
-| 指标 | 在哪看 | 什么算「能接受」 |
+| Metric | Where to look | What counts as acceptable |
 |---|---|---|
-| 首字延迟 ttft | `/api/status` 的 `ttft_ms` 或页面「首字」 | 字幕 < 600ms，助手 < 1s |
-| 单句总耗时 | `trans_ms` / `asr_ms` | 字幕 < 1.5× 句长，否则会积压（`q_tr` 涨） |
-| 断句完整性 | ASR 文本是否成句 | 半句率 < 15%，否则译文必然断章 |
+| First-token latency ttft | `ttft_ms` in `/api/status`, or 「首字」 on the page | captions < 600ms, assistant < 1s |
+| Total time per utterance | `trans_ms` / `asr_ms` | captions < 1.5× utterance length, otherwise it backs up (`q_tr` climbs) |
+| Segmentation completeness | whether the ASR text forms sentences | half-sentence rate < 15%, otherwise the translation is bound to be cut off |
 
-现成的 A/B 工具（都能打桩跑，不需要麦克风）：
+Ready-made A/B tools (all run stubbed, no microphone needed):
 
 ```bash
 .venv/bin/python tools/wav_seg_ab.py        --wav x.wav --a 0.45 --b 0.7
@@ -74,14 +83,17 @@ RapidOCR 是同一套 PP-OCRv4 模型的 onnxruntime 封装，pip 装完就能�
 .venv/bin/python tools/ttft_prompt_ab.py    --prompt short --prompt full
 ```
 
-## 4. 许可证
+## 4. Licenses
 
-**本仓库代码是 MIT，但模型不是**。各模型有自己的许可证，商用前请核对上游：
+**This repository's code is MIT, but the models are not.** Each model carries its own
+license — check upstream before commercial use:
 
-- SenseVoice / PP-OCR / Silero / Piper 各音色：见其仓库或 HuggingFace 模型卡的 License 字段
-  （Piper 各音色来源不同，**逐个看**，别默认全是 CC0）
-- Qwen2.5 / Qwen3.5：见阿里官方模型卡
-- Magnitude 运行时：见 magnitude.dev
+- SenseVoice / PP-OCR / Silero / each Piper voice: see the License field on the respective
+  repository or HuggingFace model card
+  (Piper voices come from different sources, **check each one**; don't assume they are all CC0)
+- Qwen2.5 / Qwen3.5: see Alibaba's official model cards
+- Magnitude runtime: see magnitude.dev
 
-我们不打包任何权重，`scripts/download-models.sh` 只是从上游官方地址下载。
-如果你的场景要求「模型也必须宽松许可」，优先挑 Apache-2.0 的权重。
+We do not bundle any weights; `scripts/download-models.sh` only downloads from upstream
+official URLs. If your situation requires that "the models must be permissively licensed
+too", prefer Apache-2.0 weights.

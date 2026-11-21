@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-"""两个 LLM 的翻译 A/B：同一组真实句子、同一份生产 prompt、同一请求形状。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-比较的是**模型**，不是 prompt，所以直接用生产里的 `caption_server._tr_system()`
-和生产的请求体（stream=True / temperature 0.1 / max_tokens 200）。换 prompt 的
-对照用 `tools/tr_quality.py`，两个工具不要混。
+"""Translation A/B of two LLMs: the same real sentences, the same production prompt, the same request shape.
 
-用法（在部署目录，LLM 必须活着）：
+This compares **models**, not prompts, so it calls the production `caption_server._tr_system()` directly
+together with the production request body (stream=True / temperature 0.1 / max_tokens 200). For prompt comparisons
+use `tools/tr_quality.py`; do not mix the two tools.
 
-    # 抓基线：vLLM 7B 还在跑的时候
+Usage (in the deployment directory, the LLM must be up):
+
+    # Capture a baseline while vLLM 7B is still running
     ./asr-venv/bin/python tools/ab_translate.py --tag A --out /tmp/ab_A.json
-    # 换模型后
+    # After the model switch
     ./asr-venv/bin/python tools/ab_translate.py --tag B --out /tmp/ab_B.json
-    # 摆在一起看
+    # Put them side by side
     ./asr-venv/bin/python tools/ab_translate.py --compare /tmp/ab_A.json /tmp/ab_B.json
 
-自动判据只有两条是**可靠**的，其余靠人眼：
-  · 目标日语时「一个假名都没有」→ 整句照抄（助词/语尾必然带假名，零误报）
-  · 目标中文时「出现假名」→ 源语言残留（专有名词如 深セン 会误伤，已单独标注）
-汉字占比只作参考：正常日译汉字率约 35~50%，照抄会到 85% 以上。
+Only two automatic criteria are **reliable**; the rest is left to the eye:
+  · target Japanese and "not a single kana" -> the whole sentence was copied (particles/endings always carry kana, zero false positives)
+  · target Chinese and "kana shows up" -> source language leftover (proper nouns such as 深セン false-positive, flagged separately)
+Kanji share is reference only: a normal Japanese translation runs about 35-50% kanji, while copying goes above 85%.
 """
 from __future__ import annotations
 
@@ -38,7 +41,7 @@ KANA = re.compile(r"[\u3040-\u30FF]")
 CJK = re.compile(r"[\u4e00-\u9FFF]")
 LATIN = re.compile(r"[A-Za-z]{2,}")
 
-# (目标语言, 原文, 上文) —— 前 10 条是历史实测抓到的坏输出，后 4 条来自 62s 真实音频
+# (target language, source, context) -- the first 10 are bad outputs caught in past measurements, the last 4 come from 62s of real audio
 CASES = [
     ("zh", "身体面にアメリカは坚持するべきです", ""),
     ("zh", "深zのアプリで何点给深zに評価するか", ""),
@@ -59,7 +62,7 @@ CASES = [
 
 def call_once(base: str, model: str, text: str, target: str, ctx: str,
               think: bool, key: str = "") -> tuple[str, int, int]:
-    """发一次流式请求，返回 (译文, 首字ms, 总ms)。形状与 caption_server 保持一致。"""
+    """Send one streaming request; returns (translation, first token ms, total ms). The shape matches caption_server."""
     sysp = cs._tr_system(target)
     user = f"【上文】{ctx}\n【本句】{text}" if ctx else text
     body = {
@@ -69,12 +72,12 @@ def call_once(base: str, model: str, text: str, target: str, ctx: str,
         "stream": True, "temperature": 0.1, "max_tokens": 200,
     }
     if not think:
-        # Qwen3.5 的模板里 enable_thinking 不定义就是开；关掉才不会把 200 token
-        # 全烧在思考上导致译文空白。Qwen2.5 模板不认这个变量，传了也无害。
+        # In the Qwen3.5 template enable_thinking defaults to on; only turning it off keeps the 200 tokens
+        # from burning entirely in thinking and leaving the translation blank. The Qwen2.5 template ignores this variable, so passing it is harmless.
         body["chat_template_kwargs"] = {"enable_thinking": False}
     headers = {"Content-Type": "application/json"}
     if key:
-        headers["Authorization"] = f"Bearer {key}"  # Magnitude 的 /inference/v1 要鉴权
+        headers["Authorization"] = f"Bearer {key}"  # Magnitude's /inference/v1 requires auth
     req = urllib.request.Request(
         base.rstrip("/") + "/chat/completions", data=json.dumps(body).encode(),
         headers=headers)
@@ -114,9 +117,9 @@ def metrics(out: str, target: str) -> dict:
     return {
         "kana": kana, "cjk": cjk, "latin": latin, "chars": chars,
         "han_ratio": round(cjk / chars, 2) if chars else 0.0,
-        # 整句照抄：日语一个假名都没有（含专有名词误伤的可能，但极少）
+        # Whole sentence copied: not a single kana in the Japanese (proper nouns may false-positive, but very rarely)
         "suspect_copy": target == "ja" and kana == 0 and cjk >= 6,
-        # 源语言残留：中译里冒出假名（深セン 这类专有名词会误伤）
+        # Source language leftover: kana surfacing in the Chinese translation (proper nouns like 深セン false-positive)
         "kana_left": target == "zh" and kana > 0,
     }
 
@@ -124,7 +127,7 @@ def metrics(out: str, target: str) -> dict:
 def run(base: str, model: str, tag: str, think: bool, repeat: int, out: str,
         key: str = "") -> int:
     print(f"# tag={tag} model={model} think={'on' if think else 'off'} repeat={repeat}")
-    # 预热：第一发要建图和 prefill，不计时；也让前缀缓存先热起来
+    # Warm-up: the first call builds graphs and prefills, so it is untimed; it also heats the prefix cache
     for target in ("zh", "ja"):
         call_once(base, model, "テスト" if target == "zh" else "测试", target, "", think, key)
 

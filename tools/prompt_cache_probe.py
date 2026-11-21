@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""前缀缓存到底能救回多少：改动位置 × 首字延迟。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-背景：想用「只把变化的部分送进 prompt」给看屏幕提速。但 vLLM 的前缀缓存
-按块（16 token）沿前缀链匹配，所以收益完全取决于**变化落在什么位置**：
+"""How much the prefix cache can save: change position × first token latency.
 
-  - 变化落在末尾 → 前面整段还命中，只重算尾巴
-  - 变化落在中间 → 从变化处往后全部失效
-  - 变化落在开头 → 等于冷 prefill
+Background: the idea is to speed up screen reading by "sending only the changed part into the prompt". But vLLM's prefix cache
+matches block by block (16 tokens) along the prefix chain, so the gain depends entirely on **where the change lands**:
 
-测法很关键：**必须用「原始文本」预热，再发「修改后的文本」**。如果先用修改版
-预热再测修改版，测到的是「同一内容第二次」，永远 100% 命中（第一版就栽在这）。
+  - change at the end -> the whole prefix before it still hits, only the tail is recomputed
+  - change in the middle -> everything from the change onward is invalidated
+  - change at the start -> equivalent to a cold prefill
 
-用法：
+The measurement method is critical: **you must warm up with the "original text", then send the "edited text"**. If you warm up
+with the edited version and then measure the edited version, you are measuring "the same content a second time", a guaranteed 100% hit (the first version of this script fell into exactly that).
+
+Usage:
   python tools/prompt_cache_probe.py --base http://127.0.0.1:8000/v1 --model qwen
 """
 from __future__ import annotations
@@ -42,7 +45,7 @@ def build(system: str, lines: list[str], question: str = "画面について教�
 
 
 def measure(base: str, model: str, msgs: list[dict]) -> tuple[float, int]:
-    """单次发送（不预热本内容），返回 (ttft_ms, prompt_tokens)。"""
+    """One send with no warm-up of this content; returns (ttft_ms, prompt_tokens)."""
     u: dict = {}
     ttft, *_ = post_stream(base, model, msgs, 8, u)
     return ttft, u.get("prompt_tokens", 0)
@@ -92,13 +95,13 @@ def main() -> int:
     lines[0] = "第01行 窗口标题变了"
     variants.append(("改第一行", build(system, lines)))
 
-    # 对照：改掉前 30 行（若按块位置无关复用，应只重算这 30 行）
+    # Control: change the first 30 lines (if reuse were block-position independent, only those 30 lines would be recomputed)
     lines = list(base_lines)
     for i in range(30):
         lines[i] = f"第{i + 1:02d}行 完全不同的内容 変わりました"
     variants.append(("改前 30 行", build(system, lines)))
 
-    # 对照：等长但内容全换（验证缓存到底是前缀链式还是块级任意复用）
+    # Control: same length but all content swapped (tells whether the cache is prefix-chained or arbitrary block-level reuse)
     lines = [f"第{i + 1:02d}行 別の資料 別の内容 担当 佐藤 状態 未着手 メモ なし"
              for i in range(N_LINES)]
     variants.append(("全部换掉（等长）", build(system, lines)))
@@ -110,7 +113,7 @@ def main() -> int:
 
     cold = cold_ref(args.base, args.model, base)
 
-    # 重排实验：稳定段在前、只换尾部
+    # Reorder experiment: stable part first, only the tail swapped
     stable = base_lines[:12]
     vol_a = [f"易变区 时钟 23:2{i} 通知 {i} 件" for i in range(6)]
     vol_b = [f"易变区 时钟 23:5{i} 通知 {i} 件" for i in range(6)]

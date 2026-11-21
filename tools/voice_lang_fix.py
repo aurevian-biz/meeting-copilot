@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""voice_lang_fix.py —— 语言指令到底该怎么写，模型才真的听。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-背景：voice_server 的 system 通篇是日语（"あなたは日本語と中国語のバイリンガル…"），
-只在末尾追加一句「本次回答必须使用简体中文」。实测（README 4.22）：
+"""voice_lang_fix.py -- how the language directive should be worded so the model actually obeys.
 
-    reply-lang=zh   7B：8/12 中文      35B：0/12 中文（全回日语）
+Background: voice_server's system prompt is Japanese throughout ("あなたは日本語と中国語のバイリンガル…"),
+with a single line appended at the end: "this answer must be in Simplified Chinese". Measured (README 4.22):
 
-7B 是机械跟随最后一句指令，35B 反而「太懂语境」——用户说日语、屏幕是日语，
-它就无视指令回日语。语音助手的价值就在「日语会议里用中文播报」，所以这条不通
-就不能换模型。
+    reply-lang=zh   7B: 8/12 in Chinese      35B: 0/12 in Chinese (all answered in Japanese)
 
-这里只测「怎么把话说明白」，不测速度。四种写法：
-    sys-tail   现状：system 末尾追加中文指令
-    user-tail  追加到最后一条 user 消息末尾（离生成位置最近，指令权重最高）
-    sys-hard   system 开头就声明语言，末尾再强调一次
-    both       user-tail + sys-hard 一起上
+7B mechanically follows the last instruction, while 35B is "too good at context" -- the user speaks Japanese and the screen is Japanese,
+so it ignores the directive and answers in Japanese. The whole value of the voice assistant is "broadcast in Chinese during a Japanese meeting", so if this fails
+the model cannot be swapped in.
 
-判据只有一个：输出语言正确率。速度都是几百毫秒的差别，语言错了就全废。
+This only measures "how to say it clearly", not speed. Four wordings:
+    sys-tail   current state: append the Chinese directive at the end of system
+    user-tail  append it to the end of the last user message (closest to the generation point, highest instruction weight)
+    sys-hard   declare the language at the start of system and stress it once more at the end
+    both       user-tail + sys-hard together
+
+There is only one criterion: output language accuracy. The speed differences are all a few hundred ms; getting the language wrong ruins everything.
 """
 import argparse
 import json
@@ -37,7 +40,7 @@ ZH_HARD_PREFIX = "重要：无论用户用哪种语言提问、屏幕内容是�
 
 
 def build(mode: str, scene: dict, rep: int) -> list[dict]:
-    msgs = W.build_messages(scene, lang="none", rep=rep)  # 先不加任何语言指令
+    msgs = W.build_messages(scene, lang="none", rep=rep)  # start with no language directive at all
     if mode in ("sys-tail", "sys-hard", "both"):
         msgs[0]["content"] = msgs[0]["content"] + ZH_SOFT
     if mode == "sys-hard":

@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""voice_llm_ab.py —— 语音助手换 35B 值不值：拿真实的 system prompt 和四种真实场景比。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-为什么单独写：字幕和语音助手的负载形态**完全不同**
-  · 字幕：system 长（290 token，命中缓存）→ 新内容短（60~80 token）、输出短（30~60）
-  · 助手：system 短（~200 字日语）→ 新内容可能很长（OCR 屏幕文字几百字）、输出长（160 token）
-所以「字幕上 35B 首字 300ms」这个结论不能直接搬过来：OCR 场景下 35B 的 prefill
-（4.5ms/token）可能把它拖到 1 秒以上，而 7B 的 prefill 便宜一个量级。
+"""voice_llm_ab.py -- whether 35B is worth it for the voice assistant: compare on the real system prompt and four real scenarios.
 
-用法：
-    # 四场景 × 两臂，各 3 次
+Why a separate script: captions and the voice assistant have **completely different** load shapes
+  · captions: long system (290 tokens, cache hit) → short new content (60-80 tokens), short output (30-60)
+  · assistant: short system (~200 Japanese chars) → new content may be very long (hundreds of chars of OCR screen text), long output (160 tokens)
+So the conclusion "35B first token is 300ms on captions" cannot simply be carried over: under OCR, 35B's prefill
+(4.5ms/token) can drag it past 1 second, while 7B's prefill is an order of magnitude cheaper.
+
+Usage:
+    # four scenarios × two arms, 3 runs each
     ./asr-venv/bin/python tools/voice_llm_ab.py \
         --arm '7B|http://127.0.0.1:8000/v1|qwen|' \
         --arm '35B|http://127.0.0.1:10100/inference/v1|<gguf id>|mag-xxx'
 
-    # 只看 OCR 场景
+    # OCR scenarios only
     ./asr-venv/bin/python tools/voice_llm_ab.py --only ocr-long --arm ...
 
-判据不是「首字多少」，而是**带 OCR 的场景有没有越过 1 秒**——语音助手的体感线。
+The criterion is not "how large is the first token" but **whether the OCR scenarios cross 1 second** -- the assistant's felt-latency line.
 """
 import argparse
 import json
@@ -29,11 +32,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# 直接复用线上那段 system prompt，别在这里抄一份（抄了就会漂）
+# Reuse the production system prompt directly; do not copy it here (a copy will drift)
 try:
     import voice_server as vs
     _L = vs.Llm("", "")
-    # 与语音助手一致：带 OCR 的用例用含屏幕规则的 system，不带的用纯对话版
+    # Consistent with the voice assistant: OCR cases use the system with screen rules, the rest use the pure-dialogue one
     SYS_BASE = _L.system_core
     SYS_FULL = _L.system
 except Exception:  # noqa: BLE001
@@ -41,10 +44,10 @@ except Exception:  # noqa: BLE001
 
 
 def lang_directive(code: str) -> str:
-    """线上就是 `system + _lang_directive(text)`，这里必须走同一个函数。
+    """Production is `system + _lang_directive(text)`, and the same function must be used here.
 
-    为什么单列成函数：35B 对这句末尾的中文指令的遵循明显弱于 7B（README 4.22），
-    所以「用什么语言回答」本身就是一个要量的指标，不能写成模块级常量一次性定死。
+    Why it is a separate function: 35B follows the Chinese directive at the end of this line noticeably less well than 7B (README 4.22),
+    so "which language to answer in" is itself a metric to be measured, not something to freeze once as a module-level constant.
     """
     if not SYS_BASE or code in ("", "none"):
         return ""
@@ -52,7 +55,7 @@ def lang_directive(code: str) -> str:
 
 
 def lang_of(text: str) -> str:
-    """粗判输出语言：有假名就是日语；纯汉字无假名按中文算。"""
+    """Rough output-language check: any kana means Japanese; pure kanji with no kana counts as Chinese."""
     if not text:
         return "?"
     if vs.KANA.search(text):
@@ -61,7 +64,7 @@ def lang_of(text: str) -> str:
         return "zh"
     return "other"
 
-# 一小段真实的会议 OCR 文本：从字幕日志里摘的，不是编的
+# A small slice of real meeting OCR text: lifted from caption logs, not invented
 OCR_MID = (
     "[屏幕文字] 会議の議題は三つあります。第一に、来期の販売計画について。"
     "第二に、台湾向けの取引条件の見直し。第三に、新しい物流拠点の選定です。"
@@ -76,29 +79,29 @@ OCR_LONG = OCR_MID.rstrip("[/屏幕文字]") + (
     "初期投資として三億円程度が必要になる見通しです。ご質問があればお願いします。[/屏幕文字]"
 )
 
-# asks 是同一场景的多种问法。为什么必须换：同一句重复发，整条 prompt 会被前缀缓存
-# 全命中（35B 的 prompt_n 直接掉到 1），首字被低估到 78ms —— 那是假的。真实使用
-# 每轮问句都不一样，缓存只能命中 system + OCR 那一段。
+# asks holds several phrasings of the same scenario. Why they must vary: send the same sentence repeatedly and the whole prompt
+# hits the prefix cache (35B's prompt_n drops straight to 1) and the first token is underestimated at 78ms -- which is fake. In real use
+# every turn asks differently, so the cache can only hit the system + OCR part.
 SCENES = {
-    # 无 OCR 的纯对话：最短路径，history 也短
+    # Pure dialogue without OCR: the shortest path, short history too
     "chat-short": dict(hist=0, ocr=None, asks=[
         "今日の会議は何時からですか？",
         "会議の開始時間を教えてください。",
         "今日の打ち合わせ、何時スタート？",
     ]),
-    # 对话中段：6 轮历史（voice_server 就是取 history[-6:]）
+    # Mid-conversation: 6 turns of history (voice_server takes history[-6:])
     "chat-multi": dict(hist=3, ocr=None, asks=[
         "じゃあ、その三つの議題のうち、いちばん重要なのはどれ？",
         "三つの議題で、優先度がいちばん高いのはどれだと思いますか？",
         "その中で最初に議論すべきものは何でしょう？",
     ]),
-    # OCR 中等：屏幕上约 100 字的日文
+    # Medium OCR: about 100 Japanese chars on screen
     "ocr-mid": dict(hist=0, ocr=OCR_MID, asks=[
         "画面に書いてある議題を教えて",
         "画面の内容を三つに整理して",
         "モニターに表示されている議題は何？",
     ]),
-    # OCR 长：屏幕上一段完整口播稿，这才是「让它读屏幕」的真实形态
+    # Long OCR: a whole spoken script on screen -- this is the real shape of "have it read the screen"
     "ocr-long": dict(hist=0, ocr=OCR_LONG, asks=[
         "画面の内容を一分で要約して",
         "画面の話を短くまとめてください。",
@@ -137,8 +140,8 @@ def one(base: str, model: str, key: str, msgs: list[dict], max_tokens: int
         "model": model, "messages": msgs, "stream": True,
         "temperature": 0.6, "max_tokens": max_tokens,
         "presence_penalty": 0.3, "frequency_penalty": 0.3,
-        # 语音助手必须关思考：Qwen3.5 模板未定义该变量就走 thinking 分支，
-        # 160 token 全烧在推理上，content 恒空（字幕那边踩过，见 README 4.18）
+        # The voice assistant must disable thinking: with the variable left undefined the Qwen3.5 template takes the thinking branch,
+        # all 160 tokens burn in reasoning, and content is always empty (hit on the caption side too, see README 4.18)
         "chat_template_kwargs": {"enable_thinking": False},
     }
     headers = {"Content-Type": "application/json"}
@@ -216,10 +219,10 @@ def run_arm(name: str, base: str, model: str, key: str, scenes: list[str],
 def concurrency_probe(base: str, model: str, key: str, sub_base: str,
                       sub_model: str, sub_key: str, n: int = 4,
                       lang: str = "zh") -> None:
-    """最关键的一项：语音助手在生成时，字幕的首字会被拖到多少。
+    """The most critical one: how far the caption first token is dragged while the voice assistant is generating.
 
-    GGUF 引擎大概率单槽（`magnitude serve --help` 只输出一个 -h，没有并发参数）。
-    如果确实是单槽，两个服务共用 10100 就会互相排队。
+    The GGUF engine is most likely single-slot (`magnitude serve --help` prints a single -h, with no concurrency flag).
+    If it really is single-slot, two services sharing 10100 will queue behind each other.
     """
     print("\n########## 并发：助手长输出打满时，字幕请求的首字")
 
@@ -232,13 +235,13 @@ def concurrency_probe(base: str, model: str, key: str, sub_base: str,
         r = one(sub_base, sub_model, sub_key, msgs, 80)
         out.append((i, r["ttft"], r["total"]))
 
-    # 1) 安静基线
+    # 1) quiet baseline
     base_out = []
     for i in range(n):
         sub_caption(i, base_out)
     print(f"  安静时字幕首字 {[t for _, t, _ in base_out]}")
 
-    # 2) 一边跑语音助手的长输出，一边打字幕请求
+    # 2) fire caption requests while the voice assistant's long output is running
     stop = threading.Event()
 
     def noise() -> None:

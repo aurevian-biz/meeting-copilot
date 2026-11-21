@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""验证 sherpa-onnx 的 provider 参数是不是真的能切到 GPU。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-背景：from_sense_voice(provider='cpu') 签名里确实有 provider，
-但 wheel 是纯 CPU 编译（ldd 查不到 libcudart / libnvinfer）。
-这里实测三种取值，看是报错、还是静默当 cpu 用。
+"""Check whether sherpa-onnx's provider argument can really switch to GPU.
+
+Background: the from_sense_voice(provider='cpu') signature does take provider,
+but the wheel is a pure CPU build (ldd finds no libcudart / libnvinfer).
+This measures three values to see whether it errors out or silently degrades to cpu.
 """
 import time
 from pathlib import Path

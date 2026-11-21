@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""量一段音频里「停顿」的长度分布——断句门限能设多松，由它决定。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-用法：
+"""Measure the length distribution of pauses in a clip -- it decides how loose the segmentation threshold can be.
+
+Usage:
     ./asr-venv/bin/python tools/pause_hist.py /tmp/meet60.wav
 
-门限用和 Segmenter 一样的口径：10 分位当本底 + margin 8dB。
-输出每档停顿（0.2/0.3/0.45/0.7/0.9/1.2s）以上的个数，以及"能被该门限用上的停顿占比"。
+The threshold uses the same convention as the Segmenter: 10th percentile as the baseline + margin 8dB.
+Prints the count of pauses above each bucket (0.2/0.3/0.45/0.7/0.9/1.2s), plus "the share of pauses that threshold can use".
 
-判读：
-- ≥0.9s 的停顿寥寥 → 密集口语里根本没有长停顿，hold_long 设多大都没用，
-  这时唯一的出路是省掉"等停顿"这一步（段后语义合并），而不是继续调阈值。
-- ≥0.3s 一大把但 ≥0.45s 骤降 → 说明说话人只在词间换气，句界和词界在能量上分不开。
+Reading it:
+- very few pauses ≥0.9s -> dense speech simply has no long pauses, no value of hold_long helps;
+the only way out is to drop the "wait for a pause" step (post-segment semantic merge) instead of retuning the threshold.
+- plenty ≥0.3s but a sharp drop at ≥0.45s -> the speaker only breathes between words; sentence and word boundaries are indistinguishable by energy.
 """
 from __future__ import annotations
 
@@ -64,7 +67,7 @@ def main(path: str) -> int:
         print(f"  ≥{t:3.2f}s  {n:3d} 个  {n / max(1, len(runs)) * 100:3.0f}%   "
               f"共 {cum:5.1f}s")
 
-    # 直方：0.2s 一档
+    # Histogram: 0.2s bins
     buckets: dict[float, int] = {}
     for r in runs:
         b = min(2.0, round(r * 5) / 5)

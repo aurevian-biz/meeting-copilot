@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""连续轮询 8096，记录每个 seq 的译文变化轨迹，验证流式真的在推中间态。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-判据：
-  - 同一个 seq 出现 >1 种 trans 文本（说明有中间态）
-  - 中间态都是最终译文的严格前缀（前端整行替换才不会抖）
-  - 中间态的 trans_ms 为 0（页面数字不乱跳）
+"""Poll 8096 continuously, record the translation trajectory of each seq, and verify that streaming really pushes intermediate states.
+
+Criteria:
+  - the same seq shows >1 distinct trans text (intermediate states exist)
+  - every intermediate state is a strict prefix of the final translation (so a whole-line replace will not flicker)
+  - trans_ms is 0 on intermediate states (the on-page number does not jump around)
 """
 import json
 import time

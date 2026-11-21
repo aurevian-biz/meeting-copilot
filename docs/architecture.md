@@ -1,105 +1,118 @@
-# 架构：两条链路、一个 LLM、三个进程
+# Architecture: two pipelines, one LLM, three processes
+
+[**English**](architecture.md) · [中文](architecture.zh.md) · [日本語](architecture.ja.md)
 
 ```
-                          ┌─────────────────────────────────────────────┐
-   HDMI 采集卡 ─ UVC ───→│  vision.py（常驻抓帧 / OCR / TensorRT rec）  │──→ /api/look
-                          └─────────────────────────────────────────────┘        │
-                                                                                  │
-   ┌──────────── voice-bench :8095（语音助手）──────────────────────────────┐    │
-   │  H340 麦 → KWS「小八你好」→ pw-record → Silero VAD → SenseVoice (ja)  │    │
-   │       → LLM(35B) → 按句切 → Piper(ja/zh) → pw-play → 本地耳机         │←───┘
-   │  浏览器只负责触发与显示；录音和播报都在 Jetson 上，不在浏览器里        │
-   └────────────────────────────────────────────────────────────────────────┘
-                                     │ 共用同一个 OpenAI 兼容端点
+                               ┌───────────────────────────────────────────────────────┐
+   HDMI capture card ─ UVC ───→│  vision.py (resident frame grab / OCR / TensorRT rec) │──→ /api/look
+                               └───────────────────────────────────────────────────────┘    │
+                                                                                            │
+   ┌──────────── voice-bench :8095 (voice assistant) ──────────────────────────────────┐
+   │  H340 mic → KWS 「小八你好」→ pw-record → Silero VAD → SenseVoice (ja)            │    │
+   │       → LLM(35B) → sentence split → Piper(ja/zh) → pw-play → local headset        │←────┘
+   │  Browser triggers and displays only; recording and playback run on the Jetson     │
+   └───────────────────────────────────────────────────────────────────────────────────┘
+                                     │ shared OpenAI-compatible endpoint
                           ┌──────────┴──────────┐
-                          │  Magnitude :10100   │  （或 vLLM :8000）
+                          │  Magnitude :10100   │  (or vLLM :8000)
                           │  Qwen3.5-35B-A3B    │
                           └──────────┬──────────┘
-   ┌──────────── caption-bench :8096（会议字幕）────────────────────────────┐
-   │  采集卡音频 → pw-record（不独占）→ Segmenter（分层停顿 + soft-cut）   │
-   │      → SenseVoice → translate_stream（流式、按需屏幕词提示）           │
-   │      → SSE /api/events → 浏览器增量 DOM 渲染（最新一条在最上）         │
-   └────────────────────────────────────────────────────────────────────────┘
+   ┌──────────── caption-bench :8096 (meeting captions) ───────────────────────────────┐
+   │  capture audio → pw-record (non-exclusive) → Segmenter (tiered pause + soft-cut)  │
+   │     → SenseVoice → translate_stream (streaming, on-demand screen-term hint)       │
+   │     → SSE /api/events → browser incremental DOM (newest line on top)              │
+   └───────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**为什么分成两个进程**：语音助手是「一问一答、要播报」，字幕是「不断流、要实时」，
-两者的线程模型和延迟预算完全不一样。强行合在一起会互相抢 ASR 与 LLM。
-它们通过 `voice_server.py` 的 `/api/look` 共享 OCR 结果——**采集卡是独占设备，
-只有 voice-bench 常驻持有 `/dev/video0`**，字幕要屏幕词时去问它，不自己开设备。
+> 「小八你好」, the wake-word phrase the KWS listens for, is kept verbatim in the diagram.
 
-## 进程与端口
+**Why two processes**: the voice assistant is turn-based Q&A that has to speak out loud, while
+captions are a continuous stream that has to stay real time. Their thread models and latency budgets
+are completely different. Forcing them into one process makes them fight over ASR and the LLM. They
+share OCR results through `/api/look` in `voice_server.py` — **the capture card is an exclusive
+device, and only voice-bench holds `/dev/video0` permanently**, so captions ask it for screen terms
+instead of opening the device themselves.
 
-| 进程 | 端口 | 角色 | 关键环境变量 |
+## Processes and ports
+
+| Process | Port | Role | Key environment variables |
 |---|---|---|---|
-| `magnitude-dockerd` | socket（非 TCP） | 独立 dockerd | — |
-| `magnitude` | 10100 | 35B-A3B 推理 | `MC_DATA` / `MC_MODEL_ID` |
-| `voice-bench` | 8095 | 语音对话 + 看屏幕 | `XDG_RUNTIME_DIR`、`LLM_*`、`MC_SINK` |
-| `caption-bench` | 8096 | 双语字幕 + 监听回放 | `XDG_RUNTIME_DIR`、`LLM_*` |
+| `magnitude-dockerd` | socket (not TCP) | standalone dockerd | — |
+| `magnitude` | 10100 | 35B-A3B inference | `MC_DATA` / `MC_MODEL_ID` |
+| `voice-bench` | 8095 | voice dialogue + looking at the screen | `XDG_RUNTIME_DIR`, `LLM_*`, `MC_SINK` |
+| `caption-bench` | 8096 | bilingual captions + monitor playback | `XDG_RUNTIME_DIR`, `LLM_*` |
 
-## HTTP 接口
+## HTTP API
 
-**8095 语音助手**
+**8095 voice assistant**
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Notes |
 |---|---|---|
-| GET | `/` | 测试台页面 |
-| GET | `/api/health` | 探活（含 LLM 是否可用） |
-| POST | `/api/turn` | 完整一轮：录音 → ASR → LLM → TTS（事件流） |
-| POST | `/api/say` | 直接合成一句话（调试 TTS） |
-| POST | `/api/look` | 抓一帧 → OCR → 返回屏幕文字；字幕服务从这里取词表 |
-| POST | `/api/route` | 只跑路由/判停逻辑 |
-| POST | `/api/reset` | 清空对话上下文 |
-| GET | `/api/live` `/api/poll` | 状态推流 / 兜底轮询 |
-| POST | `/api/kws_check` | 唤醒词自检 |
+| GET | `/` | Test bench page |
+| GET | `/api/health` | Liveness (includes whether the LLM is available) |
+| POST | `/api/turn` | One full turn: record → ASR → LLM → TTS (event stream) |
+| POST | `/api/say` | Synthesize one sentence directly (debugging TTS) |
+| POST | `/api/look` | Grab a frame → OCR → return screen text; the caption service gets its vocabulary from here |
+| POST | `/api/route` | Run only the routing / end-of-utterance logic |
+| POST | `/api/reset` | Clear the dialogue context |
+| GET | `/api/live` `/api/poll` | State push / fallback polling |
+| POST | `/api/kws_check` | Wake-word self-check |
 
-**8096 会议字幕**
+**8096 meeting captions**
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Notes |
 |---|---|---|
-| GET | `/` | 字幕页面 |
-| GET | `/api/events` | SSE，译文每 ~80ms 一个增量；前端断线自动回落 `/api/poll` |
-| GET | `/api/poll?after=N` | 轮询兜底（250ms） |
-| GET | `/api/status` | 全量状态，含 `q_asr/q_tr/dropped/screen/monitor` |
+| GET | `/` | Caption page |
+| GET | `/api/events` | SSE, one translation increment every ~80ms; the front end falls back to `/api/poll` on disconnect |
+| GET | `/api/poll?after=N` | Polling fallback (250ms) |
+| GET | `/api/status` | Full state, including `q_asr/q_tr/dropped/screen/monitor` |
 | POST | `/api/control` | `{"action": "start" \| "stop" \| "clear"}` |
-| POST | `/api/monitor` | 「听 HDMI」：把采集卡收到的声音回放到耳机 |
+| POST | `/api/monitor` | 「听 HDMI」 (Listen to HDMI): play capture-card audio to the headset |
 
-## 字幕为什么要「流式 + SSE + 增量 DOM」
+## Why captions are "streaming + SSE + incremental DOM"
 
-1. **流式 LLM**：整句译完才显示要等 0.8~1.3s；改成逐 token 推送后 0.26s 就开始冒字
-2. **SSE**：服务端每 50ms 检查一次更新，中间态一到就推；轮询最多多等 250ms。
-   服务端不用 `take_updates()`（那是「取走即清空」，两个页面会互相抢补丁），
-   每个连接自己比对译文快照
-3. **增量 DOM**：早期用全量 `innerHTML` + 像素 `scrollY` 回填，长句译文正在变高时
-   重建后同一个 y 指向别的内容 → 「下一句一来，上一句整行消失」。
-   现在每行一个常驻节点，只有变化的文本节点被写；`#main{overflow-anchor:none}`
+1. **Streaming LLM**: waiting until a whole sentence is translated costs 0.8~1.3s; pushing token by
+   token starts filling in at 0.26s
+2. **SSE**: the server checks for updates every 50ms and pushes as soon as an intermediate state
+   arrives; polling would wait up to 250ms longer. The server does not use `take_updates()` (that is
+   "take and clear", so two open pages steal patches from each other) — each connection compares
+   against its own snapshot of the translation
+3. **Incremental DOM**: early on it was a full `innerHTML` rewrite plus pixel `scrollY` backfill, so
+   the anchor drifted while a long translation was growing: after the rebuild the same y pointed at
+   different content → "the moment the next line arrives, the previous line disappears". Now every
+   line is a persistent node and only the text nodes that changed are written;
+   `#main{overflow-anchor:none}`
 
-排列方向是**最新一条在最上**，老行往下推。视线锚点从底部变成顶部，
-翻到下面看旧行时按 `top` 差值补偿 `scrollY`（倒序时补偿符号是 `+`）。
+The order is **newest line on top**, old lines pushed down. The visual anchor moves from the bottom to
+the top; when you scroll down to read old lines, `scrollY` is compensated by the `top` delta (with
+reverse order the sign of the compensation is `+`).
 
-## 文件地图
+## File map
 
-| 文件 | 职责 |
+| File | Responsibility |
 |---|---|
-| `voice_server.py` | 唤醒 / 录音 / ASR / LLM / TTS / Web 测试台 / `/api/look` |
-| `caption_server.py` | 采集 / 断句 / ASR / 流式翻译 / SSE / 字幕页面 |
-| `voice_probe.py` | 音频前端：高通、VAD、切分、SenseVoice 封装 |
-| `vision.py` | 抓帧（丢 40 帧预热）、OCR、屏幕词候选 |
-| `trt_rec.py` | 把 RapidOCR 的 rec 后端换成 TensorRT FP16 |
-| `paths.py` | **唯一**的目录约定，`MC_DATA` 可覆盖 |
-| `deploy/` | 4 个 systemd unit + 安装脚本 |
-| `tools/` | A/B 量测、自检、探针（都不参与运行时） |
-| `test_*.py` | 打桩回归，不需要麦克风和模型在线 |
-| `docs/engineering-log.md` | 每个默认值背后的实测数据与失败方案 |
+| `voice_server.py` | wake / record / ASR / LLM / TTS / web test bench / `/api/look` |
+| `caption_server.py` | capture / segmentation / ASR / streaming translation / SSE / caption page |
+| `voice_probe.py` | audio front end: high-pass, VAD, segmentation, SenseVoice wrapper |
+| `vision.py` | frame grab (drops 40 warm-up frames), OCR, screen-term candidates |
+| `trt_rec.py` | replaces RapidOCR's rec backend with TensorRT FP16 |
+| `paths.py` | the **only** directory convention; `MC_DATA` can override it |
+| `deploy/` | 4 systemd units + install script |
+| `tools/` | A/B measurement, self-checks, probes (none of them run at runtime) |
+| `test_*.py` | stubbed regression, no microphone or live model needed |
+| `docs/engineering-log.md` | the measurements and rejected approaches behind every default |
 
-## 线程 / 实时性
+## Threads / real time
 
-字幕链路上 `q_asr`（等 ASR 的段）和 `q_tr`（等翻译的段）是**唯一可靠的实时性判据**：
+On the caption path, `q_asr` (segments waiting for ASR) and `q_tr` (segments waiting for
+translation) are the **only reliable real-time diagnostic signal**:
 
 ```
-q_asr = 0, q_tr = 0, dropped = 0   → 跟得上
-q_tr 持续上涨                     → 翻译跟不上，先降 --ctx-lines，再看 LLM 是否在抢显存
-dropped > 0                       → 队列开始丢段，延迟已超过实时，必须处理
+q_asr = 0, q_tr = 0, dropped = 0   → keeping up
+q_tr keeps rising                  → translation cannot keep up; lower --ctx-lines first, then check whether the LLM is hogging VRAM
+dropped > 0                        → the queue has started dropping segments; latency is past real time and must be dealt with
 ```
 
-`--tr-workers 1` 是定稿值：加 worker 对单句延迟无差别，只是多抢显存。
-`--ctx-lines 1` 砍掉每句都变的上文，实测省约 90ms。
+`--tr-workers 1` is the settled value: adding workers makes no difference to single-sentence latency,
+it only takes more VRAM. `--ctx-lines 1` drops the context that changes every sentence; measured, it
+saves about 90ms.

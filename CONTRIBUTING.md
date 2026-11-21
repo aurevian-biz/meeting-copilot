@@ -1,48 +1,57 @@
-# Contributing / 贡献指南
+# Contributing
 
-欢迎提 issue 和 PR。这个项目的价值有一半在「为什么这么设计」，所以**改默认值时请带上实测数据**。
+[**English**](CONTRIBUTING.md) · [中文](CONTRIBUTING.zh.md) · [日本語](CONTRIBUTING.ja.md)
 
-## 提交前
+Issues and pull requests are welcome. Half the value of this project is *why* it is built
+this way, so **when you change a default, bring the measurement with it**.
+
+## Before you push
 
 ```bash
 python -m compileall -q .
-.venv/bin/python test_caption_pipe.py        # 16 组，含页面 JS 语法
+.venv/bin/python test_caption_pipe.py        # 16 groups, incl. page JS syntax
 .venv/bin/python -m pytest -q test_barge.py test_tts_routing.py test_vision.py \
                               test_voice_probe.py test_wake.py
 node tools/dom_render_test.js
-bash scripts/healthcheck.sh                  # 上机的话
+bash scripts/healthcheck.sh                  # if you have the hardware
 ```
 
-改动落在哪一层，就补哪层的用例：
+Add a case at the layer you touched:
 
-| 改动 | 必须补 |
+| Change | Test you must add |
 |---|---|
-| 断句 / 队列 / 翻译请求 | `test_caption_pipe.py` |
-| 字幕页面 JS（`PAGE`） | `test_page_js_syntax` + `tools/dom_render_test.js`，改完记得 F5 |
-| SSE / 数据格式 | `tools/sse_regress.py` |
-| 音频前端 / VAD | `test_voice_probe.py` |
-| OCR / 屏幕词表 | `test_vision.py` / `test_screen_hints`（在 `test_caption_pipe.py` 内） |
+| Segmentation / queue / translation request | `test_caption_pipe.py` |
+| Caption page JS (`PAGE`) | `test_page_js_syntax` + `tools/dom_render_test.js`; reload the page afterwards |
+| SSE / data format | `tools/sse_regress.py` |
+| Audio front end / VAD | `test_voice_probe.py` |
+| OCR / screen term hints | `test_vision.py` / `test_screen_hints` (inside `test_caption_pipe.py`) |
 
-## 几条约定
+## Conventions
 
-1. **不在代码里写绝对路径**。目录一律走 `paths.py`，用 `MC_DATA` 覆盖。
-2. **不提交密钥**。`conf/env.example` 只是模板；真值在 `/etc/meeting-copilot/env`。
-3. **`PAGE` 必须是 `r"""`**。普通字符串会把 JS 的 `\n` 吃掉，整段脚本语法错误，
-   页面卡「连接中…」而服务端全好——已经出过一次事故。
-4. **换模型/换参数要写清判据**：`q_asr/q_tr/dropped`、`ttft_ms`、断句完整度、
-   语言纯净度，别只写「感觉更快」。
-5. 中文/日文/英文 README 三份保持一致；细节文档写中文即可，不必三语同步。
+1. **No absolute paths in code.** Directories go through `paths.py`; override with `MC_DATA`.
+2. **No secrets.** `conf/env.example` is only a template; real values live in
+   `/etc/meeting-copilot/env`.
+3. **`PAGE` must stay `r"""`.** A normal Python string eats the `\n` inside the embedded JS,
+   which breaks the whole `<script>`: the page freezes on 「连接中…」 while the server looks
+   perfectly healthy. This has already happened once.
+4. **State the criterion when swapping models or parameters** — `q_asr/q_tr/dropped`,
+   `ttft_ms`, segmentation completeness, language purity. "Feels faster" is not a criterion.
+5. **Keep the three languages in sync.** Every document and README exists as
+   `x.md` (English), `x.zh.md` (Chinese) and `x.ja.md` (Japanese). A change to one is a
+   change to all three.
+6. **Comments in code are English.** User-facing strings stay in their original language —
+   the UI and the prompts are part of the product, not documentation.
 
-## 脱敏规则（维护者备忘）
+## Maintainer note (redaction)
 
-公开仓是从内部工作区整理出来的：那边混着调试截图、运行时产物，以及写死了本机路径 /
-内网 IP / LLM Bearer token 的 unit。重新生成时用维护脚本（**只在内部工作区，不在公开仓**）：
+The public repository is derived from a private working tree that also contains debug
+screenshots, runtime artefacts, and units with machine-specific paths, LAN addresses and
+an LLM bearer token. Regenerate with the packaging script (kept in the private tree only):
 
 ```bash
-# 在内部工作区执行，目标是公开仓目录
 python tools/package_opensource.py --dest /path/to/meeting-copilot --force
 ```
 
-它只挑运行时真正需要的文件、按规则替换敏感字符串，并在结束时自检
-「无密钥 / 无本机路径 / 无内网 IP」；`docs/` 和 README 不会被删。
-CI（`.github/workflows/ci.yml`）里还有一道同样的扫描，防止误提交。
+It picks only the files the runtime needs, rewrites sensitive strings by rule, and self-checks
+"no secrets / no local paths / no private IPs". It never deletes `docs/` or the READMEs.
+CI (`.github/workflows/ci.yml`) runs the same scan to catch a slip before it is merged.

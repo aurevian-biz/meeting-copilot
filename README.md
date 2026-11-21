@@ -1,136 +1,139 @@
 # meeting-copilot
 
-**1 台のエッジデバイスで完結する、日中バイリンガル会議字幕 ＋ 音声アシスタント。**
+**Fully local, Japanese↔Chinese meeting captions and a voice assistant on a single edge box.**
 
-[中文](README.zh.md) · [English](README.en.md) · [License: MIT](LICENSE)
+[**English**](README.md) · [中文](README.zh.md) · [日本語](README.ja.md) · [MIT](LICENSE)
 
-クラウド API は一切使いません。音声認識・翻訳・音声合成・画面 OCR・LLM 推論のすべてを
-ローカルで動かします。会議の音声も画面も外に出ないので、社内会議や機微な内容にも使えます。
+No cloud inference. ASR, translation, TTS, screen OCR and the LLM all run on the device,
+so meeting audio and screen content never leave the machine.
 
 ```
-:8095  音声アシスタント   ウェイクワード → ASR → LLM → TTS → ローカル再生
-:8096  会議字幕           HDMI 音声 → 分割 → ASR → ストリーミング翻訳 → SSE → ブラウザ
-:10100 LLM               Qwen3.5-35B-A3B（Magnitude）／ 任意の OpenAI 互換エンドポイント
+:8095  voice assistant   wake word → ASR → LLM → TTS → local playback
+:8096  meeting captions  HDMI audio → segmentation → ASR → streaming MT → SSE → browser
+:10100 LLM               Qwen3.5-35B-A3B (Magnitude), or any OpenAI-compatible endpoint
 ```
 
-## できること
+## Highlights
 
-- **日本語で話すと中国語の字幕が流れる**（逆方向も可）。訳文は 1 トークンずつ逐次表示、
-  最初の 1 文字は約 400〜470ms、知覚レイテンシは約 290ms
-- **ウェイクワード「小八你好」**で常駐起動。発話中に割り込むと即座に停止（barge-in）
-- **「画面を見て」と頼むと HDMI キャプチャを OCR**。画面上の固有名詞を使って
-  ASR の同音異字を訂正する仕組み付き（当たった文だけ +65ms、外れれば 0 トークン）
-- **ブラウザは表示だけ**。録音も再生もデバイス側なので、PC のマイク性能に左右されません
-- **2 つの画面を同時に開いても壊れない** SSE 設計、最新行が上に来る増分 DOM レンダリング
-- 100% オフライン。モデルはすべてローカル、API キーは自前の推論サーバー用だけ
+- **Japanese speech → Chinese subtitles** (and vice versa). Tokens stream in as they are
+  produced: first token in ~400–470 ms, perceived end-to-end lag ~290 ms.
+- **Wake word** plus barge-in (interrupt playback by speaking); crosstalk does not
+  false-trigger.
+- **"Look at the screen"**: OCR over an HDMI capture card, used to correct ASR
+  homophone mistakes for proper nouns — only when a term actually matches
+  (+65 ms on a hit, zero extra tokens otherwise).
+- The browser only renders. Recording and playback happen on the device, so your
+  laptop's microphone is irrelevant.
+- SSE shared safely between multiple open pages; newest line on top, incremental DOM
+  updates (no full `innerHTML` repaints).
+- Works offline. The only credential is the Bearer token of your own local LLM server.
 
-## クイックスタート
+## Quick start
 
-JetPack を焼いた Jetson AGX Orin（64GB）に、HDMI キャプチャカードと USB ヘッドセットを
-挿してから：
+On a Jetson AGX Orin 64GB (JetPack 7.2) with an HDMI capture card and USB headset:
 
 ```bash
 git clone https://github.com/<you>/meeting-copilot.git /opt/meeting-copilot
 cd /opt/meeting-copilot
-export MC_DATA=/media/ssd/mc-data          # モデル・権重は外付け SSD 推奨
-sudo -E bash scripts/install.sh             # 依存 + venv + モデル 3.4G
+export MC_DATA=/media/ssd/mc-data          # models + weights on an external SSD
+sudo -E bash scripts/install.sh             # deps + venv + 3.4G of models
 
-bash scripts/llm-magnitude.sh               # 35B-A3B 用の dockerd 設定
-sudo -E bash deploy/install-units.sh        # systemd unit と /etc/meeting-copilot/env
-sudo systemctl start magnitude              # コールドスタート約 3 分
+bash scripts/llm-magnitude.sh               # dedicated dockerd config for 35B
+sudo -E bash deploy/install-units.sh        # 4 systemd units + /etc/meeting-copilot/env
+sudo systemctl start magnitude              # ~3 min cold start (22.9G weights)
 sudo systemctl start voice-bench caption-bench
 
 bash scripts/healthcheck.sh
 ```
 
-ブラウザで `http://<デバイスIP>:8095`（音声）/ `:8096`（字幕）を開きます。
-**最初に [hardware.md](docs/hardware.md) の 3 項目（60Hz ハム・ゲイン・ウォームアップフレーム）
-を必ず確認してください** — ここを怠ると以降のチューニングが全部無効になります。
+Open `http://<device-ip>:8095` (assistant) and `:8096` (captions).
 
-詳しい手順は [install.md](docs/install.md)、詰まったら
-[troubleshooting.md](docs/troubleshooting.md)。
+> **Read [hardware.md](docs/hardware.md) first**: 60 Hz mains hum needs a high-pass filter,
+> the H340 capture gain must be lowered from +8 dB to 0 dB, and the capture card emits
+> ~40 warm-up frames that must be discarded. None of these produce an error — they just
+> silently invalidate every later tuning step.
 
-## ハードウェア
+Full steps: [install.md](docs/install.md). Stuck? [troubleshooting.md](docs/troubleshooting.md).
 
-| パーツ | 例 | 用途 |
+## Hardware
+
+| Part | Example | Role |
 |---|---|---|
-| エッジボード | Jetson AGX Orin 64GB（JetPack 7.2 / Ubuntu 24.04） | 全推論 |
-| HDMI キャプチャ | MacroSilicon MS2109（`534d:2109`） | 画面 OCR ＋ HDMI 音声 |
-| USB ヘッドセット | Logitech H340 | 集音 ＋ ローカルモニタ |
-| 外付け SSD | 128GB 以上 | モデル 3.4G ＋ 35B 権重 22.9G |
+| Edge board | Jetson AGX Orin 64GB (JetPack 7.2 / Ubuntu 24.04) | all inference |
+| HDMI capture | MacroSilicon MS2109 (`534d:2109`) | screen OCR + HDMI audio |
+| USB headset | Logitech H340 | mic + local monitoring |
+| External SSD | ≥128 GB | 3.4G models + 22.9G LLM weights |
 
-Orin 以外でも動きます（x86 + NVIDIA GPU でも可）。ただし CUDA 13 系では
-onnxruntime-gpu が使えないため、OCR の高速化は TensorRT 経由になります
-（[ocr-gpu.md](docs/ocr-gpu.md)）。
+Also runs on x86 + NVIDIA GPU. On CUDA 13, `onnxruntime-gpu` is unusable, so OCR
+acceleration goes through TensorRT ([ocr-gpu.md](docs/ocr-gpu.md)).
 
-## 構成
+## Design notes
 
-```
-HDMI ─→ キャプチャカード ─┬─→ vision.py（常駐フレーム取得 / OCR / TensorRT rec）─→ /api/look
-                          └─→ 音声 ─→ Segmenter ─→ SenseVoice ─→ ストリーミング翻訳 ─→ SSE
-USB マイク ─→ KWS ─→ ASR ─→ LLM ─→ 文単位 TTS ─→ pw-play ─→ ヘッドセット
-                              │
-                    Qwen3.5-35B-A3B（Magnitude :10100）※ vLLM 7B にも差し替え可
-```
+- Captions and the assistant are **separate processes**: a continuous stream and a
+  turn-based dialogue have different latency budgets and thread models. OCR is shared
+  via `/api/look` because `/dev/video0` is exclusive — only `voice-bench` holds it.
+- Audio uses **PipeWire**, which allows multiple readers of one source (`arecord` gets
+  "device busy").
+- Translation streams over **SSE** with **incremental DOM** updates. The earlier
+  full-`innerHTML` + pixel-`scrollY` approach drifted while a long line grew, making the
+  previous line appear to vanish.
 
-重要な設計判断：
+See [architecture.md](docs/architecture.md).
 
-- **字幕と音声アシスタントは別プロセス**。レイテンシ予算もスレッド模型も違うため、
-  1 つにまとめると ASR と LLM を取り合います。OCR は `/api/look` 経由で共有
-  （`/dev/video0` は排他デバイスなので片側だけが保持）
-- **録音は PipeWire**。複数クライアントが同じ source を読めます（`arecord` は「device busy」）
-- **訳文は SSE ＋ 増分 DOM**。全量 `innerHTML` ＋ ピクセル `scrollY` 復元は、
-  長い文が伸びている最中に錨がズレて前の行が消えるバグを生みました
+## Documentation
 
-詳細は [architecture.md](docs/architecture.md)。
+Every document exists in three languages: this table links the English files, and the
+same name with `.zh.md` / `.ja.md` is the Chinese / Japanese version
+(for example [hardware.zh.md](docs/hardware.zh.md), [hardware.ja.md](docs/hardware.ja.md)).
+Each page carries a language switcher at the top.
 
-## ドキュメント
-
-| 文書 | 内容 |
+| Doc | Contents |
 |---|---|
-| [hardware.md](docs/hardware.md) | 部品・配線・最初に直すべき 3 つの物理問題 |
-| [install.md](docs/install.md) | ゼロから起動まで |
-| [models.md](docs/models.md) | モデル一覧・選定理由・ライセンス注意 |
-| [llm-serving.md](docs/llm-serving.md) | Magnitude 35B vs vLLM 7B、prefill / キャッシュの落とし穴 |
-| [ocr-gpu.md](docs/ocr-gpu.md) | TensorRT で OCR を 3.5 倍にする |
-| [usage.md](docs/usage.md) | 画面の使い方・全パラメータ・状態の読み方 |
-| [latency.md](docs/latency.md) | レイテンシ予算・計測方法・「これ以上追うな」という硬い床 |
-| [testing.md](docs/testing.md) | オフライン回帰と A/B ツール |
-| [troubleshooting.md](docs/troubleshooting.md) | 静かに効かなくなる系のトラブル集 |
-| [engineering-log.md](docs/engineering-log.md) | 全実測データと没案の記録（約 65KB） |
+| [hardware.md](docs/hardware.md) | BOM, wiring, the three physical issues to fix first |
+| [install.md](docs/install.md) | Zero-to-running |
+| [models.md](docs/models.md) | Model list, why each, license caveats |
+| [llm-serving.md](docs/llm-serving.md) | Magnitude 35B vs vLLM 7B; prefill / prefix-cache traps |
+| [ocr-gpu.md](docs/ocr-gpu.md) | 3.5× OCR with TensorRT |
+| [usage.md](docs/usage.md) | UI, all flags, status fields |
+| [latency.md](docs/latency.md) | Budget, measurement, hard floors |
+| [testing.md](docs/testing.md) | Offline regression + A/B tools |
+| [troubleshooting.md](docs/troubleshooting.md) | Silent-failure playbook |
+| [engineering-log.md](docs/engineering-log.md) | All measurements and rejected approaches |
 
-## テスト
+## Tests
 
-マイクもモデル也不要、すべてスタブで動きます：
+No microphone and no live model needed — everything is stubbed:
 
 ```bash
-.venv/bin/python test_caption_pipe.py        # 16 グループ（ページ JS 構文チェック含む）
+.venv/bin/python test_caption_pipe.py        # 16 groups, incl. page JS syntax
 .venv/bin/python -m pytest -q test_barge.py test_tts_routing.py test_vision.py \
                               test_voice_probe.py test_wake.py
-node tools/dom_render_test.js                # レンダリング 26 項目
+node tools/dom_render_test.js                # 26 render-layer checks
 ```
 
-※ `tools/sse_regress.py` は**稼働中の 8096 に 90 秒 subscribe する実運用チェック**
-（オフラインではありません）。訳文の後戻り・空化が 0 かを実ストリームで確認します。
+`tools/sse_regress.py` is a **live check**: it subscribes to a running :8096 for 90 s
+and asserts no translation regressions or blanking. It is not an offline test.
 
-## 設定とセキュリティ
+## Configuration & secrets
 
-- ディレクトリは [paths.py](paths.py) に集約。**コード内に絶対パスは書きません**。
-  外付け SSD を使うときは `MC_DATA` を 1 つ設定するだけです
-- LLM の Bearer トークンなどは `/etc/meeting-copilot/env`（権限 0640）に置きます。
-  **リポジトリには秘密情報を含めません**。CI で `mag-*` / ローカルパス / プライベート IP を
-  毎回スキャンしています
-- 初回起動前に `conf/env.example` をコピーして中身を確認してください
+- All paths live in [paths.py](paths.py); **no absolute paths in code**. Point `MC_DATA`
+  at an external SSD and everything follows.
+- The LLM Bearer token lives in `/etc/meeting-copilot/env` (mode 0640).
+  **No secrets in this repo** — CI scans for `mag-*`, local paths and private IPs.
+- Nothing in the repo identifies the development machine: no hostnames, usernames,
+  e-mail addresses, serial numbers or LAN addresses. See [SECURITY.md](SECURITY.md).
 
-## ライセンスと注意
+## License
 
-コードは **MIT** です。ただし**モデル本体は含まれません**。
-`scripts/download-models.sh` が上流の公式配布先からダウンロードするだけです。
-各モデル（SenseVoice / Piper 各音色 / PP-OCR / Qwen など）はそれぞれ別のライセンスです。
-商用利用の前に必ず上流のモデルカードを確認してください。
+Code is **MIT** — see [LICENSE](LICENSE). Copyright (c) 2026 meeting-copilot contributors.
 
-謝辞：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)、
-[SenseVoice](https://github.com/FunAudioLLM/SenseVoice)、
-[RapidOCR](https://github.com/RapidAI/RapidOCR)、
-[Piper](https://github.com/rhasspy/piper)、[piper-voices](https://huggingface.co/rhasspy/piper-voices)、
-[Qwen](https://github.com/QwenLM)、[Magnitude](https://magnitude.dev)。
+**Model weights are not included**; `scripts/download-models.sh` only downloads them from
+upstream official URLs. SenseVoice, Piper voices, PP-OCR and Qwen each carry their own
+licenses — check the model cards before commercial use.
+Third-party components and their notices are listed in [NOTICE](NOTICE).
+
+Thanks to [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx),
+[SenseVoice](https://github.com/FunAudioLLM/SenseVoice),
+[RapidOCR](https://github.com/RapidAI/RapidOCR),
+[Piper](https://github.com/rhasspy/piper), [Qwen](https://github.com/QwenLM),
+and [Magnitude](https://magnitude.dev).

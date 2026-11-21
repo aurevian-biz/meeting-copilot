@@ -1,10 +1,13 @@
 #!/bin/bash
-# 备选路线：vLLM + Qwen2.5-7B-AWQ（首字更快、显存更省，质量不如 35B）。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+# Alternative path: vLLM + Qwen2.5-7B-AWQ (faster first token, less VRAM, lower quality than 35B).
 #
-# 什么时候用它：
-#   · 机器只有 32G 内存 / 或者要和别的服务共卡
-#   · 只做字幕、不做「读屏幕+总结」这类长回答
-# 实测对比见 docs/latency.md：35B-A3B（MoE）短回答慢 170~370ms，长回答反而快 25~35%。
+# When to use it:
+#   · the box has only 32G of RAM / or the GPU must be shared with other services
+#   · you only do captions, not long answers such as "read the screen + summarize"
+# Measured comparison in docs/latency.md: 35B-A3B (MoE) is 170~370ms slower on short answers but 25~35% faster on long ones.
 set -euo pipefail
 
 MC_DATA="${MC_DATA:-/opt/meeting-copilot/data}"

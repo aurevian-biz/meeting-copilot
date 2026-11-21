@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
 name: ci
 
 on:
@@ -14,13 +17,13 @@ jobs:
       - uses: actions/setup-node@v4
         with: {node-version: "20"}
 
-      # 1) 全部 Python 能编译（含语法 / 缩进错误）
+      # 1) All Python must compile (catches syntax / indentation errors)
       - name: compileall
         run: python -m compileall -q . && echo ok
 
-      # 2) 内嵌页面的 JS 必须能被浏览器解析。
-      #    这一条是拿事故换来的：PAGE 写成普通字符串时 Python 会把 JS 里的 \n
-      #    变成真换行，整段 <script> 语法错误 → 页面停在「连接中…」而服务端全好。
+      # 2) The JS embedded in the page must parse in a browser.
+      #    This check was bought with an incident: when PAGE is written as a plain string, Python turns \n in the JS
+      #    into real newlines, the whole <script> block becomes a syntax error -> the page sits at "connecting..." while the server is fine.
       - name: page js syntax
         run: |
           python - <<'PY'
@@ -32,8 +35,41 @@ jobs:
           PY
           node --check /tmp/page.js && echo "page js ok"
 
-      # 3) 公开仓不该出现密钥 / 本机路径
+      # 3) The public repo must not contain secrets / local paths / machine identity
       - name: no secrets
         run: |
-          ! grep -rInE "mag-[A-Za-z0-9]{24,}|/media/[a-z]+/[a-z]+/|192\.168\." \
-              --include=*.py --include=*.sh --include=*.service --include=*.md .
+          ! grep -rInE "mag-[A-Za-z0-9]{24,}|/media/[a-z]+/[a-z]+/|192\.168\.|/home/[a-z]+/|/run/user/[0-9]+" \
+              --include=*.py --include=*.sh --include=*.service --include=*.md --include=*.yml .
+
+      # 4) Every document must exist in Chinese / Japanese / English
+      - name: docs are trilingual
+        run: |
+          for d in hardware install models llm-serving ocr-gpu usage latency \
+                   testing troubleshooting architecture engineering-log; do
+            for s in .md .zh.md .ja.md; do
+              test -f "docs/$d$s" || { echo "missing docs/$d$s"; exit 1; }
+            done
+          done
+          for r in README CONTRIBUTING CHANGELOG SECURITY; do
+            for s in .md .zh.md .ja.md; do
+              test -f "$r$s" || { echo "missing $r$s"; exit 1; }
+            done
+          done
+          echo "trilingual ok"
+
+      # 5) Every source file carries the license header
+      - name: spdx headers
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          missing = []
+          for f in pathlib.Path(".").rglob("*"):
+              if not f.is_file() or "__pycache__" in str(f) or ".git/" in str(f):
+                  continue
+              if f.suffix in {".py", ".sh", ".js", ".service", ".yml"} or f.name == "requirements.txt":
+                  head = f.read_text(encoding="utf-8", errors="ignore")[:400]
+                  if "SPDX-License-Identifier: MIT" not in head:
+                      missing.append(str(f))
+          print("missing SPDX:", missing)
+          sys.exit(1 if missing else 0)
+          PY

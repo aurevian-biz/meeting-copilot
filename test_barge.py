@@ -1,9 +1,12 @@
-"""打断（barge-in）的纯逻辑测试：不需要麦克风、模型权重、LLM。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-覆盖三块容易错的地方：
-  1. SpeakState 的播报时间线 —— 合成比播放快，时钟必须按音频时长累加
-  2. 回声判别 —— 外放时不能自己打断自己
-  3. 音频交接 —— 打断后第一句的开头几个字不能被吃掉
+"""Pure-logic tests for barge-in: no microphone, model weights or LLM needed.
+
+Covers three areas that are easy to get wrong:
+  1. SpeakState's playback timeline — synthesis is faster than playback, so the clock must accumulate by audio duration
+  2. Echo detection — with the speaker on, it must not interrupt itself
+  3. Audio handoff — after a barge-in, the first few words of the next sentence must not be eaten
 """
 
 import queue
@@ -30,7 +33,7 @@ class TestSpeakState(unittest.TestCase):
         self.assertGreater(self.sp.remain(), 0.5)
 
     def test_queue_accumulates(self):
-        # 两段各 1 秒：第二段接在第一段后面，总窗口 ≈2 秒而不是 1 秒
+        # two pieces of 1 second each: the second follows the first, so the window is ≈2s, not 1s
         self.sp.add(1.0, "第一句。")
         self.sp.add(1.0, "第二句。")
         self.assertGreater(self.sp.remain(), 1.5)
@@ -56,25 +59,26 @@ class TestSpeakState(unittest.TestCase):
         for i in range(10):
             self.sp.add(0.1, f"第{i}句。")
         said = self.sp.said()
-        self.assertEqual(len(said), 6)          # 只留最近几句
+        self.assertEqual(len(said), 6)          # only the most recent ones are kept
         self.assertEqual(said[-1], "第9句。")
 
 
 class TestEcho(unittest.TestCase):
-    """外放时麦克风听到 TTS，必须判成串音，否则一播报就被打断。"""
+    """With the speaker on, the mic picks up the TTS; that must be judged as echo, otherwise every
+    announcement gets interrupted."""
 
     def test_exact_echo(self):
         self.assertTrue(vs.looks_like_echo(
             "今天天气不错，适合出门。", ["今天天气不错，适合出门。"]))
 
     def test_partial_echo(self):
-        # 串音常被截到半句
+        # echo usually gets truncated to half a sentence
         self.assertTrue(vs.looks_like_echo(
             "今天天气不错", ["今天天气不错，适合出门散步。"]))
 
     def test_truncated_fragment(self):
-        # 端到端实测的真实输出：0.9 秒串音只识别出三个字。
-        # 用整句相似度会得到 0.35 而漏判，所以判据是「最长公共子串占比」
+        # real output measured end to end: 0.9 seconds of echo recognized as only three characters.
+        # whole-sentence similarity yields 0.35 and misses it, so the criterion is "longest common substring ratio"
         self.assertTrue(vs.looks_like_echo(
             "今天天", ["今天天气不错，我们出去走走吧。"]))
 
@@ -87,7 +91,7 @@ class TestEcho(unittest.TestCase):
             "等一下我有别的问题", ["今天天气不错，适合出门散步。"]))
 
     def test_short_command_is_speech(self):
-        # 「停」这种短指令给不出可靠相似度，宁可打断也不要漏
+        # a short command like "停" gives no reliable similarity; better to barge in than to miss it
         self.assertFalse(vs.looks_like_echo("停", ["停下来听我说。"]))
         self.assertFalse(vs.looks_like_echo("等一下", ["停下来听我说。"]))
 
@@ -99,7 +103,7 @@ class TestEcho(unittest.TestCase):
             "今天天气不错。", ["今天天气不错"]))
 
     def test_similar_but_different_topic(self):
-        # 讲同一件事但措辞不同：用户插话，不是串音
+        # same topic but different wording: the user is interjecting, not echo
         self.assertFalse(vs.looks_like_echo(
             "那明天会不会下雨", ["今天多云转晴，最高气温二十度。"]))
 
@@ -109,19 +113,19 @@ class TestEcho(unittest.TestCase):
 
 
 class TestFrameHandoff(unittest.TestCase):
-    """打断交接：检测线程读走的帧必须原样进录音队列。"""
+    """Barge-in handoff: frames consumed by the detection thread must enter the recording queue unchanged."""
 
     def setUp(self):
-        self.hub = vs.AudioHub("plughw:NONE", pre_s=0.6)  # 不 start，纯逻辑
+        self.hub = vs.AudioHub("plughw:NONE", pre_s=0.6)  # not started, pure logic
 
     def test_pre_frames_replace_ring(self):
         hub = self.hub
-        hub._recent.append(np.full(320, 7, dtype=np.int16))   # 环形缓冲里的旧帧
+        hub._recent.append(np.full(320, 7, dtype=np.int16))   # an old frame sitting in the ring buffer
         frames = [np.full(320, 9, dtype=np.int16) for _ in range(5)]
         q = hub.subscribe(pre_s=0.6, pre_frames=frames)
         got = [q.get_nowait() for _ in range(5)]
         self.assertTrue(all(f[0] == 9 for f in got))
-        self.assertTrue(q.empty())      # 没把环形缓冲的旧帧混进来
+        self.assertTrue(q.empty())      # the old ring-buffer frame was not mixed in
 
     def test_ring_buffer_still_used_by_default(self):
         hub = self.hub
@@ -141,7 +145,7 @@ class TestFrameHandoff(unittest.TestCase):
 
 
 class TestBargeThreshold(unittest.TestCase):
-    """门限必须跟静默本底走，且不能被播报期的串音带偏。"""
+    """The threshold must track the silence floor and must not be thrown off by echo while playing."""
 
     def make(self):
         return vs.BargeMonitor(
@@ -152,25 +156,25 @@ class TestBargeThreshold(unittest.TestCase):
     def test_quiet_room(self):
         m = self.make()
         m.quiet_floor = -56.0
-        self.assertAlmostEqual(m.threshold(), -42.0)   # 落在 min_db
+        self.assertAlmostEqual(m.threshold(), -42.0)   # lands on min_db
 
     def test_noisy_room_raises(self):
         m = self.make()
         m.quiet_floor = -30.0
-        self.assertAlmostEqual(m.threshold(), -22.0)   # 本底 +8
+        self.assertAlmostEqual(m.threshold(), -22.0)   # floor +8
 
     def test_echo_does_not_raise(self):
-        # 回归测试：曾经把播报期电平算进门限，结果外放时串音把门限抬到
-        # 人声之上，真人插话永远打不断
+        # regression test: playback-level audio used to be folded into the threshold, so with the
+        # speaker on the echo pushed the threshold above speech and a real interjection never got through
         m = self.make()
         m.quiet_floor = -56.0
-        m.echo_floor = -20.0        # 外放，串音很大
+        m.echo_floor = -20.0        # speaker on, lots of echo
         self.assertAlmostEqual(m.threshold(), -42.0)
 
     def test_capped(self):
         m = self.make()
         m.quiet_floor = -10.0
-        self.assertAlmostEqual(m.threshold(), -18.0)   # max_db 封顶
+        self.assertAlmostEqual(m.threshold(), -18.0)   # capped at max_db
 
 
 if __name__ == "__main__":

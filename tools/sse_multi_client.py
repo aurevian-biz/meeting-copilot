@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""两个客户端同时订阅 /api/events，验证多端都能收到中间态（不互相抢补丁）。"""
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+"""Two clients subscribe to /api/events at once: verify each one receives intermediate states (no patch stealing)."""
 import json
 import threading
 import time

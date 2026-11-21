@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""翻译质量对照：旧 prompt vs 新 prompt，跑同一组真实坏例子。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-用法（在部署目录跑，vLLM 必须活着）：
+"""Translation quality comparison: old prompt vs new prompt on the same set of real bad cases.
+
+Usage (run in the deployment directory, vLLM must be up):
     ./asr-venv/bin/python tools/tr_quality.py
     ./asr-venv/bin/python tools/tr_quality.py --only new
 
-用例全部来自实测抓到的坏输出（混中文、原样照抄、错字未纠），
-判据是「lang_clean 过 + 人眼读得通」，不看速度。
+Every case comes from a bad output caught in measurement (Chinese bleeding in, verbatim copying, uncorrected typos);
+the criterion is "lang_clean passes + a human can read it", not speed.
 """
 from __future__ import annotations
 
@@ -38,7 +41,7 @@ OLD_SYS = {
            "不要把语气词译成实词；但有实义的词要保留。"),
 }
 
-# (目标语言, 原文, 上文)  —— 前 3 条是实测抓到的字面残留，后面是正常句做回归
+# (target language, source, context)  -- the first 3 are literal leftovers caught in measurement, the rest are normal sentences for regression
 CASES = [
     ("zh", "身体面にアメリカは坚持するべきです", ""),
     ("zh", "深zのアプリで何点给深zに評価するか", ""),
@@ -50,14 +53,14 @@ CASES = [
     ("ja", "所以去扯什么台湾会不会进行交易筹码？", ""),
     ("ja", "这个都没有啊，怎么可能第一次就有结论，那不可能的事。", ""),
     ("ja", "三强会晤，三角的峰会我不认为。", "中方刻意的给了韩国好处"),
-    # 下面 4 条来自 62 秒真实音频的端到端输出，是 7B 守不住的原样照抄
+    # The 4 below come from end-to-end output on 62 seconds of real audio: verbatim copies that 7B fails to suppress
     ("ja", "他比较晚了，有开了等一长会议又开了开了会之后才有。", ""),
     ("ja", "这就投扯太远的了，根本不可能在这种地方提出了。", ""),
     ("ja", "了不起在中美会晤中国大陆再讲一下啊，我认为就是这样了。", ""),
     ("ja", "因为他的很容易跟韩国做对比是。", ""),
 ]
 
-# 把最关键的一条重复放到 user 消息末尾：离生成位置最近，小模型对指令位置极敏感
+# Repeat the most critical line at the end of the user message: closest to the generation point, and small models are very sensitive to instruction position
 TAIL = {
     "ja": "\n\n只输出日语译文。禁止出现任何中文词、中文语气词或英文字句。",
     "zh": "\n\n只输出中文译文。禁止出现任何日文词或假名。",

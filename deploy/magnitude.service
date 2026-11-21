@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
 [Unit]
 Description=Magnitude 推理服务（Qwen3.5-35B-A3B，OpenAI 兼容 10100）
 Documentation=https://magnitude.dev
@@ -8,12 +11,12 @@ Wants=magnitude-dockerd.service network-online.target
 Type=oneshot
 RemainAfterExit=yes
 EnvironmentFile=-/etc/meeting-copilot/env
-# 起容器 + 等 health + 等 35B Ready。冷启动含 22.9G 权重加载，约 3 分钟
+# Start the container + wait for health + wait for 35B Ready. Cold start includes loading 22.9G of weights, ~3 minutes
 ExecStart=/usr/local/bin/magnitude-up.sh
 TimeoutStartSec=600
-# 停的时候把模型卸掉释放内存，再停容器；不删容器，下次 start 很快
-# 注意：这里不写 ${MC_DATA}。systemd 只做变量替换、不认 shell 的 ${VAR:-默认}；
-# 所以由 install-units.sh 把 __DATA__ 替换成真实数据根。
+# On stop, unload the model to free memory, then stop the container; the container is kept, so the next start is quick
+# Note: ${MC_DATA} is not used here. systemd only substitutes variables and does not understand shell ${VAR:-default};
+# so install-units.sh replaces __DATA__ with the real data root.
 ExecStop=/bin/bash -c 'DOCKER_HOST=unix://__DATA__/magnitude-data/docker.sock /usr/bin/docker stop magnitude-bench || true'
 
 [Install]

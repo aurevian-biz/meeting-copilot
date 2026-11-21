@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""TTS 文本清洗 / 音色路由 / 切句的纯逻辑测试（不加载模型）。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-覆盖两个真实故障：
-  1. 纯标点片段进 Piper → 0 帧音频 → wave 抛 "# channels not specified"
-  2. 纯数字句子（"1.5"）没有假名也没有汉字 → 落到默认音色（日语），
-     中文回答里的数字被日本語読み
+"""Pure-logic tests for TTS text cleaning / voice routing / sentence splitting (no model loaded).
+
+Covers two real failures:
+  1. A punctuation-only chunk reaches Piper → 0 frames of audio → wave raises "# channels not specified"
+  2. A digits-only sentence ("1.5") has neither kana nor Han characters → falls back to the default
+     voice (Japanese), so digits inside a Chinese answer get Japanese readings
 """
 import sys
 import unittest
@@ -15,7 +18,7 @@ import voice_server as vs  # noqa: E402
 
 
 def fake_tts(voices=("ja", "zh")):
-    """绕过模型加载，只要 pick() 需要的三个属性。"""
+    """Bypasses model loading; sets only the three attributes pick() needs."""
     t = vs.Tts.__new__(vs.Tts)
     t.voices = {k: object() for k in voices}
     t.default = "ja" if "ja" in t.voices else voices[0]
@@ -49,7 +52,7 @@ class TestPick(unittest.TestCase):
         self.assertEqual(self.t.pick("今天天气很好。"), "zh")
 
     def test_digits_follow_hint(self):
-        # 故障 2：中文上下文里 "1.5" 曾经被判成 ja
+        # failure 2: "1.5" in a Chinese context used to be classified as ja
         self.assertEqual(self.t.pick("1.5", hint="zh"), "zh")
         self.assertEqual(self.t.pick("2026", hint="zh"), "zh")
 
@@ -57,7 +60,7 @@ class TestPick(unittest.TestCase):
         self.assertEqual(self.t.pick("1.5", hint="ja"), "ja")
 
     def test_digits_default_zh(self):
-        # 无上下文的英文/数字首句：中文模型不会读成日语音
+        # English/digits first sentence with no context: the Chinese model will not read it with Japanese phonetics
         self.assertEqual(self.t.pick("OK"), "zh")
 
     def test_latin_follows_hint(self):

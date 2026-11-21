@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""同一段真实音频、同一批切段，多个引擎正面比：首字 / 全文 / 质量。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-为什么不用 `ab_translate.py`：那个用 14 条定长句子，短句（8~20 token）占多数，
-MoE 的 prefill 劣势被低估、dense 的优势被高估。这里用真实音频切出来的段，
-长度分布就是线上分布，才能回答「9B 还是 35B」。
+"""One real audio clip, one batch of cut segments, several engines compared head to head: first token / full text / quality.
 
-四条设计约束（都是被坑出来的）：
-- **ASR 只跑一次**，多臂共用同一份文本和同一份【上文】。否则比的是 ASR 抖动。
-- **每臂先热身一发**：首次请求要建图 + 填前缀缓存，不热身会把 p50 拉高。
-- **每臂连续跑完自己的全部段，不要交替**：前缀缓存在两套 system prompt 之间
-  来回切换会全部失效（实测一交替 `cache_n` 就从 290 掉到 0）。
-- **判据看 `prompt_n - cache_n`**（引擎本轮真处理的 token 数），首字只是它的函数。
+Why not `ab_translate.py`: that uses 14 fixed-length sentences, mostly short ones (8-20 tokens),
+so MoE's prefill disadvantage is underestimated and dense's advantage overestimated. Here the segments come from real audio, and the
+length distribution is the production distribution, which is what it takes to answer "9B or 35B".
 
-用法（多臂各跑一遍）：
+Four design constraints (all learned the hard way):
+- **run ASR once only**; every arm reuses the same text and the same [context]. Otherwise it compares ASR jitter.
+- **warm up each arm once first**: the first request builds graphs + fills the prefix cache, and skipping the warm-up inflates p50.
+- **run each arm through all of its segments consecutively, never interleaved**: switching the prefix cache back and forth
+  between two system prompts invalidates all of it (measured: one interleave drops `cache_n` from 290 to 0).
+- **judge by `prompt_n - cache_n`** (the token count the engine really processed this round); the first token is merely a function of it.
+
+Usage (run each arm in turn):
 
     ./asr-venv/bin/python tools/wav_seg_ab.py --wav /tmp/meet60.wav \
         --arm "35B|http://127.0.0.1:10100/inference/v1|hf:unsloth/...gguf|mag-xxx" \
         --arm "9B|http://127.0.0.1:10100/inference/v1|qwen3.5-9b:gguf:q4|mag-xxx" \
         --ctx-lines 2 --out /tmp/wav_ab.json
 
-只看质量不比速度时，把 `--no-timing` 关掉没必要——反正只有一次 ASR。
+When only quality matters and speed does not, there is no point turning off `--no-timing` -- there is only one ASR pass anyway.
 """
 from __future__ import annotations
 
@@ -43,7 +46,7 @@ ASR_DIR = ("/opt/meeting-copilot/data/asr-models/"
 
 
 def segment(wav: str, ns: argparse.Namespace) -> list[np.ndarray]:
-    """按线上同一套断句参数把 wav 切成段。末尾补 1 秒静音，否则最后一句不 flush。"""
+    """Cut the wav into segments with the same segmentation parameters as production. Append 1s of silence at the end, otherwise the last sentence never flushes."""
     audio, sr = cs.vp.read_wav(wav)
     if sr != cs.SR:
         n = int(round(audio.size * cs.SR / sr))
@@ -122,7 +125,7 @@ def main() -> int:
     if not items:
         return 1
 
-    # 上文按 ASR 文本顺序拼，所有臂完全一致
+    # Context is assembled in ASR text order, identical for every arm
     for i, it in enumerate(items):
         prev = [x["text"] for x in items[max(0, i - ns.ctx_lines):i]] if ns.ctx_lines else []
         it["ctx"] = "".join(prev)
@@ -133,7 +136,7 @@ def main() -> int:
         print(f"\n-- {arm['name']}  {arm['model']}", flush=True)
         if arm["key"]:
             cs._LLM_KEY = arm["key"]
-        # 热身：同一份 system prompt 打一发，建图 + 让前缀缓存热起来
+        # Warm-up: fire one request with the same system prompt to build graphs + heat the prefix cache
         cs.translate_stream(arm["base"], arm["model"], "熱身", "zh", timeout=120)
         rows = []
         for i, it in enumerate(items, 1):
@@ -163,8 +166,8 @@ def main() -> int:
             "ttft_p90": tt[min(len(tt) - 1, int(len(tt) * 0.9))] if tt else -1,
             "total_p50": int(statistics.median(tot)) if tot else -1,
             "chars_p50": int(statistics.median([r["chars"] for r in ok])) if ok else 0,
-            # Magnitude 的 prompt_n **就是本轮真处理的 token 数**（cache_n 是复用的那部分，
-            # 两者相加才是总 prompt）。所以新 token = prompt_n，别再相减。
+            # For Magnitude, prompt_n **is the token count really processed this round** (cache_n is the reused part,
+            # and only the sum of the two is the whole prompt). So new tokens = prompt_n; do not subtract again.
             "new_tok_p50": int(statistics.median([r["prompt_n"] for r in ok])) if ok else -1,
             "suspect_copy": sum(x["suspect_copy"] for x in m),
             "kana_left": sum(x["kana_left"] for x in m),
@@ -183,7 +186,7 @@ def main() -> int:
         print(f"{name:<10}{s['ttft_p50']:>9}{s['ttft_p90']:>9}{s['total_p50']:>9}"
               f"{s['new_tok_p50']:>9}{s['suspect_copy']:>6}{s['kana_left']:>7}{s['empty']:>4}")
 
-    # 逐句对照：只有同一句才看得出质量差
+    # Line-by-line comparison: only the same line reveals a quality difference
     if len(results) > 1:
         print(f"\n-- 逐句对照 --")
         names = list(results)

@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""sse_regress.py —— 抓「上一句译文被删掉/回退」的现场。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-现象（用户报）：上一句是长文、译文还在流式输出时，下一句来了，上一句的流就没了。
+"""sse_regress.py -- catch the scene where "the previous sentence's translation gets deleted / regresses".
 
-这里只做一件事：订阅 /api/events，为每个 seq 记下每次见到的译文版本，然后
-判两件事——
+Symptom (reported by users): the previous line is long and its translation is still streaming when the next line arrives, and the previous stream just disappears.
 
-  1. **回退**：新版本不是旧版本的前缀（`"abc" → "abd"` / 变短 / 变空）
-  2. **消失**：某行的译文从非空变成空
+This does one thing only: subscribe to /api/events, record every translation version seen for each seq, then
+judge two things --
 
-同时用前端同样的合并逻辑（`pushLines` + `applyUpd` 的 Python 复刻）跑一遍，
-输出「页面上最终会显示什么」，确认是不是前端合并的问题而不是数据本身。
+  1. **regression**: the new version is not a prefix of the old one (`"abc" → "abd"` / shorter / becoming empty)
+  2. **disappearance**: a line's translation goes from non-empty to empty
 
-用法：
+At the same time it replays the frontend's own merge logic (a Python port of `pushLines` + `applyUpd`),
+prints "what will actually end up on the page", and confirms whether this is a frontend merge problem rather than the data itself.
+
+Usage:
     ./asr-venv/bin/python tools/sse_regress.py --sec 90
     ./asr-venv/bin/python tools/sse_regress.py --sec 90 --verbose
 """
@@ -23,23 +26,23 @@ import urllib.request
 
 
 def is_prefix(old: str, new: str) -> bool:
-    """新版本是不是旧版本的延伸（流式正常形态）。"""
+    """Whether the new version extends the old one (the normal streaming shape)."""
     return new.startswith(old)
 
 
 class Probe:
     def __init__(self, verbose: bool = False):
-        self.seen: dict[int, str] = {}       # 服务端推送的当前版本
+        self.seen: dict[int, str] = {}       # current version pushed by the server
         self.hist: dict[int, list[str]] = {}
         self.regress: list[dict] = []
         self.vanish: list[dict] = []
         self.verbose = verbose
-        # 前端合并状态：seq -> 行对象（只关心 trans）
+        # Frontend merge state: seq -> line object (only trans matters)
         self.page: dict[int, dict] = {}
         self.page_order: list[int] = []
 
     def on_payload(self, p: dict, t: float) -> None:
-        # ---- 服务端原始推送 ----
+        # ---- raw server pushes ----
         for u in p.get("upd") or []:
             seq, cur = u["seq"], u.get("trans") or ""
             old = self.seen.get(seq)
@@ -58,10 +61,10 @@ class Probe:
             self.seen[seq] = cur
             self.hist.setdefault(seq, []).append(cur)
 
-        # ---- 前端合并逻辑复刻：pushLines 然后 applyUpd ----
+        # ---- frontend merge logic ported: pushLines then applyUpd ----
         for l in p.get("lines") or []:
             if l["seq"] in self.page:
-                continue                     # idx.has 去重
+                continue                     # idx.has dedupe
             self.page[l["seq"]] = dict(trans=l.get("trans") or "",
                                        pending=bool(l.get("pending")),
                                        text=(l.get("text") or "")[:20])

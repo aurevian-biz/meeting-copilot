@@ -1,41 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""vision.py — 让语音助手「看一眼屏幕」
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-链路：/dev/video0（UVC 采集卡）→ 丢弃预热帧 → 缩放 → RapidOCR → 文本
+"""vision.py — let the voice assistant "take a look at the screen"
 
-## 为什么是 RapidOCR 而不是 PaddleOCR
+Pipeline: /dev/video0 (UVC capture card) → drop warm-up frames → scale → RapidOCR → text
 
-Jetson AGX Orin 实测，同一张 1080p 中文界面截图（50 行文字）：
+## Why RapidOCR rather than PaddleOCR
 
-| 引擎 | 耗时 | 平均置信 |
+Measured on Jetson AGX Orin, the same 1080p Chinese UI screenshot (50 lines of text):
+
+| Engine | Time | Mean confidence |
 |---|---|---|
 | RapidOCR (onnxruntime) | **6.2s** | 0.894 |
-| PaddleOCR 默认（server 模型） | 17.0s | 0.98 |
+| PaddleOCR default (server model) | 17.0s | 0.98 |
 | PaddleOCR mobile | 24.6s | 0.749 |
 
-mobile 模型在 Jetson 上反而比 server 更慢（Jetson CPU 对大卷积更友好），
-且置信度明显下降。RapidOCR 还省掉 paddle 那几百 MB 依赖——asr-venv 里现成就有。
+On Jetson the mobile model is actually slower than server (the Jetson CPU likes large convolutions),
+and its confidence drops noticeably. RapidOCR also drops paddle's few hundred MB of deps — asr-venv has them already.
 
-## 为什么输入先缩到长边 1440
+## Why the input is scaled to a 1440 long edge first
 
-1920 原图要 7.3s，而且「窗口」被读成「官口」；缩到 1440 只要 5.7s，反而读对了。
-RapidOCR 内部会把长边压到固定尺寸，先自己用 INTER_AREA 缩能少一次重采样。
-960 以下小字开始糊（「编辑」→「编冀」），不要更低。
+The 1920 original takes 7.3s and reads 「窗口」 as 「官口」; at 1440 it takes only 5.7s and reads correctly.
+RapidOCR internally squashes the long edge to a fixed size, so scaling with INTER_AREA first saves one resampling pass.
+Below 960 small glyphs start to smear (「编辑」→「编冀」), so do not go lower.
 
-## OCR 线程数为什么要写死
+## Why the OCR thread count is hard-coded
 
-`RapidOCR()` 不传线程数就吃 onnxruntime 默认值。这台机同时跑 vLLM、ASR、字幕服务，
-12 核吃满 12 线程实测 **9.10s**，显式 8 线程 **4.36s**——超订的代价远大于并行收益。
-平坦区 6~8，10 开始退化。见 `OCR_THREADS`。
+`RapidOCR()` without a thread count takes the onnxruntime default. This machine also runs vLLM, ASR and captions,
+12 cores at 12 threads measures **9.10s**, explicit 8 threads **4.36s** — oversubscription costs far more than parallelism gains.
+The flat region is 6~8, degradation starts at 10. See `OCR_THREADS`.
 
-## 为什么每段音频不丢帧，但打开设备要丢 40 帧
+## Why no frames are dropped per audio segment, but 40 are dropped on device open
 
-MS2109 每次**打开设备或切换分辨率**后，前 33~36 帧是纯黑（实测 YMAX=7）。不丢就是
-一张黑图，OCR 出来是空的，看起来像「屏幕上没字」。这个坑在 README 4.7 有完整记录。
+On MS2109, after every **device open or resolution switch** the first 33~36 frames are pure black (YMAX=7 measured). Skip them and you get
+one black image whose OCR is empty, looking like "there is no text on screen". README 4.7 has the full record of this trap.
 
-所以预热是「每次 open 一次」，不是「每次取帧一次」：`_Capture` 把句柄常驻下来，
-**一个进程生命周期只付这一次 1.2 秒**。取帧从 2.87 秒降到几十毫秒（读 2 帧就够新）。
+So warm-up happens "once per open", not "once per frame grab": `_Capture` keeps the handle resident,
+**a process lifetime pays that 1.2s only once**. Frame grab drops from 2.87s to tens of milliseconds (2 frames are fresh enough).
 """
 
 from __future__ import annotations
@@ -45,15 +48,15 @@ import time
 from pathlib import Path
 
 
-# OCR 线程数：**必须显式指定，不能吃默认值**。
-# onnxruntime 默认吃满核数（Orin 12 核 → 12 线程），而 vLLM/ASR/字幕服务同时在跑，
-# 12 线程实测 9.10s，8 线程 4.36s——超订把速度打回一半（线程迁移 + 抢核）。
-# 实测平坦区在 6~8（4.34 / 4.49s），10 开始退化（5.11s），12 崩掉（9.10s）。
-# 取 8：留 4 核给别的常驻进程，且与 6 的差在噪声内。
+# OCR thread count: **must be set explicitly, never inherit the default**.
+# onnxruntime defaults to saturating all cores (Orin 12 cores → 12 threads), while vLLM/ASR/captions run alongside,
+# 12 threads measures 9.10s, 8 threads 4.36s — oversubscription halves the speed (thread migration + core contention).
+# Measured flat region is 6~8 (4.34 / 4.49s), degradation starts at 10 (5.11s), collapse at 12 (9.10s).
+# Pick 8: leaves 4 cores for other resident processes, and the difference from 6 is within noise.
 OCR_THREADS = 8
 
-# 「看一眼屏幕」的语音意图。命中任一即触发 OCR。
-# 注意不要放「看到」这种过宽的词，日常对话里太容易误触。
+# Voice intents that mean "take a look at the screen". Any hit triggers OCR.
+# Do not add overly broad words like "see" — far too easy to false-trigger in daily conversation.
 LOOK_HINTS = (
     "看看", "看一看", "看一眼", "看一下", "瞧瞧", "瞧一眼",
     "屏幕上", "画面上", "屏幕里", "画面里",
@@ -63,14 +66,14 @@ LOOK_HINTS = (
 
 
 def is_look_intent(text: str) -> bool:
-    """这句话是不是在要求「看屏幕」。"""
+    """Is this utterance asking to look at the screen?"""
     if not text:
         return False
     return any(h in text for h in LOOK_HINTS)
 
 
-# ---------------------------------------------------------------- 脱敏
-# 屏幕上经常出现 token / 密钥 / 手机号，OCR 全文进 LLM 前先遮掉明显的东西
+# ---------------------------------------------------------------- Redaction
+# Screens often show tokens / keys / phone numbers; mask the obvious ones before full OCR text reaches the LLM
 import re
 
 _SECRET = re.compile(r"\b(sk-|ghp_|mul_|xox[baprs]-|AKIA)[A-Za-z0-9_\-]{8,}")
@@ -79,7 +82,7 @@ _PHONE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
 
 
 def redact(text: str) -> tuple[str, int]:
-    """遮掉疑似密钥/长随机串/手机号，返回 (处理后文本, 命中数)。"""
+    """Mask suspected keys / long random strings / phone numbers; returns (processed text, hit count)."""
     n = 0
 
     def count(_m: "re.Match") -> str:
@@ -89,7 +92,7 @@ def redact(text: str) -> tuple[str, int]:
 
     for pat in (_SECRET, _LONGKEY, _PHONE):
         text = pat.sub(count, text)
-    # 统一替换：保留前缀便于人眼判断是什么类型的密钥
+    # Final substitution: keep the prefix so a human can tell which kind of key it is
     text = _SECRET.sub(lambda m: m.group(1) + "***", text)
     text = _LONGKEY.sub("***", text)
     text = _PHONE.sub(lambda m: m.group(1)[:3] + "****" + m.group(1)[-4:], text)
@@ -101,13 +104,13 @@ class VisionError(RuntimeError):
 
 
 class _Capture:
-    """常驻的采集卡句柄：打开一次、预热一次，之后每次只读一两帧。
+    """Resident capture-card handle: open once, warm up once, then read only a frame or two each time.
 
-    为什么不在后台线程里连续解码：1080p MJPG 解码是实打实的 CPU 开销，而「看屏幕」
-    一场会议也就用几次。保持「句柄常开、帧按需读」两头都占——省掉 1.2 秒预热和
-    设备协商，又不在空闲时烧 CPU。V4L2 自己维护最近帧的队列，读到的仍是当前画面。
+    Why not decode continuously in a background thread: 1080p MJPG decoding is real CPU cost, while "look at the
+    screen" is used only a few times per meeting. Keeping "handle always open, frames read on demand" gets both — the
+    1.2s warm-up and device negotiation are skipped, no CPU burns while idle, and V4L2's queue still yields the current picture.
 
-    线程安全：内部一把锁串行化，设备本身也是独占的。
+    Thread safety: one internal lock serialises access, and the device is exclusive anyway.
     """
 
     def __init__(self, dev: str, width: int, height: int, warmup: int,
@@ -117,21 +120,21 @@ class _Capture:
         self.height = height
         self.warmup = max(1, warmup)
         self.keep_open = keep_open
-        self.idle_release = idle_release    # >0 时闲置这么久就松开设备，让别的程序能用
+        self.idle_release = idle_release    # if >0, release the device after this much idle time so others can use it
         self._cap = None
         self._lock = threading.RLock()
-        self.opens = 0          # 打开次数（正常应为 1，多次说明掉线重连过）
-        self.warmups = 0        # 预热轮数（每次 open 一轮；全黑重试会 +1）
-        self.reads = 0          # 成功取帧次数
-        self.open_s = 0.0       # 最近一次「打开 + 预热」耗时
-        self.grab_s = 0.0       # 最近一次取帧耗时
+        self.opens = 0          # open count (should be 1; more means it dropped and reconnected)
+        self.warmups = 0        # warm-up rounds (one per open; an all-black retry adds 1)
+        self.reads = 0          # successful frame grabs
+        self.open_s = 0.0       # duration of the last "open + warm-up"
+        self.grab_s = 0.0       # duration of the last frame grab
         self.last_read = 0.0
         self.reconnects = 0
         self.last_release = ""
 
-    # ------------------------------------------------------------ 内部
+    # ------------------------------------------------------------ Internal
     def _drain_locked(self, n: int):
-        """连读 n 帧，返回最后一个成功帧（读不到返回 None）。"""
+        """Read n frames back to back; return the last good frame (None if none could be read)."""
         frame = None
         for _ in range(max(1, n)):
             ok, f = self._cap.read()
@@ -146,8 +149,8 @@ class _Capture:
         if not cap.isOpened():
             cap.release()
             raise VisionError(f"打不开 {self.dev}（设备被占用或未枚举）")
-        # 必须显式 MJPG：默认会协商成 YUYV，1080p 在 USB2 上只有 5fps，
-        # 读 40 帧预热要 8 秒而不是 1.3 秒
+        # MJPG must be explicit: the default negotiates YUYV, which gives only 5fps for 1080p on USB2,
+        # so a 40-frame warm-up takes 8s instead of 1.3s
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
@@ -155,7 +158,7 @@ class _Capture:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._cap = cap
         self.opens += 1
-        frame = self._drain_locked(self.warmup)     # 一次性丢掉预热黑帧
+        frame = self._drain_locked(self.warmup)     # drop the warm-up black frames in one go
         self.warmups += 1
         self.open_s = round(time.time() - t0, 2)
         if frame is None:
@@ -176,9 +179,9 @@ class _Capture:
         return bool(self.idle_release and self._cap is not None and self.last_read
                     and time.time() - self.last_read > self.idle_release)
 
-    # ------------------------------------------------------------ 对外
+    # ------------------------------------------------------------ Public
     def read(self, fresh: int = 2):
-        """取一帧当前画面。句柄已开就只读 fresh 帧，不重开、不重预热。"""
+        """Grab one frame of the current picture. If the handle is already open, read only `fresh` frames — no reopen, no re-warm."""
         with self._lock:
             if self._idle_expired_locked():
                 self._release_locked("闲置释放")
@@ -187,7 +190,7 @@ class _Capture:
                 self._open_locked()
             frame = self._drain_locked(max(1, fresh))
             if frame is None:
-                # 扩展坞那种偶发掉线（曾 166 秒断流）：松开重开一次就回来了
+                # The occasional dock dropout (once saw a 166s stream cut): releasing and reopening once brings it back
                 self._release_locked("读帧失败")
                 self.reconnects += 1
                 self._open_locked()
@@ -202,11 +205,11 @@ class _Capture:
             return frame
 
     def rewarm(self, budget_s: float = 1.5):
-        """再丢一轮预热帧。源切分辨率后 MS2109 会重新吐黑帧，用它清掉。
+        """Drop one more round of warm-up frames. After a source resolution switch MS2109 emits black frames again; use this to clear them.
 
-        带时间预算：**无信号时设备会降帧率**（实测 40 帧读到 5 秒），不设上限就会让
-        「判无信号」这件事本身变得很慢。预算内没读满 40 帧也无所谓，画面是否恢复由
-        调用方复查。
+        Time-budgeted: **without signal the device lowers its frame rate** (measured 5s to read 40 frames), and with no
+        cap the "no-signal decision" itself becomes very slow. Not reading the full 40 frames within the budget is fine;
+        whether the picture recovered is re-checked by the caller.
         """
         with self._lock:
             if self._cap is None:
@@ -235,7 +238,7 @@ class _Capture:
 
 
 class Vision:
-    """采集卡取帧 + OCR。线程安全（内部串行化，设备是独占的）。"""
+    """Capture-card frame grab + OCR. Thread-safe (internally serialised; the device is exclusive)."""
 
     def __init__(self, dev: str = "/dev/video0", width: int = 1920, height: int = 1080,
                  warmup: int = 40, max_side: int = 1440, min_score: float = 0.35,
@@ -245,42 +248,42 @@ class Vision:
         self.dev = dev
         self.width = width
         self.height = height
-        self.warmup = warmup          # 丢弃的前置帧数（MS2109 黑帧预热）
+        self.warmup = warmup          # number of leading frames to discard (MS2109 black-frame warm-up)
         self.max_side = max_side
         self.min_score = min_score
         self.max_chars = max_chars
         self.cache_ttl = cache_ttl
         self.ocr_threads = ocr_threads
-        self.trt_engine = trt_engine  # 非空则把 rec 后端换成 TensorRT（约 2.4×）
+        self.trt_engine = trt_engine  # non-empty swaps the rec backend for TensorRT (~2.4×)
         self._trt = None
-        self.trt_note = ""            # TensorRT 挂载结果（ok / 失败原因）
+        self.trt_note = ""            # TensorRT attach result (ok / failure reason)
         self._lock = threading.Lock()
         self._engine = None
         self._cache: dict[str, tuple[float, dict]] = {}
         self.calls = 0
         self.errors = 0
         self.last: dict | None = None
-        self._grab_s = 0.0   # 最近一次取帧耗时；grab 失败时也要有值可读
+        self._grab_s = 0.0   # duration of the last frame grab; must hold a value even when grab fails
         self._cap = _Capture(dev, width, height, warmup,
                              keep_open=keep_open, idle_release=idle_release)
 
-    # ------------------------------------------------------------ 引擎
+    # ------------------------------------------------------------ Engine
     def _ocr_engine(self):
         if self._engine is None:
-            from rapidocr_onnxruntime import RapidOCR   # 懒加载：0.4s，不用不付
+            from rapidocr_onnxruntime import RapidOCR   # lazy import: 0.4s, only paid when used
             try:
                 self._engine = RapidOCR(intra_op_num_threads=self.ocr_threads)
             except TypeError:
-                # 老版本没有这个参数：退回默认（会在 12 核机上超订，慢一倍）
+                # older versions lack this argument: fall back to the default (oversubscribes on a 12-core box, 2× slower)
                 self._engine = RapidOCR()
             self._attach_trt()
         return self._engine
 
     def _attach_trt(self) -> None:
-        """把 rec 后端换成 TensorRT。失败就留在 CPU，绝不让「看屏幕」整个不可用。
+        """Swap the rec backend for TensorRT. On failure stay on CPU — never let "look at the screen" break entirely.
 
-        engine 是跟 TensorRT 版本绑死的（换 JetPack 要重建），也可能是别的机型拷来的，
-        所以这里所有异常都吞掉、只记状态——CPU 路径本来就一直能用。
+        The engine is pinned to a TensorRT version (rebuild it when JetPack changes) and may have been copied from
+        another machine, so every exception is swallowed here and only recorded as status — the CPU path always worked.
         """
         if not self.trt_engine or self._engine is None:
             return
@@ -299,11 +302,11 @@ class Vision:
         return self._trt.status() if self._trt is not None else None
 
     def warm_ocr(self) -> bool:
-        """开机时把 OCR 引擎（含 TensorRT）建好。
+        """Build the OCR engine (including TensorRT) at startup.
 
-        引擎懒加载本来是为了省 0.4 秒启动时间，但 TRT 要反序列化 engine、建 CUDA
-        context，第一次前向还要 warmup——这几秒落到用户头上就是「第一次看屏幕特别慢」。
-        所以在后台线程里先付掉。
+        Lazy loading the engine saves 0.4s of startup, but TRT has to deserialise the engine and create a CUDA
+        context, and the first forward pass still needs a warmup — those seconds land on the user as "the first
+        screen look is very slow". So pay them up front on a background thread.
         """
         try:
             self._ocr_engine()
@@ -311,12 +314,12 @@ class Vision:
         except Exception:  # noqa: BLE001
             return False
 
-    # ------------------------------------------------------------ 取帧
+    # ------------------------------------------------------------ Frame grab
     def grab(self):
-        """返回一帧当前画面。
+        """Return one frame of the current picture.
 
-        设备句柄常驻，所以这里**不再**开关设备、也不再丢 40 帧预热——那两笔只在
-        进程启动时付一次（`prewarm()`），取帧本身只剩读 2 帧的时间。
+        The device handle is resident, so this **no longer** opens or closes the device and no longer drops 40
+        warm-up frames — both are paid once at process start (`prewarm()`), leaving only the 2 frame reads per grab.
         """
         t0 = time.time()
         frame = self._cap.read()
@@ -324,9 +327,9 @@ class Vision:
         return frame
 
     def prewarm(self) -> bool:
-        """开机时先把设备打开预热好，第一次「看屏幕」不用再等 1.2 秒。
+        """Open and warm up the device at startup, so the first "look at the screen" need not wait another 1.2s.
 
-        失败只返回 False，不抛异常：采集卡没插时服务照常启动，只是「看屏幕」不可用。
+        Failure only returns False and never raises: without a capture card the service still starts, "look at the screen" is just unavailable.
         """
         try:
             self._cap.read(fresh=1)
@@ -335,7 +338,7 @@ class Vision:
             return False
 
     def close(self) -> None:
-        """松开采集卡（让别的程序能用这个设备）。"""
+        """Release the capture card (so another program can use the device)."""
         self._cap.close()
         if self._trt is not None:
             try:
@@ -347,13 +350,13 @@ class Vision:
     def capture_status(self) -> dict:
         return self._cap.status()
 
-    # ------------------------------------------------------------ 帧指纹
+    # ------------------------------------------------------------ Frame fingerprint
     @staticmethod
     def _dhash(img, size: int = 16) -> int:
-        """横向梯度哈希。对光标闪烁/时钟跳秒不敏感，又能区分不同版式。
+        """Horizontal gradient hash. Insensitive to cursor blink / clock ticking, yet distinguishes layouts.
 
-        纯 numpy 实现（不走 cv2）：一个哈希不值得引入依赖，也让单测能在
-        没有 opencv 的机器上跑。16×17 个块平均，每次约 1ms。
+        Pure numpy (no cv2): one hash is not worth a dependency, and it lets unit tests run on
+        machines without opencv. Averages 16×17 blocks, about 1ms per call.
         """
         import numpy as np
 
@@ -376,7 +379,7 @@ class Vision:
             bits = (bits << 1) | int(v)
         return bits
 
-    # ------------------------------------------------------------ 识别
+    # ------------------------------------------------------------ Recognition
     def _ocr(self, img) -> dict:
         import cv2
         h, w = img.shape[:2]
@@ -409,10 +412,10 @@ class Vision:
     def available(self) -> bool:
         return Path(self.dev).exists()
 
-    # 无信号的判据是「又暗又平」，不是「纯黑」。
-    # 实测：MS2109 在无信号时吐的是 mean=7.0 / std=1.5 的帧（YMAX=7，带传感器噪点），
-    # 所以旧判据 mean<3 在真机上永远不会命中，会把无信号当成「一屏没有字的画面」。
-    # 而暗色主题的 IDE（mean 15~25）std 有 15 以上，不会被误判。
+    # The no-signal criterion is "dark and flat", not "pure black".
+    # Measured: with no signal MS2109 emits frames at mean=7.0 / std=1.5 (YMAX=7, sensor noise included),
+    # so the old criterion mean<3 never fires on real hardware and treats no-signal as "a screen with no text".
+    # A dark-theme IDE (mean 15~25) has std above 15, so it is not misjudged.
     BLANK_MEAN, BLANK_STD = 12.0, 6.0
 
     @classmethod
@@ -422,18 +425,18 @@ class Vision:
         a = np.asarray(img, dtype=np.float32)
         return float(a.mean()) < cls.BLANK_MEAN and float(a.std()) < cls.BLANK_STD
 
-    # ------------------------------------------------------------ 对外
+    # ------------------------------------------------------------ Public
     def look(self, force: bool = False) -> dict:
-        """看一眼屏幕。同一画面（dHash 相同）在 cache_ttl 内直接返回缓存。"""
+        """Look at the screen. The same picture (same dHash) is served straight from cache within cache_ttl."""
         with self._lock:
             self.calls += 1
             t0 = time.time()
             try:
                 img = self.grab()
                 if self._is_blank(img):
-                    # 源切分辨率后 MS2109 会重新吐一轮黑帧。常驻句柄遇不到 open，
-                    # 却会遇到这种「流中途变黑」，所以再丢一轮预热帧才判无信号，
-                    # 否则会把正常画面误报成「HDMI 没信号」。
+                    # After a source resolution switch MS2109 emits another round of black frames. A resident
+                    # handle never hits the open path but does hit this "mid-stream blackening", so drop one more
+                    # warm-up round before declaring no-signal, or a normal picture is misreported as "HDMI no signal".
                     self._cap.rewarm()
                     img2 = self.grab()
                     if img2 is not None and not self._is_blank(img2):
@@ -464,7 +467,7 @@ class Vision:
                 if redacted:
                     info["redacted"] = redacted
                 self._cache[key] = (time.time(), info)
-                # 只留最近 8 个画面指纹，避免常驻进程无限增长
+                # keep only the 8 most recent screen fingerprints so a resident process cannot grow without bound
                 if len(self._cache) > 8:
                     oldest = min(self._cache.items(), key=lambda kv: kv[1][0])[0]
                     self._cache.pop(oldest, None)
@@ -478,7 +481,7 @@ class Vision:
 
 
 def format_context(info: dict, max_lines: int = 40) -> str:
-    """把 OCR 结果变成喂给 LLM 的上下文块。"""
+    """Turn the OCR result into a context block fed to the LLM."""
     text = (info or {}).get("text") or ""
     lines = [ln for ln in text.splitlines() if ln.strip()][:max_lines]
     if not lines:

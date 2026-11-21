@@ -1,39 +1,36 @@
-# 从零装一遍
+# Install from scratch
 
-假设你已经有一台刷好 JetPack 的 AGX Orin，能 ssh 进去，插好了采集卡和耳麦。
-全程不需要联网推理——**ASR / TTS / OCR / LLM 全在本地**，装完之后断网也能用。
+[**English**](install.md) · [中文](install.zh.md) · [日本語](install.ja.md)
 
-## 0. 前置检查
+This assumes you already have an AGX Orin with JetPack flashed, can ssh into it, and have the capture card and headset plugged in. No network is needed for inference at any point — **ASR / TTS / OCR / LLM all run locally**, so the box keeps working offline once installed.
+
+## 0. Pre-flight check
 
 ```bash
-python3 -V                    # 3.10+（JetPack 7 是 3.12）
-nvidia-smi | head -5          # 驱动 / CUDA 正常
-pactl list short sources      # 能看到采集卡和耳麦
-ls /dev/video*                # 有 /dev/video0
-df -h /                       # 根盘最好留 5G 以上
+python3 -V                    # 3.10+ (JetPack 7 is 3.12)
+nvidia-smi | head -5          # driver / CUDA healthy
+pactl list short sources      # capture card and headset visible
+ls /dev/video*                # /dev/video0 present
+df -h /                       # ideally 5G+ free on the root disk
 ```
 
-## 1. 取代码 + 装依赖
+## 1. Fetch the code + install dependencies
 
 ```bash
 git clone https://github.com/<you>/meeting-copilot.git /opt/meeting-copilot
 cd /opt/meeting-copilot
 
-# 数据（3.4G 模型 + 之后的 22.9G 权重）建议放外置盘
+# data (3.4G model + 22.9G of weights later) belongs on the external drive
 export MC_DATA=/media/ssd/mc-data
 
 sudo -E bash scripts/install.sh
 ```
 
-`install.sh` 做四件事：apt 装 PipeWire/构建工具 → 建 `.venv` → `pip install -r requirements.txt`
-→ 调 `scripts/download-models.sh` 下模型 → 最后跑 `tools/check_env.py` 自查。
+`install.sh` does four things: apt-install PipeWire/build tools → create `.venv` → `pip install -r requirements.txt` → call `scripts/download-models.sh` to fetch the models → finally run `tools/check_env.py` as a self-check.
 
-**它不会装 TensorRT / cuda-python**：这两个必须和 JetPack 的 CUDA 严格配套，
-pip 装错版本会**静默**退回 CPU（OCR 从 300ms 变 3s，日志一个字不提）。
-要 GPU 加速 OCR，先确认 `python -c "import tensorrt, cuda"` 能过，再按
-[ocr-gpu.md](ocr-gpu.md) 生成 engine。
+**It does not install TensorRT / cuda-python**: those two must match JetPack's CUDA exactly, and a wrong pip version **silently** falls back to CPU (OCR goes from 300ms to 3s, and the log says nothing). To get GPU-accelerated OCR, first confirm `python -c "import tensorrt, cuda"` passes, then build the engine as described in [ocr-gpu.md](ocr-gpu.md).
 
-想手工装也行：
+Installing by hand works too:
 
 ```bash
 python3 -m venv .venv
@@ -41,54 +38,51 @@ python3 -m venv .venv
 bash scripts/download-models.sh
 ```
 
-## 2. 起一个大模型
+## 2. Start a large model
 
-两条路，**先选一条**：
+Two routes, **pick one first**:
 
 | | Magnitude + Qwen3.5-35B-A3B | vLLM + Qwen2.5-7B-AWQ |
 |---|---|---|
-| 显存/内存 | 22.9G 权重，常驻约 26G | 约 6G |
-| 首字 | 300~470ms（短句） | **90ms** |
-| 长回答 | **快 25~35%** | 慢 |
-| 中日混排 / 幻觉 | 干净 | 会出「会議的时间确认 needed。」 |
-| 起服务 | 冷启约 3 分钟 | 约 40 秒 |
+| VRAM / RAM | 22.9G of weights, ~26G resident | ~6G |
+| First token | 300~470ms (short sentences) | **90ms** |
+| Long answers | **25~35% faster** | slower |
+| Mixed Chinese/Japanese, hallucination | clean | will emit 「会議的时间确认 needed。」 |
+| Starting the service | ~3 min cold start | ~40 s |
 
 ```bash
-# A. 35B-A3B（推荐：质量优先，字幕与助手都用它）
-bash scripts/llm-magnitude.sh            # 生成 dockerd 配置
-sudo bash deploy/install-units.sh        # 装 magnitude / magnitude-dockerd unit
-sudo systemctl start magnitude           # 冷启约 3 分钟（22.9G 权重）
+# A. 35B-A3B (recommended: quality first; used for both captions and the assistant)
+bash scripts/llm-magnitude.sh            # generate the dockerd config
+sudo bash deploy/install-units.sh        # install the magnitude / magnitude-dockerd units
+sudo systemctl start magnitude           # ~3 min cold start (22.9G of weights)
 
-# B. 7B（延迟优先 / 内存紧张）
+# B. 7B (latency first / tight memory)
 bash scripts/llm-vllm.sh
-# 然后把 /etc/meeting-copilot/env 改成：
+# then change /etc/meeting-copilot/env to:
 #   LLM_BASE=http://127.0.0.1:8000/v1
 #   LLM_MODEL=qwen
 #   LLM_KEY=
 ```
 
-细节（为什么 35B 的 MoE 反而更划算、prompt 缓存为什么命中不了）见
-[llm-serving.md](llm-serving.md)。
+For the details (why a 35B MoE is the better deal, why the prefix cache never hits), see [llm-serving.md](llm-serving.md).
 
-## 3. 装服务
+## 3. Install the services
 
 ```bash
 sudo MC_DATA=/media/ssd/mc-data bash deploy/install-units.sh
-sudo systemctl start voice-bench      # 8095 语音助手
-sudo systemctl start caption-bench    # 8096 会议字幕
+sudo systemctl start voice-bench      # 8095 voice assistant
+sudo systemctl start caption-bench    # 8096 meeting captions
 ```
 
-`install-units.sh` 会生成 `/etc/meeting-copilot/env`（0640，含 LLM 的 Bearer token）
-并把 unit 里的 `__HOME__` / `__USER__` / `__UID__` 替换成真实值。
-**token 不在仓库里**，Magnitude 自己生成、脚本现读现填。
+`install-units.sh` generates `/etc/meeting-copilot/env` (0640, holds the LLM Bearer token) and substitutes the real values for `__HOME__` / `__USER__` / `__UID__` in the units. **The token is not in the repository**; Magnitude generates it and the script reads and fills it in at install time.
 
-## 4. 验证
+## 4. Verify
 
 ```bash
 bash scripts/healthcheck.sh
 ```
 
-期望看到：
+Expected output:
 
 ```
 == 服务
@@ -100,30 +94,28 @@ bash scripts/healthcheck.sh
   首字 443ms  译文 1005ms  延迟 290ms
 ```
 
-再加一条离线回归（不需要麦克风、不需要模型在线，打桩跑）：
+Then one offline regression (no microphone, no models online, runs stubbed):
 
 ```bash
-.venv/bin/python test_caption_pipe.py      # 16 组
-node tools/dom_render_test.js              # 渲染层 26 项
+.venv/bin/python test_caption_pipe.py      # 16 groups
+node tools/dom_render_test.js              # 26 checks in the render layer
 ```
 
-## 5. 打开界面
+## 5. Open the UI
 
 ```
-http://<本机IP>:8095   语音助手（对着耳麦说话；唤醒词「小八你好」）
-http://<本机IP>:8096   会议字幕（点「开始」，左上角状态灯应变成「运行中」）
+http://<LAN-IP>:8095   voice assistant (talk into the headset; wake word 「小八你好」)
+http://<LAN-IP>:8096   meeting captions (press 「开始」; the status light in the top-left should turn 「运行中」)
 ```
 
-**页面卡在「连接中…」先看这里**：那说明 JS 没跑起来（不是网络问题）。
-`curl -s localhost:8096/ | node --check` 这种检查已进 CI；本地可直接
-`.venv/bin/python test_caption_pipe.py`，其中 `test_page_js_syntax` 会过一遍 `node --check`。
+**If the page is stuck on 「连接中…」 (connecting…), look here first**: that means the JS never ran (it is not a network problem). Checks like `curl -s localhost:8096/ | node --check` are already in CI; locally you can just run `.venv/bin/python test_caption_pipe.py`, where `test_page_js_syntax` runs `node --check` over the page.
 
-## 6. 装不动的三种情况
+## 6. Three ways the install fails
 
-| 现象 | 原因 | 处理 |
+| Symptom | Cause | Fix |
 |---|---|---|
-| `piper-phonemize` 装不上 | 老版本 piper 依赖它，aarch64 没 wheel | 用 `piper-tts>=1.8.0`（本仓库已要求） |
-| 日语 TTS 报 `pyopenjtalk` 找不到 | 官方包只有源码，编译失败 | 换成 `pyopenjtalk-plus`（模块名不变） |
-| 服务起来但没声音 | 缺 `XDG_RUNTIME_DIR` | unit 里的那行别删；手工跑时自己 export |
+| `piper-phonemize` won't install | old piper versions depend on it and there is no aarch64 wheel | use `piper-tts>=1.8.0` (already required by this repo) |
+| Japanese TTS reports `pyopenjtalk` not found | the official package is source-only and fails to compile | switch to `pyopenjtalk-plus` (module name unchanged) |
+| The service comes up but there is no sound | missing `XDG_RUNTIME_DIR` | don't delete that line in the unit; export it yourself when running by hand |
 
-更多见 [troubleshooting.md](troubleshooting.md)。
+More in [troubleshooting.md](troubleshooting.md).

@@ -1,86 +1,83 @@
-# 延迟：预算、怎么量、哪些是硬地板
+# Latency: the budget, how to measure it, and what is a hard floor
 
-这套系统的调参空间不大，因为**大部分时间花在物理上**：ASR 要听完、MoE 要做 prefill、
-GPU 要做 OCR。这份文档把「能省的」和「别再追的」分开。
+[**English**](latency.md) · [中文](latency.zh.md) · [日本語](latency.ja.md)
 
-## 一次字幕的延迟预算（线上实测）
+There is little tuning headroom in this system, because **most of the time is spent in physics**: ASR has to hear the end of the utterance, MoE has to do prefill, the GPU has to do OCR. This document separates "what can be saved" from "what to stop chasing".
 
-```
-说话结束
-  ├─ 断句收尾（分层停顿 / soft-cut）     0.30~0.90s   ← 由说话节奏决定，不是浪费
-  ├─ SenseVoice ASR                      ~290ms
-  ├─ LLM prefill → 首字                  400~470ms   ← ttft_ms
-  ├─ 流式译文逐字推                      ~80ms/增量
-  └─ 整句译完                            ~1000ms      ← trans_ms
-
-感知延迟 lag_ms ≈ 290ms（从音频到第一行字）
-```
-
-**关键**：首字一到就开始显示，用户不需要等 `trans_ms`。这也是为什么
-`--no-stream-trans` 千万别开——整句译完才显示会把感知延迟从 0.26s 推到 0.8~1.3s。
-
-## 首字的经验公式（35B-A3B）
+## Latency budget of one caption (measured in production)
 
 ```
-TTFT ≈ 65ms + 3.5~6.5ms × 新 token        线上斜率实测 4.5ms/token
+speech ends
+  ├─ segmentation tail (tiered pause / soft-cut)   0.30~0.90s   ← set by speaking rhythm, not waste
+  ├─ SenseVoice ASR                                ~290ms
+  ├─ LLM prefill → first token                     400~470ms   ← ttft_ms
+  ├─ streaming translation, token by token         ~80ms/increment
+  └─ whole sentence translated                     ~1000ms      ← trans_ms
+
+perceived latency lag_ms ≈ 290ms (from audio to the first line of text)
 ```
 
-「新 token」= 引擎返回的 `prompt_n`（**本轮真正处理的 token**），
-不是 `prompt_n - cache_n`；`cache_n` 是复用的，两者相加才是整条 prompt。
-**首字 200ms 是硬地板**，别再往下追。
+**Key point**: display starts as soon as the first token arrives, so the user never waits for `trans_ms`. That is why you must never turn on `--no-stream-trans`: showing only the finished sentence pushes perceived latency from 0.26s to 0.8~1.3s.
 
-由此得到三条反直觉结论：
+## Rule of thumb for the first token (35B-A3B)
 
-| 做法 | 结果 | 原因 |
+```
+TTFT ≈ 65ms + 3.5~6.5ms × new tokens        measured on-line slope 4.5ms/token
+```
+
+"New tokens" is the `prompt_n` returned by the engine (**the tokens actually processed this round**), not `prompt_n - cache_n`; `cache_n` is the reused part, and the two together make up the whole prompt. **A 200ms first token is a hard floor**; stop pushing below it.
+
+This yields three counter-intuitive conclusions:
+
+| Move | Result | Why |
 |---|---|---|
-| 把 system 从 250 token 砍到 70 | **更慢** | 用户内容每句都变，短前缀 `cache_n` 恒 0（24/24），整份重付 prefill |
-| `--ctx-lines 2 → 1` | **省约 90ms** | 上文部分每句都变，是真正的新 token |
-| `--tr-workers 2 → 1` | 无差别 | 单句延迟不受并发数影响，只是少抢显存 |
+| Cut the system prompt from 250 tokens to 70 | **Slower** | User content changes every sentence, so the short prefix has `cache_n` = 0 (24/24) and you pay prefill for the whole thing |
+| `--ctx-lines 2 → 1` | **Saves about 90ms** | The context part changes every sentence, so it is genuinely new tokens |
+| `--tr-workers 2 → 1` | No difference | Single-sentence latency doesn't depend on concurrency, you just fight less over VRAM |
 
-**长前缀不要钱**：稳定的长 system 会被缓存复用（约 290 token），砍它反而破坏了复用。
+**A long prefix is free**: a stable long system prompt is reused from cache (about 290 tokens), so cutting it actually breaks the reuse.
 
-## 7B vs 35B（同一段 62 秒音频，长句正面对比）
+## 7B vs 35B (same 62-second clip, head-to-head on long sentences)
 
-| | 7B-AWQ（dense，vLLM） | 35B-A3B（MoE，Magnitude） |
+| | 7B-AWQ (dense, vLLM) | 35B-A3B (MoE, Magnitude) |
 |---|---|---|
-| 短句首字 | **90ms** | 300~470ms |
-| 长回答全文 | 慢 | **快 25~35%** |
-| 中日混排 / 幻觉 | 会出错 | 干净 |
+| Short-sentence first token | **90ms** | 300~470ms |
+| Long answer, full text | slow | **25~35% faster** |
+| Japanese-Chinese mixed text / hallucinations | makes mistakes | clean |
 
-MoE 每 token 只激活约 3B，解码便宜；但 prefill 要读几乎全部专家，所以贵。
-**短回答 dense 赢，长回答 MoE 赢** —— 别拿 7B 的直觉套 35B。
+MoE activates only about 3B per token, so decoding is cheap; but prefill has to read nearly all the experts, so it is expensive. **Dense wins short answers, MoE wins long answers** — don't apply 7B intuition to 35B.
 
-## 判据（只看这三个数）
+## Decision criteria (look at only these three numbers)
 
 ```bash
 curl -s localhost:8096/api/status
 ```
 
-| 字段 | 健康 | 不正常时先做什么 |
+| Field | Healthy | What to do first when it isn't |
 |---|---|---|
-| `q_asr` | 0 | 涨 → ASR 线程不够 / 采集被占 |
-| `q_tr` | 0 | **涨 = 翻译跟不上**：先 `--ctx-lines 1`，再看 LLM 是否在抢显存 |
-| `dropped` | 0 | >0 → 队列开始丢段，延迟已超实时，必须处理 |
+| `q_asr` | 0 | rising → not enough ASR threads / capture is taken |
+| `q_tr` | 0 | **rising = translation can't keep up**: try `--ctx-lines 1` first, then check whether the LLM is fighting for VRAM |
+| `dropped` | 0 | >0 → the queue has started dropping segments; latency is already past real time and must be dealt with |
 
-`NRestarts` 和 `ActiveEnterTimestamp` 一起看，能判断是不是在无限重启循环。
+Read `NRestarts` together with `ActiveEnterTimestamp` to tell whether it is stuck in an endless restart loop.
 
-## 怎么量自己的机器
+## How to measure your own machine
 
 ```bash
-.venv/bin/python tools/ttft_prompt_ab.py     # prompt 档位 × 前缀缓存
-.venv/bin/python tools/ttft_scenarios.py     # 不同句长 / 上文行数的首字
-.venv/bin/python tools/trans_stream_probe.py # 流式 vs 整句
-.venv/bin/python tools/sse_verify.py 45      # SSE 中间态数量与间隔
-.venv/bin/python tools/e2e_latency.py        # 端到端
+.venv/bin/python tools/ttft_prompt_ab.py     # prompt variants × prefix cache
+.venv/bin/python tools/ttft_scenarios.py     # first token across sentence lengths / context lines
+.venv/bin/python tools/trans_stream_probe.py # streaming vs whole sentence
+.venv/bin/python tools/sse_verify.py 45      # number and spacing of SSE intermediate states
+.venv/bin/python tools/e2e_latency.py        # end-to-end
 .venv/bin/python tools/wav_seg_ab.py --wav x.wav --a 0.45 --b 0.7
 ```
 
-## 别当 bug 查
+## Don't investigate these as bugs
 
-| 现象 | 真相 |
+| Symptom | Truth |
 |---|---|
-| 看一次屏幕要 3.4~3.9s | 采集卡要丢 40 帧预热（约 1.2s）+ OCR ≈ 行数 × 30ms |
-| 改了页面前端没变化 | `PAGE` 是常量：重启服务 + **用户 F5** |
-| `cache_n` 一直是 0 | 用户内容每句都变，前缀失效；不是缓存坏了 |
-| vLLM 命中不了 35B 前缀缓存 | 1056 token 粒度，模型 + 引擎的物理特性 |
-| 首字压不到 200ms 以内 | 65ms 固定开销 + prefill，是硬地板 |
+| One screen look takes 3.4~3.9s | The capture card drops 40 warm-up frames (about 1.2s) + OCR ≈ lines × 30ms |
+| Frontend change doesn't show up | `PAGE` is a constant: restart the service + **user presses F5** |
+| `cache_n` is always 0 | User content changes every sentence, so the prefix is invalidated; the cache is not broken |
+| vLLM can't hit the 35B prefix cache | 1056-token granularity, a physical property of the model + engine |
+| First token won't get below 200ms | 65ms fixed overhead + prefill; it is a hard floor |

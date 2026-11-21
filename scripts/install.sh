@@ -1,8 +1,11 @@
 #!/bin/bash
-# 一次性安装：系统依赖 → venv → Python 依赖 → 目录 → 自检。
-# 用法：
-#   sudo bash scripts/install.sh            # 代码在 /opt/meeting-copilot，数据也在里面
-#   MC_DATA=/media/ssd/mc-data sudo -E bash scripts/install.sh   # 数据放外置盘
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+# One-shot install: system deps -> venv -> Python deps -> directories -> self-check.
+# Usage:
+#   sudo bash scripts/install.sh            # code lives in /opt/meeting-copilot, data too
+#   MC_DATA=/media/ssd/mc-data sudo -E bash scripts/install.sh   # data on an external disk
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,7 +35,7 @@ if [ ! -x "$MC_HOME/.venv/bin/python" ]; then
     "$PY" -m venv "$MC_HOME/.venv"
 fi
 "$MC_HOME/.venv/bin/pip" install -q --upgrade pip wheel
-# numpy 2.x 在 aarch64 上没有老的 ABI 问题，但 sherpa-onnx 2.0.1 要求 <3
+# numpy 2.x has no legacy ABI issues on aarch64, but sherpa-onnx 2.0.1 requires <3
 "$MC_HOME/.venv/bin/pip" install -q -r "$MC_HOME/requirements.txt"
 
 say "模型"

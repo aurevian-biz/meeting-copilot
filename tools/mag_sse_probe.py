@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Magnitude 的 SSE 探针：把 `timings` 里的 cache_n / prompt_n 读出来。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-Magnitude 在每个 chunk 里带 `timings`，其中
-  prompt_n  本次 prompt 的 token 数
-  cache_n   其中**从 KV 前缀缓存复用**的 token 数   ← 前缀缓存到底有没有生效的硬判据
-  prompt_ms 本次 prefill 实际耗时
-这比「看首字延迟」可靠：首字里混了解码、调度、网络，cache_n 是引擎自己报的。
+"""SSE probe for Magnitude: pull cache_n / prompt_n out of `timings`.
 
-同时统计 content / reasoning_content 各多少字——Qwen3.5 系模板不关思考时，
-200 token 会全烧在 reasoning 上、content 恒为空（在 vLLM/SGLang 上都踩过）。
+Magnitude attaches `timings` to every chunk, containing
+  prompt_n  token count of this prompt
+  cache_n   how many of those were **reused from the KV prefix cache**   <- the hard criterion for whether the prefix cache works at all
+  prompt_ms actual elapsed prefill time for this call
+This is more reliable than "look at first token latency": the first token mixes in decode, scheduling and network, while cache_n is reported by the engine itself.
 
-用法：
-  ./asr-venv/bin/python tools/mag_sse_probe.py            # 默认连 10100 的已加载模型
+It also counts characters in content / reasoning_content -- with the Qwen3.5 template and thinking left on,
+all 200 tokens burn in reasoning and content is always empty (hit on both vLLM and SGLang).
+
+Usage:
+  ./asr-venv/bin/python tools/mag_sse_probe.py            # by default connects to the model loaded on 10100
 """
 from __future__ import annotations
 
@@ -109,7 +112,7 @@ def main() -> int:
             continue
         print(f"-- {label} {json.dumps(extra, ensure_ascii=False) if extra else ''}")
         for i in range(1, args.repeats + 1):
-            # 前缀完全相同：模拟线上「每句都用同一份 system prompt」
+            # identical prefix: mimic production where every sentence uses the same system prompt
             try:
                 r = one(args.base, args.key, args.model, sysp, args.text, extra, args.max_tokens)
             except Exception as e:  # noqa: BLE001

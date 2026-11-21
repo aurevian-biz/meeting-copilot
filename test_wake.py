@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""常驻采集（AudioHub）的分发语义测试，不需要麦克风和模型。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-唤醒的难点不在识别，而在多路消费者：唤醒线程、VAD 录音、以及「唤醒词刚说完就接着说」
-时的时间连续性。这些都能在没有设备的情况下验证。
+"""Dispatch-semantics tests for the always-on capture (AudioHub); no microphone or model needed.
+
+The hard part of wake word is not recognition but the multiple consumers: the wake thread, the VAD
+recorder, and the time continuity when someone keeps talking right after the wake word. All of it
+can be verified without any device.
 """
 import sys
 import unittest
@@ -27,13 +31,13 @@ def frame(h, value=1):
 
 class TestSubscribe(unittest.TestCase):
     def test_prefill_recent(self):
-        h = hub(pre_s=0.2)          # 10 帧
+        h = hub(pre_s=0.2)          # 10 frames
         for i in range(25):
             h._push(frame(h, i))
         q = h.subscribe(pre_s=0.2)
         self.assertEqual(q.qsize(), 10)
         got = [q.get_nowait()[0] for _ in range(10)]
-        self.assertEqual(got, list(range(15, 25)))  # 最近 10 帧、且是新的
+        self.assertEqual(got, list(range(15, 25)))  # the 10 most recent frames, and they are the new ones
 
     def test_no_prefill(self):
         h = hub()
@@ -43,10 +47,10 @@ class TestSubscribe(unittest.TestCase):
         self.assertEqual(q.qsize(), 0)
 
     def test_prefill_capped_by_buffer(self):
-        h = hub(pre_s=0.2)          # 缓冲只有 10 帧
+        h = hub(pre_s=0.2)          # the buffer holds only 10 frames
         for i in range(40):
             h._push(frame(h, i))
-        q = h.subscribe(pre_s=5.0)  # 要 5 秒，但只有 10 帧可给
+        q = h.subscribe(pre_s=5.0)  # asks for 5 seconds, but only 10 frames can be given
         self.assertEqual(q.qsize(), 10)
 
     def test_live_frames_arrive(self):
@@ -77,14 +81,14 @@ class TestSubscribe(unittest.TestCase):
         for i in range(5):
             h._push(frame(h, i))
         got = [q.get_nowait()[0] for _ in range(2)]
-        self.assertEqual(got, [3, 4])  # 只保留最新两帧，采集线程不被阻塞
+        self.assertEqual(got, [3, 4])  # only the newest two frames are kept; the capture thread is not blocked
 
     def test_rate_s_without_frames(self):
         self.assertEqual(hub().rate_s, -1.0)
 
 
 class TestEventsSince(unittest.TestCase):
-    """短轮询的增量切片：唤醒事件全靠它送到页面。"""
+    """Incremental slicing for short polling: wake events reach the page entirely through this."""
 
     def buf(self, n):
         return deque(((i, {"i": i}) for i in range(1, n + 1)), maxlen=600)
@@ -97,7 +101,7 @@ class TestEventsSince(unittest.TestCase):
         self.assertEqual(vs.events_since(self.buf(5), 5), [])
 
     def test_future_after_is_empty(self):
-        # 前端打开时用 after=1e12 对齐，不应重放历史
+        # the frontend aligns with after=1e12 when it opens; history must not be replayed
         self.assertEqual(vs.events_since(self.buf(5), 10**12), [])
 
     def test_empty_buffer(self):

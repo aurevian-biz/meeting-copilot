@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""tts_probe.py —— Piper 日语合成的时延与质量诊断。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-对双工来说，真正重要的不是「合成完要多快」，而是「多久能听到第一个音」。
-所以这里测三个数：
-    load_s      模型加载（常驻服务里只发生一次）
-    first_ms    首个音频块返回的时延 —— 决定「回应感」
-    rtf         (总合成时间 / 音频时长) —— 决定能否追上说话速度
+"""tts_probe.py — latency and quality diagnostics for Piper Japanese synthesis.
 
-用法：
+For full duplex, what really matters is not "how fast synthesis finishes" but "how soon the first sound is heard".
+So three numbers are measured here:
+    load_s      model load (happens only once in a resident service)
+    first_ms    latency to the first audio chunk — decides the "responsive" feel
+    rtf         (total synthesis time / audio duration) — decides whether it keeps up with speaking speed
+
+Usage:
     python tts_probe.py --text "確認してください。"
     python tts_probe.py --text-file in.txt --out /tmp/a.wav
 """
@@ -36,7 +39,7 @@ def synthesize(model_path: str, text: str, out_path: str | None,
 
     cfg = SynthesisConfig(speaker_id=speaker) if speaker is not None else None
 
-    # 流式合成：记录首块到达时间，这才是双工真正感知到的延迟
+    # Streaming synthesis: record when the first chunk arrives — that is the latency duplex actually perceives
     t1 = time.time()
     first_ms = None
     chunks = []

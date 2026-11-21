@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""量一个 ONNX ASR 模型「还能压多小」：按消费它的算子分类统计权重字节。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+"""Measure how much smaller an ONNX ASR model can get: tally weight bytes by the op class that consumes them.
 
     python tools/quant_probe.py /path/to/model.onnx
     python tools/quant_probe.py model.int8.onnx --target 80
 
-为什么需要它：把 234MB 的 SenseVoice 压到 80MB 听起来是「再省 2/3」，但只有
-MatMul/Gemm 的权重能降到 4-bit（1/4）；Conv、LayerNorm、embedding(Gather) 不行。
-所以先看它们各占多少字节，才知道 4-bit 到底能到哪个数、够不够目标。
+Why it is needed: squeezing the 234MB SenseVoice down to 80MB sounds like "another 2/3 saved", but only
+MatMul/Gemm weights can drop to 4-bit (1/4); Conv, LayerNorm and embedding(Gather) cannot.
+So first see how many bytes each one holds, to know what 4-bit can actually reach and whether that meets the target.
 
-分类依据是「谁消费这个初始器」而不是名字猜：
-  MatMul/Gemm  → 4-bit 可压，乘 0.28（4-bit 权重 + 每 32 元素一个 fp16 scale）
-  Conv/ConvTranspose → 保持 8-bit（ONNX Runtime 没有 4-bit Conv 内核）
-  Gather/Take  → 8-bit（embedding 行访问，压了也不省带宽）
-  其余（Norm/Bias/位置编码等）→ 保持 8-bit，通常很小
+Classification is by "which op consumes this initialiser", not by guessing from the name:
+  MatMul/Gemm  -> compressible to 4-bit, times 0.28 (4-bit weights + one fp16 scale per 32 elements)
+  Conv/ConvTranspose -> stay 8-bit (ONNX Runtime has no 4-bit Conv kernel)
+  Gather/Take  -> 8-bit (embedding row lookups, compressing saves no bandwidth)
+  the rest (Norm/Bias/positional encoding etc.) -> stay 8-bit, usually tiny
 
-退出码：0 = 4-bit 后能达到 --target；1 = 达不到（说明要砍参数，不是砍位宽）。
+Exit code: 0 = --target reachable with 4-bit; 1 = not reachable (meaning you must cut parameters, not bit width).
 """
 from __future__ import annotations
 
@@ -26,18 +29,18 @@ from pathlib import Path
 
 import onnx
 
-# 消费某初始器的算子 → 归到哪一类
+# The op consuming an initialiser -> which class it falls into
 CATEGORY = {
     "MatMul": "matmul", "Gemm": "matmul", "MatMulInteger": "matmul",
     "Conv": "conv", "ConvTranspose": "conv", "ConvInteger": "conv",
     "Gather": "embed", "GatherElements": "embed", "EmbedLayerNormalization": "embed",
 }
-# 每类的压缩系数，都以「1 字节/参数」为基准
-# MatMul: 4-bit 权重 + 每 32 元素一个 fp16 scale ≈ 0.5 + 0.03125 → 0.53
+# Compression factor per class, all relative to "1 byte/parameter"
+# MatMul: 4-bit weights + one fp16 scale per 32 elements ≈ 0.5 + 0.03125 → 0.53
 KEEP_4BIT = {"matmul": 0.53, "conv": 1.0, "embed": 1.0, "other": 1.0}
 KEEP_8BIT = {"matmul": 1.0, "conv": 1.0, "embed": 1.0, "other": 1.0}
 
-# TensorProto 枚举 → 单元素字节数（float32 是 4，别写反）
+# TensorProto enum -> bytes per element (float32 is 4, do not get it backwards)
 DTYPE_BYTES = {1: 4, 2: 1, 3: 1, 4: 2, 5: 2, 6: 4, 7: 8, 9: 1, 10: 2, 11: 8, 16: 2}
 
 
@@ -65,7 +68,7 @@ def analyze(path: Path) -> dict:
     biggest: list[tuple[int, str, str, str]] = []
     for init in m.graph.initializer:
         cats = {CATEGORY.get(op, "other") for op in consumers.get(init.name, ())}
-        # 一个初始器被多类算子共用时，按最保守（不可压）的类记账
+        # when one initialiser is shared by several op classes, charge it to the most conservative (incompressible) class
         cat = "other" if not cats else max(cats, key=lambda c: KEEP_8BIT[c])
         n = bytes_of(init)
         cat_bytes[cat] += n

@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""只量首字：prompt 长版 vs 短版 × 带上文 vs 不带上文，四格对照。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-为什么要这个工具：线上 `/api/status` 的 `ttft_ms` 长期是 400~800ms，离线单句却只有
-89ms。差的那 3~7 倍到底是「system prompt 太长（250~300 token）」还是「本句 + 上文
-的新 token 太多」，光换 prompt 看不出来——必须把两个因子拆开。
+"""Measure the first token only: long vs short prompt × with vs without context, a four-cell comparison.
 
-四个格子：
-  full/ctx2   现网形态
-  short/ctx2  只砍 system prompt
-  full/ctx0   只砍上文
-  short/ctx0  两个都砍，理论下界
+Why this tool exists: `ttft_ms` from the production `/api/status` sits at 400-800ms for long stretches, while a single offline sentence takes only
+89ms. Whether that 3-7x gap is "the system prompt is too long (250-300 tokens)" or "this sentence + context
+adds too many new tokens" cannot be seen by just swapping prompts -- the two factors have to be separated.
 
-判据不是「首字多少」而是**服务器回报的 `cache_n`**：
-  · `cache_n` 稳定 > 0  → 固定前缀被复用，那几个 token 不要钱，prompt 长短对首字
-    几乎没影响，换短版是白干
-  · `cache_n` = 0      → 每句都在重付整个 prefill，此时 prompt 长度才按毫秒计费
+Four cells:
+  full/ctx2   the production shape
+  short/ctx2  cut the system prompt only
+  full/ctx0   cut the context only
+  short/ctx0  cut both, the theoretical lower bound
 
-注意字段语义（很容易搞反）：`prompt_n` 是**本轮真处理的 token 数**，`cache_n` 是
-**从 KV 前缀复用掉的**，两者相加才是整个 prompt 的长度。
+The criterion is not "how large is the first token" but **the `cache_n` the server reports**:
+  · `cache_n` steadily > 0  -> the fixed prefix is reused, those tokens are free, and prompt length barely
+    affects the first token; shipping the short version is wasted work
+  · `cache_n` = 0      -> every sentence re-pays the whole prefill, and only then is prompt length billed in milliseconds
 
-用例必须是**真实句子**（段长分布决定 token 数），默认从线上 `/api/poll` 抓最近
-定稿的日文段，上文按 `--ctx-lines` 从相邻行拼。停机前先抓一份存下来：
+Mind the field semantics (easy to get backwards): `prompt_n` is **the token count really processed this round**, `cache_n` is
+**the part reused from the KV prefix**; only the sum of the two is the length of the whole prompt.
+
+The cases must be **real sentences** (the segment length distribution decides the token count); by default the latest
+finalised Japanese segments are pulled from the production `/api/poll`, and context is assembled from neighbouring lines per `--ctx-lines`. Capture one copy before shutting anything down:
 
     curl -s http://127.0.0.1:8096/api/poll > /tmp/poll.json
     ./asr-venv/bin/python tools/ttft_prompt_ab.py --cases-from /tmp/poll.json --save-cases /tmp/cases.json
@@ -46,7 +49,7 @@ CELLS = [("full", 2), ("short", 2), ("full", 0), ("short", 0)]
 
 
 def cases_from_poll(path: str, ctx_lines: int) -> list[dict]:
-    """把 /api/poll 的 lines 变成 {(target, text, ctx)}。只取已定稿的行。"""
+    """Turn /api/poll lines into {(target, text, ctx)}. Finalised lines only."""
     d = json.loads(Path(path).read_text(encoding="utf-8"))
     lines = [l for l in d.get("lines", []) if l.get("text") and not l.get("pending")]
     out = []
@@ -61,7 +64,7 @@ def cases_from_poll(path: str, ctx_lines: int) -> list[dict]:
 
 def one(base: str, model: str, key: str, style: str, target: str,
         text: str, ctx: str) -> dict:
-    """发一次流式请求。返回首字/全文耗时 + 服务器侧 timings。"""
+    """Send one streaming request. Returns first-token / full-text elapsed + the server-side timings."""
     sysp = cs._tr_system(target, style)
     user = f"【上文】{ctx}\n【本句】{text}" if ctx else text
     body = {
@@ -137,12 +140,12 @@ def main() -> int:
     print(f"# 用例 {len(cases)} 条，每格每句 {args.repeat} 次\n")
 
     res: dict[tuple[str, int], list[dict]] = {c: [] for c in CELLS}
-    # 两轮换向，抵消缓存/温度漂移；每格开始先热身一发，让前缀缓存热起来
+    # Two rounds in opposite order to cancel cache/temperature drift; warm up once at the start of each cell so the prefix cache is hot
     order = [CELLS, list(reversed(CELLS))]
     for rd, cells in enumerate(order, 1):
         for style, ctxn in cells:
             one(args.base, args.model, args.key, style,
-                "zh", "熱身", "")          # 热身不计
+                "zh", "熱身", "")          # warm-up, not counted
             for case in cases:
                 ctx = case["ctx"] if ctxn else ""
                 r = one(args.base, args.model, args.key, style,
@@ -174,8 +177,8 @@ def main() -> int:
                         "under200": hit, "n": len(tt),
                         "out": rows[-1]["out"]})
 
-    # 判据：缓存命中率，而不是首字本身。注意 prompt_n 就是「本轮真处理的 token 数」，
-    # cache_n 是「从 KV 前缀复用掉的」，两者相加才是整个 prompt。
+    # Criterion: the cache hit rate, not the first token itself. Note prompt_n is "the token count really processed this round"
+    # and cache_n is "the part reused from the KV prefix"; only the sum of the two is the whole prompt.
     print()
     for s in summary:
         if s["prompt_n"] > 0:

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""tools/trt_rec_probe.py — 把 OCR 的 rec 换到 TensorRT，量真实收益
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-为什么走 TensorRT 而不是 onnxruntime 的 CUDA EP：
-  JetPack 7.2 带 CUDA 13.2，而 onnxruntime 官方只发 cu12 轮子（pip 无 cu13、
-  apt 无 cuda-cudart-12-*），CUDA EP 加载时 dlopen 失败、报
-  「No registered plugin EP device found」。TensorRT 10.16 倒是随系统就有。
+"""tools/trt_rec_probe.py — move the OCR rec stage onto TensorRT and measure the real gain
 
-做法：不改 RapidOCR 源码，只把 `TextRecognizer.session` 换成一个 TensorRT 包装。
-这样 resize_norm_img / CTC 解码 / 字符表全部复用原实现，两边只差「推理后端」，
-测出来的才是纯粹的后端差异。
+Why TensorRT rather than onnxruntime's CUDA EP:
+  JetPack 7.2 ships CUDA 13.2, while onnxruntime publishes cu12 wheels only (no cu13 on pip,
+  no cuda-cudart-12-* on apt), so the CUDA EP fails its dlopen at load time and reports
+  "No registered plugin EP device found". TensorRT 10.16, on the other hand, is already on the system.
 
-用法：
+Approach: no changes to RapidOCR sources, just swap `TextRecognizer.session` for a TensorRT wrapper.
+That way resize_norm_img / CTC decoding / the charset all reuse the original implementation, and the only difference between the two sides is "the inference backend",
+so what gets measured is the pure backend delta.
+
+Usage:
   python tools/trt_rec_probe.py --engine /tmp/rec_fp16.engine --image /tmp/vision-bench/frame0.png
   python tools/trt_rec_probe.py --engine ... --image ... --side 1440 --threads 8
 """
@@ -29,11 +32,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 class TrtSession:
-    """把 TensorRT engine 伪装成 OrtInferSession。
+    """Disguise a TensorRT engine as an OrtInferSession.
 
-    RapidOCR 的 TextRecognizer 只用到 session 的三件事：
-      `__call__(batch) -> [logits]`、`have_key()`、`get_character_list()`。
-    后两个委托给原 ORT session（它负责读 keys 文件），我们只接管前向。
+    RapidOCR's TextRecognizer only uses three things from the session:
+      `__call__(batch) -> [logits]`, `have_key()`, `get_character_list()`.
+    The last two are delegated to the original ORT session (it reads the keys file); we only take over the forward pass.
     """
 
     def __init__(self, engine_path: str, inner=None, verbose: bool = False):
@@ -66,16 +69,16 @@ class TrtSession:
         self.stream = stream
         self._mem: dict[tuple, tuple[int, int]] = {}   # shape -> (d_in, d_out)
         self.calls = 0
-        self.fallbacks = 0     # 形状超 profile 而退回 CPU 的批次数
+        self.fallbacks = 0     # batches sent back to CPU because the shape exceeded the profile
         self.last_ms = 0.0
 
-    # ---------------------------------------------------------------- 工具
+    # ---------------------------------------------------------------- helpers
     def _check(self, err, what: str):
         if int(err) != 0:
             raise RuntimeError(f"{what} 失败：{err}")
 
     def _buffers(self, in_shape, out_shape):
-        """按形状缓存显存，避免每次 malloc（在统一内存上尤其贵）。"""
+        """Cache device memory per shape to avoid a malloc every time (especially costly on unified memory)."""
         key = (in_shape, out_shape)
         if key not in self._mem:
             rt = self._rt
@@ -88,7 +91,7 @@ class TrtSession:
             self._mem[key] = (d_in, d_out, n_in, n_out)
         return self._mem[key]
 
-    # ---------------------------------------------------------------- 前向
+    # ---------------------------------------------------------------- forward
     def __call__(self, x: np.ndarray):
         rt = self._rt
         x = np.ascontiguousarray(x, dtype=np.float32)
@@ -96,9 +99,9 @@ class TrtSession:
         t0 = time.perf_counter()
 
         if not self.ctx.set_input_shape(self.in_name, shape):
-            # 超出 optimization profile（屏幕上偶尔有一行特别长，整批被 max_wh_ratio 撑宽）。
-            # 与其重建一个覆盖极值的大 engine 拖慢常见路径，不如让这几批退回 CPU：
-            # 实测宽度分布 76% 就是基准 320，超 1536 的只占 4%。
+            # Beyond the optimization profile (the screen occasionally has one very long line, and max_wh_ratio widens the whole batch).
+            # Rather than rebuild a big engine covering the extremes and slowing the common path, send these few batches back to CPU:
+            # the measured width distribution is 76% at the 320 baseline and only 4% above 1536.
             if self._inner is not None:
                 self.fallbacks += 1
                 self.last_ms = (time.perf_counter() - t0) * 1000
@@ -107,7 +110,7 @@ class TrtSession:
         out_shape = tuple(int(v) for v in self.ctx.get_tensor_shape(self.out_name))
         d_in, d_out, n_in, n_out = self._buffers(shape, out_shape)
 
-        # 注意：set_tensor_address 返回 bool（True=成功），不是 cudaError_t
+        # Note: set_tensor_address returns bool (True=success), not cudaError_t
         if not self.ctx.set_tensor_address(self.in_name, int(d_in)):
             raise RuntimeError("set_tensor_address(in) 失败")
         if not self.ctx.set_tensor_address(self.out_name, int(d_out)):
@@ -130,7 +133,7 @@ class TrtSession:
         self.last_ms = (time.perf_counter() - t0) * 1000
         return [host]
 
-    # -------------------------------------------------- 委托给原 ORT session
+    # -------------------------------------------------- delegate to the original ORT session
     def have_key(self):
         return bool(self._inner and self._inner.have_key())
 
@@ -180,10 +183,10 @@ def main(argv=None):
 
     im = _load_image(args.image, args.side)
 
-    # ---------------------------------------------------------- 对照组：CPU
+    # ---------------------------------------------------------- control group: CPU
     print("[1/3] CPU (onnxruntime)", flush=True)
     cpu = RapidOCR(intra_op_num_threads=args.threads)
-    cpu(im)                                  # 暖机
+    cpu(im)                                  # warm-up
     t_cpu = []
     for _ in range(args.runs):
         t = time.perf_counter()
@@ -193,12 +196,12 @@ def main(argv=None):
     print(f"      {['%.2f' % x for x in t_cpu]}  均 {sum(t_cpu)/len(t_cpu):.2f}s"
           f"  {st_cpu['rows']} 行 / 均分 {st_cpu['score']:.3f} / {st_cpu['chars']} 字符")
 
-    # ------------------------------------------------------- 实验组：TensorRT
+    # ------------------------------------------------------- test group: TensorRT
     print("[2/3] 换成 TensorRT rec（预处理与解码不变）", flush=True)
     trt_eng = RapidOCR(intra_op_num_threads=args.threads)
     trt_sess = TrtSession(args.engine, inner=trt_eng.text_rec.session)
     trt_eng.text_rec.session = trt_sess
-    trt_eng(im)                              # 暖机：CUDA context + 形状缓存
+    trt_eng(im)                              # warm-up: CUDA context + shape cache
     t_gpu = []
     for _ in range(args.runs):
         t = time.perf_counter()
@@ -209,7 +212,7 @@ def main(argv=None):
           f"  {st_trt['rows']} 行 / 均分 {st_trt['score']:.3f} / {st_trt['chars']} 字符")
     print(f"      GPU 批 {trt_sess.calls} 次，超 profile 回退 CPU {trt_sess.fallbacks} 次")
 
-    # ------------------------------------------------------------ 一致性
+    # ------------------------------------------------------------ consistency
     print("[3/3] 结果一致性", flush=True)
     same = sum(1 for a, b in zip(st_cpu["text"], st_trt["text"]) if a == b)
     diff = [(a, b) for a, b in zip(st_cpu["text"], st_trt["text"]) if a != b]
@@ -223,7 +226,7 @@ def main(argv=None):
 
     trt_sess.close()
 
-    # 判据：行数一致 + 均分差 < 0.01，才算「精度没塌」
+    # Criterion: same line count + mean score delta < 0.01, i.e. "accuracy has not collapsed"
     ok_rows = st_cpu["rows"] == st_trt["rows"]
     ok_score = abs(st_cpu["score"] - st_trt["score"]) < 0.01
     print(f"精度判定：行数{'一致' if ok_rows else '不一致'}、均分差 "

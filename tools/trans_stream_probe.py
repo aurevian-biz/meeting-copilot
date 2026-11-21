@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""对比 vLLM 翻译的「非流式整句」与「流式首字」延迟。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-用字幕服务里的真实句子和真实 system prompt，测三种指标：
-  total    非流式：从发出到拿到整句
-  ttft     流式：从发出到第一个 token
-  t_all    流式：从发出到流结束
+"""Compare vLLM translation latency for "non-streaming whole sentence" versus "streaming first token".
 
-判据：流式相对非流式的收益 = total - ttft（用户看到第一个字提前了多少）。
+Using the real sentences and real system prompt from the caption service, it measures three figures:
+  total    non-streaming: from send to the whole sentence
+  ttft     streaming: from send to the first token
+  t_all    streaming: from send to end of stream
+
+Criterion: the gain of streaming over non-streaming = total - ttft (how much earlier the user sees the first character).
 """
 import argparse
 import json
@@ -17,7 +20,7 @@ import urllib.request
 
 sys.path.insert(0, "/opt/meeting-copilot")
 
-# 真实句子（取自 8096 的 /api/poll，seq 911~916）
+# Real sentences (taken from /api/poll on 8096, seq 911-916)
 CASES = [
     ("短句", "元首和平宣言。", ""),
     ("中句", "巨头的会面哦，看起来呢。", "元首和平宣言。"),
@@ -100,7 +103,7 @@ def main() -> int:
     print(f"{'均值':6} {avg([r[1] for r in rows]):7.0f}ms "
           f"{avg([r[2] for r in rows]):8.0f}ms {avg([r[3] for r in rows]):7.0f}ms "
           f"{avg([r[4] for r in rows]):+6.0f}ms")
-    # 与生产实测对照
+    # Cross-check against the production measurement
     print("\n生产 8096 实测（916 段）：asr 116~174ms，trans 296~1210ms，lag 117ms")
     return 0
 

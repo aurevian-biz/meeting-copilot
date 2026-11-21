@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""字幕延迟改造的回归测试：两段式出字、队列解耦、上头文、短段。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-ASR 和翻译都打桩，所以不依赖模型和 vLLM，本机/Jetson 都能跑：
+"""Regression tests for the caption latency rework: two-stage output, decoupled queue,
+context carry-over, short segments.
+
+ASR and translation are both stubbed, so neither a model nor vLLM is needed — runs on a laptop or a Jetson:
 
     ./asr-venv/bin/python test_caption_pipe.py
-    python test_caption_pipe.py            # 本机（需 numpy）
+    python test_caption_pipe.py            # local machine (requires numpy)
 
-验证的是"结构"：原文必须比译文先出来，而且采集线程不能被识别/翻译卡住。
+What is verified is the "structure": the source text must appear before the translation, and
+the capture thread must never be blocked by ASR/translation.
 """
 from __future__ import annotations
 
@@ -22,10 +27,10 @@ import caption_server as cs  # noqa: E402
 
 SR = cs.SR
 FRAME_N = cs.FRAME_N
-calls: list[dict] = []          # fake_translate 的调用记录，用例之间共享
+calls: list[dict] = []          # call log of fake_translate, shared between cases
 
 
-# ---------------------------------------------------------------- 打桩
+# ---------------------------------------------------------------- stubs
 class _Result:
     text = "<|zh|>测试一句话。"
 
@@ -51,7 +56,7 @@ class FakeAsr:
 
 def fake_translate(base, model, text, target, timeout=12.0, ctx=""):
     calls.append({"ctx": ctx, "text": text, "target": target})
-    time.sleep(0.25)                       # 模拟 250ms 译文耗时
+    time.sleep(0.25)                       # simulate a 250ms translation
     return "テスト文"
 
 
@@ -60,13 +65,13 @@ stream_calls: list[dict] = []
 
 def fake_translate_stream(base, model, text, target, timeout=12.0, ctx="",
                           on_delta=None, screen_hint=""):
-    """模拟流式：先吐两个增量，再给全文。首字快、整句慢。"""
+    """Simulates streaming: emits two deltas first, then the full text. Fast first token, slow full sentence."""
     stream_calls.append({"ctx": ctx, "text": text, "target": target,
                          "screen_hint": screen_hint})
     t0 = time.time()
     pieces = ["テスト", "文"]
     for i, p in enumerate(pieces, 1):
-        time.sleep(0.09)     # > 80ms 节流窗口，保证两次增量都真的推出去
+        time.sleep(0.09)     # > 80ms throttle window, so both deltas are really pushed out
         if on_delta is not None:
             on_delta("".join(pieces[:i]))
     ttft = int(90)
@@ -80,9 +85,9 @@ def ok(cond, msg, detail=""):
     print(f"[ok]   {msg}" + (f"  {detail}" if detail else ""))
 
 
-# ---------------------------------------------------------------- 用例
+# ---------------------------------------------------------------- cases
 def test_two_stage():
-    """原文先出，译文后补，且回填同一行。"""
+    """Source text comes out first, translation is added later, and it backfills the same line."""
     cap = cs.Captioner(FakeAsr(), bilingual=True, tr_workers=2, ctx_lines=2)
     cap.start_workers()
     pcm = (np.random.randn(SR) * 100).astype(np.int16)
@@ -119,7 +124,8 @@ def test_two_stage():
 
 
 def test_stream_trans():
-    """流式：同一 seq 合并、中间态是最终译文的前缀、只有 final 带耗时。"""
+    """Streaming: repeated pushes for the same seq merge, intermediate states are prefixes of the final
+    translation, and only final carries timings."""
     cap = cs.Captioner(FakeAsr(), bilingual=True, tr_workers=1)
     cap._push_update(7, "テ", False)
     cap._push_update(7, "テスト", False)
@@ -156,7 +162,7 @@ def test_stream_trans():
 
 
 def test_ctx_and_order():
-    """第二句带第一句做上文；积压时译文按序补。"""
+    """The second sentence carries the first as context; when translations back up, they are filled in order."""
     cap = cs.Captioner(FakeAsr(), bilingual=True, tr_workers=1, ctx_lines=2)
     cap.start_workers()
     pcm = (np.random.randn(SR) * 100).astype(np.int16)
@@ -167,14 +173,14 @@ def test_ctx_and_order():
         time.sleep(0.01)
     ok(len(cap.lines) == 3, "三段都进了队列并被识别", f"{len(cap.lines)} 段")
     ok(all(l["trans"] for l in cap.lines), "译文全部补齐")
-    # 流式路径记在 stream_calls，整句路径记在 calls；按实际走的取
+    # the streaming path records into stream_calls, the whole-sentence path into calls; take whichever ran
     last = (stream_calls or calls)[-1]
     ok(last["ctx"].startswith("测试一句话"), "翻译带上了上文",
        repr(last["ctx"][:20]))
 
 
 def test_submit_not_blocked():
-    """采集线程投递段不能被 ASR/翻译阻塞。"""
+    """Submitting a segment from the capture thread must not be blocked by ASR/translation."""
     cap = cs.Captioner(FakeAsr(), bilingual=True, tr_workers=1)
     cap.start_workers()
     pcm = (np.random.randn(SR) * 100).astype(np.int16)
@@ -186,9 +192,9 @@ def test_submit_not_blocked():
 
 
 def test_queue_overflow_drops_oldest():
-    """队列满了丢最老的一段，而不是无限堆积。"""
+    """A full queue drops the oldest segment rather than growing without bound."""
     a = cs.Captioner(FakeAsr(), bilingual=False)
-    a._started = True                       # 不启工作线程，让它纯堆积
+    a._started = True                       # don't start worker threads, so it just accumulates
     pcm = np.zeros(FRAME_N, dtype=np.int16)
     for _ in range(a._q_asr.maxsize + 5):
         a.submit(pcm, 0.02, end_ts=time.time())
@@ -197,28 +203,28 @@ def test_queue_overflow_drops_oldest():
 
 
 def test_segment_length():
-    """max_s=3.0 生效：连续说话最多 3 秒一段。"""
+    """max_s=3.0 takes effect: continuous speech is capped at 3 seconds per segment."""
     seg = cs.Segmenter(margin_db=8.0, hold_s=0.42, max_s=3.0, min_s=0.25)
     frame = (np.random.randn(FRAME_N) * 400).astype(np.int16)
     lens = []
-    for i in range(400):                    # 8 秒连续有声
+    for i in range(400):                    # 8 seconds of continuous voice activity
         db = -20.0
         out = seg.push(frame, db)
         if out is not None:
             lens.append(out.size / SR)
-        # 前 1.2 秒是本底预热，不判语音
+        # the first 1.2 seconds are noise-floor warm-up and are not judged as speech
     ok(len(lens) >= 2, "连续说话被强制切段", f"{[round(x,2) for x in lens]}")
     ok(max(lens) <= 3.0 + 1e-6, "单段不超过 3 秒", f"max={max(lens):.2f}s")
     ok(all(x >= 0.25 for x in lens), "不产出过短的碎段")
 
 
 def test_soft_cut_at_dip():
-    """硬切前回退到能量低谷：段长不再一律等于 max_s。"""
+    """Before a hard cut, back off to an energy dip: segment length is no longer always exactly max_s."""
     seg = cs.Segmenter(margin_db=8.0, hold_s=0.42, max_s=3.0, min_s=0.25, soft_s=0.7)
     frame = (np.random.randn(FRAME_N) * 400).astype(np.int16)
     lens = []
     for i in range(400):
-        # 每 0.5 秒安排 2 帧深低谷；够不上 21 帧的静音挂起，只能靠硬切
+        # place 2 deep-dip frames every 0.5s; that never reaches the 21-frame silence hang, so only a hard cut fires
         db = -62.0 if (i % 25) < 2 else -20.0
         out = seg.push(frame, db)
         if out is not None:
@@ -229,7 +235,7 @@ def test_soft_cut_at_dip():
 
 
 def _pump(seg, frame, voiced_n, silent_n, db_v=-20.0, db_s=-70.0):
-    """先说话 voiced_n 帧、再静音 silent_n 帧，收集期间产出的所有段。"""
+    """Speak for voiced_n frames, then stay silent for silent_n frames; collect every segment produced meanwhile."""
     outs = []
     for _ in range(voiced_n):
         r = seg.push(frame, db_v)
@@ -243,42 +249,44 @@ def _pump(seg, frame, voiced_n, silent_n, db_v=-20.0, db_s=-70.0):
 
 
 def test_hold_layering():
-    """停顿门限分层：段还短时只认长停顿，段够长时短停顿就切。"""
+    """Layered pause thresholds: while a segment is short only long pauses count;
+    once it is long enough, a short pause already cuts."""
     frame = (np.random.randn(FRAME_N) * 400).astype(np.int16)
 
     def fresh():
         seg = cs.Segmenter(margin_db=8.0, hold_s=0.45, max_s=4.5, min_s=0.25,
                            soft_s=0.7, hold_long_s=0.90, hold_short_s=0.30,
                            mid_s=1.20, long_s=2.40)
-        for _ in range(int(1.2 / cs.FRAME_S) + 2):      # 预热，估本底
+        for _ in range(int(1.2 / cs.FRAME_S) + 2):      # warm-up, to estimate the noise floor
             seg.push(frame, -70.0)
         return seg
 
-    # 0.6 秒短句 + 0.5 秒停顿：0.5 < hold_long(0.9)，不许切。
-    # 这正是「…况且140。」+「亿美元对台均售…」被数字切断的成因。
+    # 0.6s utterance + 0.5s pause: 0.5 < hold_long(0.9), so no cut allowed.
+    # This is exactly what used to split "…况且140。" + "亿美元对台均售…" at the digits.
     seg = fresh()
     outs = _pump(seg, frame, 30, 25)
     ok(not outs, "短段遇 0.5s 停顿不该断句", f"切出了 {len(outs)} 段")
 
-    # 同一个段，静音继续撑到 0.9 秒以上就该断
+    # same segment; once silence holds past 0.9s it must cut
     outs = _pump(seg, frame, 0, 25)
     ok(len(outs) == 1, "静音够 0.9s 就断句", f"{len(outs)} 段")
     if outs:
         dur = outs[0].size / SR
         ok(1.2 < dur < 2.2, "段长≈0.6 有声 + 0.9 静音 + 预补", f"{dur:.2f}s")
 
-    # 3 秒长句 + 0.32 秒停顿：段已超 seg_long，按 hold_short 立刻切
+    # 3-second utterance + 0.32s pause: the segment already exceeds seg_long, so cut at once per hold_short
     seg = fresh()
     outs = _pump(seg, frame, 150, 16)
     ok(len(outs) == 1, "长段遇短停顿就切，延迟不再往上堆", f"{len(outs)} 段")
     ok(seg.last_cut == "silence", "记录成因是自然停顿，不是撞上限", seg.last_cut)
 
-    # 3 秒长句 + 0.2 秒停顿（不足 hold_short）：还是不许切
+    # 3-second utterance + 0.2s pause (below hold_short): still no cut
     seg = fresh()
     outs = _pump(seg, frame, 150, 10)
     ok(not outs, "0.2s 停顿短于 hold_short，不切", f"{len(outs)} 段")
 
-    # 静音门限调到比基准还短时，不能反过来让长段门槛低于基准（参数传反的兜底）
+    # when the silence threshold is set shorter than the base, the long-segment threshold must not
+    # end up below the base either (fallback for swapped parameters)
     seg = cs.Segmenter(margin_db=8.0, hold_s=0.45, max_s=4.5, min_s=0.25,
                        hold_long_s=0.10, hold_short_s=2.0)
     ok(seg.hold_long_frames >= seg.hold_frames, "hold_long 不小于基准")
@@ -286,7 +294,7 @@ def test_hold_layering():
 
 
 def test_noise_segment_dropped():
-    """只有标点的识别结果不算一句话，不能占一行字幕。"""
+    """An ASR result that is only punctuation is not a sentence and must not occupy a caption line."""
     ok(not cs.SUBSTANCE.search(" 。"), "纯标点丢弃")
     ok(not cs.SUBSTANCE.search("  "), "空白丢弃")
     ok(bool(cs.SUBSTANCE.search("嗯。")), "单个实词保留")
@@ -295,17 +303,20 @@ def test_noise_segment_dropped():
 
 
 def test_lang_clean():
-    """译文残留检测：假名必中；中日共用汉字绝不能误伤。"""
+    """Translation residue detection: kana must always hit; Han characters shared by Chinese and
+    Japanese must never be false positives."""
     ok(not cs.lang_clean("美国应该坚持するべきです", "zh"), "日译中残留假名被检出")
     ok(cs.lang_clean("在实质层面，美国应当坚持立场。", "zh"), "干净中文放过")
-    # 专有名词允许保留日文写法，少量假名不该触发重试
+    # proper nouns may keep their Japanese spelling; a few kana must not trigger a retry
     ok(cs.lang_clean("特别是深圳（深セン）被称为中国的硅谷。", "zh"), "专有名词少量假名放过")
     ok(not cs.lang_clean("美国应该坚持するべきです", "zh"), "整句假名仍判脏")
     ok(not cs.lang_clean("中国側は故意に韓国に给好处", "ja"), "中译日残留简体被检出")
     ok(cs.lang_clean("中国側は意図的に韓国に便宜を図った。", "ja"), "干净日语放过")
-    # 这三个汉字中日共用，误放进名单就会把正常译文判脏、白白多跑一次翻译
+    # these three Han characters are shared by Chinese and Japanese; adding them to the list would
+    # flag healthy translations as dirty and waste a whole extra translation call
     ok(cs.lang_clean("会議は都会で開かれる。", "ja"), "「会」「都」不误伤")
-    # 整句照抄中文时每个字都是日语也有的汉字，只能靠「有没有假名」判
+    # when a whole sentence is copied from Chinese, every character is also a Han character used in
+    # Japanese, so only "does it contain kana" can decide
     ok(not cs.lang_clean("我是主持人田英和", "ja"), "纯汉字整句判脏（没翻译）")
     ok(cs.lang_clean("私は司会の谭英文です。", "ja"), "带假名的正常译文放过")
     ok(cs.lang_clean("了解", "ja"), "短句不受无假名规则影响")
@@ -314,7 +325,7 @@ def test_lang_clean():
 
 
 def asr_saying(text: str):
-    """固定输出一句话的 ASR 替身，用来验证「原文逐字、翻译前清洗」。"""
+    """ASR stand-in that always emits one sentence, used to verify "source stays verbatim, cleaning happens before translation"."""
     result = type("R", (), {"text": text})()
     stream = type("S", (), {"result": result,
                             "accept_waveform": lambda self, sr, x: None})()
@@ -324,7 +335,7 @@ def asr_saying(text: str):
 
 
 def test_strip_fillers():
-    """去口癖的边界：只删纯语气词，实义词与空结果都必须保住。"""
+    """Filler-removal boundaries: only pure interjections are deleted; content words and empty results must survive."""
     ok(cs.strip_fillers("嗯，那个项目怎么样了") == "那个项目怎么样了", "句首语气词删掉")
     ok(cs.strip_fillers("我觉得那个不行") == "我觉得那个不行", "「那个」有实义，不动")
     ok(cs.strip_fillers("嗯嗯，呃，好的") == "好的", "连续语气词全清，标点不残留")
@@ -338,8 +349,8 @@ def test_strip_fillers():
 
 
 def test_fillers_only_for_translation():
-    """页面显示的原文保持逐字，只有送进翻译的文本被清洗。"""
-    calls.clear()                       # 前面的用例留下的线程还在跑，先清空记录
+    """The source text displayed on the page stays verbatim; only what is sent to translation gets cleaned."""
+    calls.clear()                       # threads from earlier cases are still running, so clear the log first
     stream_calls.clear()
     cap = cs.Captioner(asr_saying("<|zh|>嗯，那个项目怎么样了。"), bilingual=True,
                        tr_workers=1)
@@ -352,7 +363,7 @@ def test_fillers_only_for_translation():
     ok(bool(cap.lines), "产出一行字幕")
     ok(cap.lines[0]["text"] == "嗯，那个项目怎么样了。",
        "显示用的原文仍带语气词", repr(cap.lines[0]["text"]))
-    rec = stream_calls or calls          # 流式是默认路径
+    rec = stream_calls or calls          # streaming is the default path
     ok(any(c["text"] == "那个项目怎么样了。" for c in rec),
        "翻译拿到的是清洗后的文本", repr([c["text"] for c in rec][-3:]))
     ok(not any(c["text"].startswith("嗯") for c in rec),
@@ -373,11 +384,12 @@ def test_clear_resets():
 
 
 def test_segmenter_draft():
-    """分段器要能交出「还没断句的当前段」——草稿字幕的原料。"""
+    """The segmenter must be able to hand out "the current segment that is not cut yet" —
+    the raw material for a draft caption."""
     seg = cs.Segmenter()
     ok(seg.draft() is None, "没声音时没有草稿")
     frame = (np.random.randn(FRAME_N) * 300).astype(np.int16)
-    for _ in range(100):                     # 2 秒：前 60 帧是预热期，之后才建段
+    for _ in range(100):                     # 2 seconds: the first 60 frames are warm-up, segments start after that
         seg.push(frame, -20.0)
     d = seg.draft()
     ok(d is not None and d[0].size > 0 and d[1] > 0.5, "有声时能拿到草稿音频",
@@ -385,7 +397,8 @@ def test_segmenter_draft():
 
 
 def test_draft_caption():
-    """说话过程中先出灰字，段定稿后草稿立即清空（正式行接手）。"""
+    """Grey text appears first while speaking; once the segment is finalized the draft is cleared
+    immediately (the real line takes over)."""
     cap = cs.Captioner(FakeAsr(), bilingual=True, draft_on=True)
     cap.start_workers()
     pcm = (np.random.randn(SR) * 100).astype(np.int16)
@@ -407,13 +420,14 @@ def test_draft_caption():
 
 
 def test_draft_stale_dropped():
-    """草稿识别慢于定稿时必须丢弃，否则灰字会盖到已经定稿的内容上。"""
+    """A draft slower than finalization must be dropped, otherwise the grey text would be drawn
+    over content that is already final."""
 
     class SlowAsr:
         class rec:
             @staticmethod
             def create_stream():
-                time.sleep(0.25)             # 模拟识别比断句还慢
+                time.sleep(0.25)             # simulate recognition slower than segmentation
                 return _Stream()
 
             @staticmethod
@@ -425,7 +439,7 @@ def test_draft_stale_dropped():
     pcm = (np.random.randn(SR) * 100).astype(np.int16)
 
     cap.push_draft(pcm, 1.0)
-    time.sleep(0.05)                         # 草稿线程已进 recognize（要 0.25s）
+    time.sleep(0.05)                         # the draft thread is already inside recognize (needs 0.25s)
     cap.submit(pcm, 1.0, end_ts=time.time())
     time.sleep(0.6)
     ok(cap.draft_state()["text"] == "", "过期草稿不落到屏幕上")
@@ -442,10 +456,11 @@ def test_no_draft():
 
 
 def test_ctx_lines_zero():
-    """ctx_lines=0 必须真的不带上文。
+    """ctx_lines=0 must truly carry no context.
 
-    切片写成 `prev[-self.ctx_lines:]` 时，0 会变成 `[0:]` 把**全部历史**都当上文，
-    实测把 35B 的 prompt 从 80 token 涨到 138、首字多花 300ms。
+    When the slice is written as `prev[-self.ctx_lines:]`, 0 turns into `[0:]` and treats **the
+    whole history** as context; measured on the 35B model this grew the prompt from 80 to 138
+    tokens and cost 300ms extra on the first token.
     """
     cap = cs.Captioner(FakeAsr(), bilingual=True, ctx_lines=0)
     for i in range(1, 5):
@@ -460,10 +475,11 @@ def test_ctx_lines_zero():
 
 
 def test_tr_prompt_styles():
-    """两档 prompt 都要在、且能按 --tr-prompt / TR_STYLE 切换。
+    """Both prompt styles must exist and be selectable via --tr-prompt / TR_STYLE.
 
-    short 版是 4.20 加的：short 只留三条硬规则，砍掉示例，长度必须真的短下来
-    （否则等于没改），但也不能短到把「纯目标语言」这条丢掉。
+    The short version was added in 4.20: it keeps only the three hard rules and drops the examples,
+    so its length must really shrink (otherwise nothing changed), but it must not shrink so far
+    that the "target language only" rule is lost.
     """
     for target in ("zh", "ja"):
         full = cs._tr_system(target, "full")
@@ -471,11 +487,11 @@ def test_tr_prompt_styles():
         ok(short != full, f"{target} 两档不同", short[:20])
         ok(len(short) < 140, f"{target} short 确实短（{len(short)} 字）", len(short))
         ok(len(full) > len(short) * 2, f"{target} full 至少两倍长", len(full))
-        # 三条硬规则的关键词一个都不能少
+        # not a single keyword of the three hard rules may be missing
         for kw in ("【本句】", "【上文】", "半句"):
             ok(kw in short, f"{target} short 含 {kw}", short)
 
-    # 模块级开关：不传 style 时看 TR_STYLE
+    # module-level switch: when style is not passed, TR_STYLE decides
     old = cs.TR_STYLE
     try:
         cs.TR_STYLE = "short"
@@ -487,18 +503,18 @@ def test_tr_prompt_styles():
 
 
 def test_screen_hints():
-    """屏幕词表：只按「读音相似、写法不同」命中；命中才递提示，不命中零代价。"""
-    # ---- 读音工具
+    """Screen term hints: only triggered by "similar reading, different spelling"; a hit passes a hint, a miss costs nothing."""
+    # ---- reading helpers
     ok(cs._hira("ハンズイ") == "はんずい", "_hira 片假名转平假名")
     ok(cs._hira("ABC 12、") == "", "_hira 丢掉拉丁/数字/标点")
     ok(cs._lev("はんずい", "はんずい") == 0, "_lev 相同为 0")
     ok(cs._lev("はんずい", "はんすい") == 1, "_lev 差一个音为 1")
     ok(cs._lev("はんずい", "はん") == 9, "_lev 长度差过大直接判 9")
 
-    # ---- 假读音器：不依赖 pyopenjtalk，本机也能跑
+    # ---- fake reading engine: no pyopenjtalk dependency, runs on a laptop too
     lex = {
         "畔蒜泰助": "はんずいたいすけ",
-        "阪井泰介": "はんずいたいすけ",     # ASR 的同音异字
+        "阪井泰介": "はんずいたいすけ",     # ASR's homophone with different characters
         "首脳会談": "しゅのうかいだん",
         "三社": "さんしゃ", "さんしゃ": "さんしゃ",
         "会議": "かいぎ",
@@ -521,7 +537,7 @@ def test_screen_hints():
         return out
 
     h = cs.ScreenHints(reader=reader, recent=lambda: ["这是上一句已经译好的中文内容"])
-    # 屏幕文本：UI 行要丢、自我循环行要丢、剩下的才进词表
+    # screen text: UI lines must go, self-feeding lines must go, only the rest enters the term list
     h.set_text("会议字幕 已识别206段\n这是上一句已经译好的中文内容\n"
                "这样字幕可以根据屏幕内容修改\n"
                "畔蒜泰助 東京財団政策研究所\n三社の会談")
@@ -532,26 +548,26 @@ def test_screen_hints():
     ok(all("这样" not in w for w in words), "中文界面/聊天窗口的行被丢掉（简体外挂字）")
     ok(h.status()["lines"] == 5, "记录原始屏幕行数", h.status()["lines"])
 
-    # 命中：读音完全相同、写法不同
+    # hit: identical reading, different spelling
     hit = h.suggest("阪井泰介さんが来ました")
     ok(hit.startswith("【屏幕词】") and "畔蒜泰助" in hit, "同音异字被命中并提示", hit)
     ok(len(hit) < 80, "提示很短（只多几十个 token）", f"{len(hit)} 字")
     ok(h.hits == 1, "命中计数 +1", h.hits)
 
-    # 不命中：本句已经写对了，不该再提示（否则纯属浪费 + 干扰）
+    # miss: this sentence is already spelled correctly, so no hint (otherwise pure waste plus noise)
     ok(h.suggest("畔蒜泰助さんが来ました") == "", "写法已正确时不提示")
-    # 不命中：读音差得远
+    # miss: the readings are far apart
     ok(h.suggest("この会議は長いです") == "", "读音不相似时不提示")
-    # 不命中：读音相似但一个字都不共用（纯巧合，多半是中文界面词被硬读出日语读音）
+    # miss: similar reading but not a single character in common (pure coincidence, usually a Chinese UI word force-read with Japanese readings)
     h3 = cs.ScreenHints(reader=reader)
     h3.terms = [("三社", "さんしゃ")]
     ok(h3.suggest("さんしゃです") == "", "读音巧合但无共同字时不提示")
 
-    # 空词表
+    # empty term list
     h2 = cs.ScreenHints(reader=reader)
     ok(h2.suggest("阪井泰介さんが来ました") == "", "没有屏幕词表时恒为空串")
 
-    # ---- 接到 Captioner：命中才出现在请求体里
+    # ---- wired into Captioner: the hint appears in the request body only on a hit
     cap = cs.Captioner(FakeAsr(), bilingual=True, tr_workers=1, screen=h)
     cap.start_workers()
     stream_calls.clear()
@@ -566,7 +582,7 @@ def test_screen_hints():
        "没命中时请求体不带任何屏幕提示（零代价）",
        repr(stream_calls[-1]["screen_hint"])[:40])
 
-    # 打桩 ASR 说的是「阪井泰介」，屏幕上是「畔蒜泰助」→ 该带提示
+    # the stubbed ASR says "阪井泰介" while the screen shows "畔蒜泰助" → a hint is expected
     cap2 = cs.Captioner(asr_saying("阪井泰介さんが来ました"), bilingual=True,
                         tr_workers=1, screen=h)
     cap2.start_workers()
@@ -583,19 +599,21 @@ def test_screen_hints():
     ok(cap2.lines[0].get("screen_hint", "").startswith("【屏幕词】"),
        "行对象上标了 screen_hint，便于事后核对")
 
-    # 默认关闭：不传 screen 时 status 是 None、请求体也不该有 screen_hint
+    # off by default: without screen, status is None and the request body must carry no screen_hint
     cap3 = cs.Captioner(FakeAsr(), bilingual=True, tr_workers=1)
     ok(cap3.status()["screen"] is None, "不传 screen 时 status.screen 为 None")
 
 
 def test_page_js_syntax():
-    """内嵌页面必须能被浏览器解析。
+    """The embedded page must parse in the browser.
 
-    2026-11-21 踩过：给 #scr 加 tooltip 时写了 '\\n'，PAGE 当时不是 raw 字符串，
-    Python 端把 JS 里的换行转义变成了真换行，单引号字符串被截断 → 整段 <script>
-    语法错误 → 页面停在初始 DOM（连接中… / -99 dB / 0 段），按钮全失效，
-    而服务端一切正常（/api/status、/api/poll 都有数据），排查方向全被带偏。
-    这里直接把 PAGE 里的 <script> 交给 node --check，语法错就跑不过。
+    Hit on 2026-11-21: adding a tooltip to #scr, we wrote '\\n', and PAGE was not a raw string
+    at the time, so the Python side turned the newline escape inside the JS into a real newline;
+    the single-quoted string was truncated → the whole <script> block had a syntax error → the
+    page stuck on the initial DOM (connecting… / -99 dB / 0 segments) with every button dead,
+    while the server was perfectly fine (/api/status and /api/poll both had data), which sent the
+    debugging effort in the wrong direction. So here the <script> inside PAGE is handed straight
+    to node --check: a syntax error cannot slip through.
     """
     import re
     import shutil
@@ -609,8 +627,24 @@ def test_page_js_syntax():
     js = m.group(1)
     ok("applyPayload" in js and "startSSE" in js, "关键函数还在", js[:20])
 
-    # 单引号字符串里绝不能出现真换行（raw 字符串被改回去时最先炸的就是这个）
-    bad = [i + 1 for i, ln in enumerate(js.split("\n")) if ln.count("'") % 2 == 1]
+    # a single-quoted string must never contain a real newline (this is the first thing to blow up
+    # if the raw string is reverted). Comments are stripped first: an English comment containing
+    # an apostrophe ("don't") is not a broken string, and counting it made this check cry wolf.
+    def _strip_comments(text):
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        out = []
+        for line in text.split("\n"):
+            pos = line.find("//")
+            while pos != -1:
+                # only a comment if the quotes before it are balanced (skip URLs in strings)
+                if line[:pos].count("'") % 2 == 0:
+                    line = line[:pos]
+                    break
+                pos = line.find("//", pos + 1)
+            out.append(line)
+        return out
+
+    bad = [i + 1 for i, ln in enumerate(_strip_comments(js)) if ln.count("'") % 2 == 1]
     ok(not bad, "没有跨行断掉的单引号字符串", f"可疑行 {bad[:5]}")
 
     node = shutil.which("node")

@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# 在 8000 端口上换 LLM：vLLM(Qwen2.5-7B-AWQ) <-> SGLang(Qwen3.5-35B-A3B-GPTQ-Int4)。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
+
+# Swap the LLM on port 8000: vLLM(Qwen2.5-7B-AWQ) <-> SGLang(Qwen3.5-35B-A3B-GPTQ-Int4).
 #
-# 两个服务都叫 served-model-name=qwen，所以 voice_server / caption_server 一行都不用改。
+# Both serve as served-model-name=qwen, so voice_server / caption_server need no changes at all.
 #
-#   ./tools/llm_switch.sh status              # 现在是谁在跑、多久起得来
-#   ./tools/llm_switch.sh stop                # 停掉当前 LLM（开始停机）
-#   ./tools/llm_switch.sh start-sgl           # 起 35B-A3B
-#   ./tools/llm_switch.sh start-vllm          # 回滚 7B
-#   ./tools/llm_switch.sh wait                # 等 /v1/models 就绪
+#   ./tools/llm_switch.sh status              # who is running now and how long it takes to come up
+#   ./tools/llm_switch.sh stop                # stop the current LLM (start of the switch)
+#   ./tools/llm_switch.sh start-sgl           # start 35B-A3B
+#   ./tools/llm_switch.sh start-vllm          # roll back to 7B
+#   ./tools/llm_switch.sh wait                # wait until /v1/models is ready
 #
-# 可调参数（环境变量）：
-#   MEM=0.62   显存占用比例。Jetson 是统一内存，61G 里还要留给 OCR/ASR/系统，
-#              0.8 会把机器榨干；0.62 ≈ 38G，KV 池对 8K 上下文绰绰有余
-#   CTX=8192   上下文上限。生产 prompt 只有几百 token，开 131072 纯属浪费
-#   SPEC=0     1 = 开 NEXTN 投机解码（readme 里验证过的组合，先跑通再开它）
+# Tunables (environment variables):
+#   MEM=0.62   VRAM fraction. Jetson uses unified memory and 61G must still hold OCR/ASR/system,
+#              0.8 would drain the box; 0.62 ~ 38G leaves a KV pool far beyond 8K context needs
+#   CTX=8192   context limit. Production prompts are a few hundred tokens; 131072 is pure waste
+#   SPEC=0     1 = enable NEXTN speculative decoding (combination verified in the readme; get it working first)
 #
 set -uo pipefail
 
@@ -65,15 +68,15 @@ status)
     ;;
 
 stop)
-    # 只停容器不删：回滚时 docker start 不用重新加载镜像层，快得多
+    # Stop the container without removing it: on rollback docker start skips re-loading image layers, much faster
     docker stop "${VLLM_NAME}" >/dev/null 2>&1 && say "stopped ${VLLM_NAME}"
     docker stop "${SGL_NAME}"  >/dev/null 2>&1 && say "stopped ${SGL_NAME}"
     say "8000 已释放"
     ;;
 
 start-vllm)
-    # VLLM_MEM 默认 0.40。要和 Magnitude 的 35B（27.9G）共存时压到 0.25：
-    # 7B 的 KV 池原先是 19.94G/373k token，我们实际只用到几千 token，纯浪费。
+    # VLLM_MEM defaults to 0.40. Squeeze it to 0.25 when co-existing with Magnitude's 35B (27.9G):
+    # the 7B KV pool used to be 19.94G/373k tokens while we only ever use a few thousand — pure waste.
     VLLM_MEM=${VLLM_MEM:-0.40}
     if docker inspect "${VLLM_NAME}" >/dev/null 2>&1; then
         docker start "${VLLM_NAME}" >/dev/null && say "docker start ${VLLM_NAME}（复用原容器）"
@@ -90,8 +93,8 @@ start-vllm)
     ;;
 
 start-vllm-35b)
-    # 文件里那两版命令原样不能跑：gpu-memory-utilization 0.8/0.9 + max-model-len
-    # 128000/262144 在 61G 统一内存上会把 OCR/ASR 挤死。这里压到 0.55 / 8192。
+    # The two commands from the doc do not run as-is: gpu-memory-utilization 0.8/0.9 + max-model-len
+    # 128000/262144 starves OCR/ASR on 61G of unified memory. Capped here at 0.55 / 8192.
     docker rm -f "${SGL_NAME}" >/dev/null 2>&1
     docker rm -f vllm-qwen35b >/dev/null 2>&1
     docker run -d --name vllm-qwen35b --runtime nvidia --network host --gpus all \
@@ -133,7 +136,7 @@ start-sgl)
                --speculative-num-steps 3
                --speculative-eagle-topk 1
                --speculative-num-draft-tokens 4)
-        # 只在真开投机时才设这个变量：设成 "0" 也会被当成「已设置」而打开 v2 路径
+        # Set this only when speculation is really on: even "0" counts as "set" and turns on the v2 path
         envs+=(-e SGLANG_ENABLE_SPEC_V2=1)
     fi
     say "启动：MEM=${MEM} CTX=${CTX} SPEC=${SPEC}"

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""装完自查：依赖能不能 import、模型在不在、设备认不认。
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 meeting-copilot contributors
 
-为什么单独一个脚本：这套系统最坑的不是报错，而是**静默降级**——
-  · cuda-python 版本和 JetPack 不配套 → TensorRT 不可用 → OCR 悄悄跑在 CPU 上，
-    从 300ms 变 3s，日志里一个字都不提
-  · pyopenjtalk 装成了官方源码版但编译失败 → 日语音色直接不可用
-  · 采集卡有 /dev/video0 但读出来是全黑（预热帧没丢）
-这些在「服务起来了」这一层完全看不出来，只能逐项探。
+"""Post-install self-check: whether the dependencies import, the models are present, the devices are recognised.
+
+Why a separate script: the nastiest failure here is not an error but **silent degradation** --
+  · cuda-python version mismatched with JetPack -> TensorRT unavailable -> OCR quietly runs on CPU,
+    going from 300ms to 3s with not a word in the log
+  · pyopenjtalk installed as the official source build but the compilation failed -> the Japanese voice is simply unusable
+  · the capture card has /dev/video0 but reads all black (warm-up frames not dropped)
+None of this is visible at the "the service came up" level; it has to be probed item by item.
 """
 from __future__ import annotations
 
@@ -61,7 +64,7 @@ def check_models() -> int:
 
 
 def check_gpu() -> int:
-    """TensorRT 是可选加速；不可用时明确告警，因为它是**静默**降级的。"""
+    """TensorRT is an optional accelerator; warn loudly when unavailable, because it degrades **silently**."""
     try:
         import tensorrt as trt
         line(OK, f"TensorRT {trt.__version__}（OCR 可走 GPU）")
