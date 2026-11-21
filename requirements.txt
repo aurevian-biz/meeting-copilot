@@ -6,7 +6,7 @@
 # Why TensorRT is not lumped into this single requirements file:
 # tensorrt / cuda-python must match JetPack's own CUDA version exactly; pip-installing a mismatched
 # version falls back to CPU silently (OCR goes from 300ms to 3s with no error). Use the JetPack
-# builds, and install separately per docs/ocr-gpu.md only if you really want GPU-accelerated OCR.
+# builds, and install separately per docs/en/ocr-gpu.md only if you really want GPU-accelerated OCR.
 
 numpy>=1.26,<3
 scipy>=1.11

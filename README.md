@@ -48,12 +48,12 @@ bash scripts/healthcheck.sh
 
 Open `http://<device-ip>:8095` (assistant) and `:8096` (captions).
 
-> **Read [hardware.md](docs/hardware.md) first**: 60 Hz mains hum needs a high-pass filter,
+> **Read [hardware.md](docs/en/hardware.md) first**: 60 Hz mains hum needs a high-pass filter,
 > the H340 capture gain must be lowered from +8 dB to 0 dB, and the capture card emits
 > ~40 warm-up frames that must be discarded. None of these produce an error — they just
 > silently invalidate every later tuning step.
 
-Full steps: [install.md](docs/install.md). Stuck? [troubleshooting.md](docs/troubleshooting.md).
+Full steps: [install.md](docs/en/install.md). Stuck? [troubleshooting.md](docs/en/troubleshooting.md).
 
 ## Hardware
 
@@ -65,7 +65,7 @@ Full steps: [install.md](docs/install.md). Stuck? [troubleshooting.md](docs/trou
 | External SSD | ≥128 GB | 3.4G models + 22.9G LLM weights |
 
 Also runs on x86 + NVIDIA GPU. On CUDA 13, `onnxruntime-gpu` is unusable, so OCR
-acceleration goes through TensorRT ([ocr-gpu.md](docs/ocr-gpu.md)).
+acceleration goes through TensorRT ([ocr-gpu.md](docs/en/ocr-gpu.md)).
 
 ## Design notes
 
@@ -78,27 +78,26 @@ acceleration goes through TensorRT ([ocr-gpu.md](docs/ocr-gpu.md)).
   full-`innerHTML` + pixel-`scrollY` approach drifted while a long line grew, making the
   previous line appear to vanish.
 
-See [architecture.md](docs/architecture.md).
+See [architecture.md](docs/en/architecture.md).
 
 ## Documentation
 
-Every document exists in three languages: this table links the English files, and the
-same name with `.zh.md` / `.ja.md` is the Chinese / Japanese version
-(for example [hardware.zh.md](docs/hardware.zh.md), [hardware.ja.md](docs/hardware.ja.md)).
-Each page carries a language switcher at the top.
+Every document exists in three languages, in three sibling folders:
+`docs/en/`, `docs/zh/`, `docs/ja/` — the file name is the same in all of them.
+The table below links the English folder; each page carries a language switcher at the top.
 
 | Doc | Contents |
 |---|---|
-| [hardware.md](docs/hardware.md) | BOM, wiring, the three physical issues to fix first |
-| [install.md](docs/install.md) | Zero-to-running |
-| [models.md](docs/models.md) | Model list, why each, license caveats |
-| [llm-serving.md](docs/llm-serving.md) | Magnitude 35B vs vLLM 7B; prefill / prefix-cache traps |
-| [ocr-gpu.md](docs/ocr-gpu.md) | 3.5× OCR with TensorRT |
-| [usage.md](docs/usage.md) | UI, all flags, status fields |
-| [latency.md](docs/latency.md) | Budget, measurement, hard floors |
-| [testing.md](docs/testing.md) | Offline regression + A/B tools |
-| [troubleshooting.md](docs/troubleshooting.md) | Silent-failure playbook |
-| [engineering-log.md](docs/engineering-log.md) | All measurements and rejected approaches |
+| [hardware.md](docs/en/hardware.md) | BOM, wiring, the three physical issues to fix first |
+| [install.md](docs/en/install.md) | Zero-to-running |
+| [models.md](docs/en/models.md) | Model list, why each, license caveats |
+| [llm-serving.md](docs/en/llm-serving.md) | Magnitude 35B vs vLLM 7B; prefill / prefix-cache traps |
+| [ocr-gpu.md](docs/en/ocr-gpu.md) | 3.5× OCR with TensorRT |
+| [usage.md](docs/en/usage.md) | UI, all flags, status fields |
+| [latency.md](docs/en/latency.md) | Budget, measurement, hard floors |
+| [testing.md](docs/en/testing.md) | Offline regression + A/B tools |
+| [troubleshooting.md](docs/en/troubleshooting.md) | Silent-failure playbook |
+| [engineering-log.md](docs/en/engineering-log.md) | All measurements and rejected approaches |
 
 ## Tests
 

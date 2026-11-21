@@ -44,11 +44,11 @@ bash scripts/healthcheck.sh
 ```
 
 ブラウザで `http://<デバイスIP>:8095`（音声）/ `:8096`（字幕）を開きます。
-**最初に [hardware.ja.md](docs/hardware.ja.md) の 3 項目（60Hz ハム・ゲイン・ウォームアップフレーム）
+**最初に [hardware.md](docs/ja/hardware.md) の 3 項目（60Hz ハム・ゲイン・ウォームアップフレーム）
 を必ず確認してください** — ここを怠ると以降のチューニングが全部無効になります。
 
-詳しい手順は [install.ja.md](docs/install.ja.md)、詰まったら
-[troubleshooting.ja.md](docs/troubleshooting.ja.md)。
+詳しい手順は [install.md](docs/ja/install.md)、詰まったら
+[troubleshooting.md](docs/ja/troubleshooting.md)。
 
 ## ハードウェア
 
@@ -61,7 +61,7 @@ bash scripts/healthcheck.sh
 
 Orin 以外でも動きます（x86 + NVIDIA GPU でも可）。ただし CUDA 13 系では
 onnxruntime-gpu が使えないため、OCR の高速化は TensorRT 経由になります
-（[ocr-gpu.ja.md](docs/ocr-gpu.ja.md)）。
+（[ocr-gpu.md](docs/ja/ocr-gpu.md)）。
 
 ## 構成
 
@@ -82,27 +82,26 @@ USB マイク ─→ KWS ─→ ASR ─→ LLM ─→ 文単位 TTS ─→ pw-pl
 - **訳文は SSE ＋ 増分 DOM**。全量 `innerHTML` ＋ ピクセル `scrollY` 復元は、
   長い文が伸びている最中に錨がズレて前の行が消えるバグを生みました
 
-詳細は [architecture.ja.md](docs/architecture.ja.md)。
+詳細は [architecture.md](docs/ja/architecture.md)。
 
 ## ドキュメント
 
-各ドキュメントは日本語 / 中文 / English の 3 版があります。下表は日本語版へのリンクで、
-ファイル名を `.md` / `.zh.md` に変えれば英語版 / 中国語版になります
-（例：[hardware.md](docs/hardware.md)、[hardware.zh.md](docs/hardware.zh.md)）。
+各ドキュメントは日本語 / 中文 / English の 3 版があり、`docs/ja/`、`docs/zh/`、
+`docs/en/` の 3 つのディレクトリに同じファイル名で入っています。下表は日本語版へのリンクで、
 各ページの先頭に言語切り替えがあります。
 
 | 文書 | 内容 |
 |---|---|
-| [hardware.ja.md](docs/hardware.ja.md) | 部品・配線・最初に直すべき 3 つの物理問題 |
-| [install.ja.md](docs/install.ja.md) | ゼロから起動まで |
-| [models.ja.md](docs/models.ja.md) | モデル一覧・選定理由・ライセンス注意 |
-| [llm-serving.ja.md](docs/llm-serving.ja.md) | Magnitude 35B vs vLLM 7B、prefill / キャッシュの落とし穴 |
-| [ocr-gpu.ja.md](docs/ocr-gpu.ja.md) | TensorRT で OCR を 3.5 倍にする |
-| [usage.ja.md](docs/usage.ja.md) | 画面の使い方・全パラメータ・状態の読み方 |
-| [latency.ja.md](docs/latency.ja.md) | レイテンシ予算・計測方法・「これ以上追うな」という硬い床 |
-| [testing.ja.md](docs/testing.ja.md) | オフライン回帰と A/B ツール |
-| [troubleshooting.ja.md](docs/troubleshooting.ja.md) | 静かに効かなくなる系のトラブル集 |
-| [engineering-log.ja.md](docs/engineering-log.ja.md) | 全実測データと没案の記録 |
+| [hardware.md](docs/ja/hardware.md) | 部品・配線・最初に直すべき 3 つの物理問題 |
+| [install.md](docs/ja/install.md) | ゼロから起動まで |
+| [models.md](docs/ja/models.md) | モデル一覧・選定理由・ライセンス注意 |
+| [llm-serving.md](docs/ja/llm-serving.md) | Magnitude 35B vs vLLM 7B、prefill / キャッシュの落とし穴 |
+| [ocr-gpu.md](docs/ja/ocr-gpu.md) | TensorRT で OCR を 3.5 倍にする |
+| [usage.md](docs/ja/usage.md) | 画面の使い方・全パラメータ・状態の読み方 |
+| [latency.md](docs/ja/latency.md) | レイテンシ予算・計測方法・「これ以上追うな」という硬い床 |
+| [testing.md](docs/ja/testing.md) | オフライン回帰と A/B ツール |
+| [troubleshooting.md](docs/ja/troubleshooting.md) | 静かに効かなくなる系のトラブル集 |
+| [engineering-log.md](docs/ja/engineering-log.md) | 全実測データと没案の記録 |
 
 ## テスト
 

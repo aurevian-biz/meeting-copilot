@@ -41,15 +41,33 @@ jobs:
           ! grep -rInE "mag-[A-Za-z0-9]{24,}|/media/[a-z]+/[a-z]+/|192\.168\.|/home/[a-z]+/|/run/user/[0-9]+" \
               --include=*.py --include=*.sh --include=*.service --include=*.md --include=*.yml .
 
-      # 4) Every document must exist in Chinese / Japanese / English
+      # 4) Every document must exist in docs/{en,zh,ja}/ under the same name
       - name: docs are trilingual
         run: |
           for d in hardware install models llm-serving ocr-gpu usage latency \
                    testing troubleshooting architecture engineering-log; do
-            for s in .md .zh.md .ja.md; do
-              test -f "docs/$d$s" || { echo "missing docs/$d$s"; exit 1; }
+            for l in en zh ja; do
+              test -f "docs/$l/$d.md" || { echo "missing docs/$l/$d.md"; exit 1; }
             done
           done
+          # no leftover language suffixes: docs/<lang>/<name>.md only
+          ! find docs -name '*.zh.md' -o -name '*.ja.md' | grep .
+          # every relative link inside docs must resolve
+          python - <<'PY'
+          import pathlib, re, sys
+          bad = []
+          for f in pathlib.Path("docs").rglob("*.md"):
+              for m in re.finditer(r"\]\(([^)\s]+)\)", f.read_text(encoding="utf-8")):
+                  link = m.group(1)
+                  if link.startswith(("http://", "https://", "mailto:", "#")):
+                      continue
+                  target = link.split("#")[0]
+                  if target and not (f.parent / target).exists():
+                      bad.append(f"{f}: {link}")
+          if bad:
+              print("\n".join(bad)); sys.exit(1)
+          print("links ok")
+          PY
           for r in README CONTRIBUTING CHANGELOG SECURITY; do
             for s in .md .zh.md .ja.md; do
               test -f "$r$s" || { echo "missing $r$s"; exit 1; }

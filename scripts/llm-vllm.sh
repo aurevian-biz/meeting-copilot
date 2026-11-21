@@ -7,7 +7,7 @@
 # When to use it:
 #   · the box has only 32G of RAM / or the GPU must be shared with other services
 #   · you only do captions, not long answers such as "read the screen + summarize"
-# Measured comparison in docs/latency.md: 35B-A3B (MoE) is 170~370ms slower on short answers but 25~35% faster on long ones.
+# Measured comparison in docs/en/latency.md: 35B-A3B (MoE) is 170~370ms slower on short answers but 25~35% faster on long ones.
 set -euo pipefail
 
 MC_DATA="${MC_DATA:-/opt/meeting-copilot/data}"

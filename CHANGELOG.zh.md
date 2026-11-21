@@ -4,7 +4,7 @@
 
 本仓库是 2026-11-17 ~ 11-21 五天实机开发的整理结果，首次开源发布时把过程压缩成一个版本。
 每个技术决策背后的实测数据与被否掉的方案，见
-[docs/engineering-log.zh.md](docs/engineering-log.zh.md)。
+[docs/zh/engineering-log.md](docs/zh/engineering-log.md)。
 
 ## v0.1.0 — 2026-11-21
 

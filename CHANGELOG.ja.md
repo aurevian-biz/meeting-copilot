@@ -4,7 +4,7 @@
 
 本リポジトリは 2026-11-17 〜 11-21 の 5 日間の実機開発を整理したもので、初回のオープンソース
 公開にあたって過程を 1 バージョンにまとめています。各判断の背後にある実測値と没になった案は
-[docs/engineering-log.ja.md](docs/engineering-log.ja.md) にあります。
+[docs/ja/engineering-log.md](docs/ja/engineering-log.md) にあります。
 
 ## v0.1.0 — 2026-11-21
 

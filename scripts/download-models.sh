@@ -52,5 +52,5 @@ get "$HF/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json" \
 say "完成"
 du -sh "$ASR" "$TTS"
 echo
-echo "LLM 不在这里下载：35B-A3B 由 Magnitude 自己拉（见 docs/llm-serving.md），"
+echo "LLM 不在这里下载：35B-A3B 由 Magnitude 自己拉（见 docs/zh/llm-serving.md），"
 echo "或者用 vLLM 挂任何 OpenAI 兼容的小模型（--llm-model qwen 走 8000）。"

@@ -5,7 +5,7 @@
 This repository is the cleaned-up result of five days of on-device development
 (2026-11-17 → 11-21); the first open-source release squashes that process into one version.
 The measurements behind each decision, and the approaches that were rejected, are in
-[docs/engineering-log.md](docs/engineering-log.md).
+[docs/en/engineering-log.md](docs/en/engineering-log.md).
 
 ## v0.1.0 — 2026-11-21
 

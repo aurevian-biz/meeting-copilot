@@ -57,6 +57,6 @@ cat <<EOF
        http://<本机IP>:8095  语音助手
        http://<本机IP>:8096  会议字幕
 
-第一次跑之前请务必看 docs/hardware.md 里的两件事：60Hz 工频哼声要高通、
+第一次跑之前请务必看 docs/zh/hardware.md 里的两件事：60Hz 工频哼声要高通、
 USB 采集卡要丢预热帧。这两条不做，后面所有调参都是白费。
 EOF

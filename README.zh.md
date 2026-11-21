@@ -44,12 +44,12 @@ bash scripts/healthcheck.sh
 
 浏览器打开 `http://<设备IP>:8095`（助手）和 `:8096`（字幕）。
 
-> **动手前务必先看 [hardware.zh.md](docs/hardware.zh.md) 的三件事**：60Hz 工频哼声要高通、
+> **动手前务必先看 [hardware.md](docs/zh/hardware.md) 的三件事**：60Hz 工频哼声要高通、
 > H340 采集增益要从 +8dB 降到 0dB、采集卡要丢 40 帧预热黑帧。
 > 这三条不修，后面所有调参都是白费，而且它们**都不报错**。
 
-完整步骤见 [install.zh.md](docs/install.zh.md)，卡住先看
-[troubleshooting.zh.md](docs/troubleshooting.zh.md)。
+完整步骤见 [install.md](docs/zh/install.md)，卡住先看
+[troubleshooting.md](docs/zh/troubleshooting.md)。
 
 ## 硬件
 
@@ -61,7 +61,7 @@ bash scripts/healthcheck.sh
 | 外置 SSD | ≥128G | 模型 3.4G + 35B 权重 22.9G |
 
 x86 + NVIDIA GPU 也能跑；CUDA 13 下 `onnxruntime-gpu` 用不了，OCR 加速改走
-TensorRT（见 [ocr-gpu.zh.md](docs/ocr-gpu.zh.md)）。
+TensorRT（见 [ocr-gpu.md](docs/zh/ocr-gpu.md)）。
 
 ## 架构要点
 
@@ -79,26 +79,25 @@ USB 麦 ─→ KWS ─→ ASR ─→ LLM ─→ 按句 TTS ─→ pw-play ─→
 - **译文 SSE + 增量 DOM**：早期全量 `innerHTML` + 像素 `scrollY` 回填，
   长句逐字变高时锚点漂移，表现为「下一句一来上一句整行消失」
 
-详见 [architecture.zh.md](docs/architecture.zh.md)。
+详见 [architecture.md](docs/zh/architecture.md)。
 
 ## 文档
 
-每份文档都有中 / 日 / 英三版：下表指向中文版，把文件名改成 `.md` / `.ja.md`
-就是英文 / 日文版（例如 [hardware.md](docs/hardware.md)、[hardware.ja.md](docs/hardware.ja.md)）。
-每页顶部都有语言切换。
+每份文档都有中 / 日 / 英三版，分别放在 `docs/zh/`、`docs/ja/`、`docs/en/`
+三个目录里，文件名完全一致。下表指向中文版，每页顶部都有语言切换。
 
 | 文档 | 内容 |
 |---|---|
-| [hardware.zh.md](docs/hardware.zh.md) | BOM、接线、必须先修的三个物理问题 |
-| [install.zh.md](docs/install.zh.md) | 从零装一遍 |
-| [models.zh.md](docs/models.zh.md) | 模型清单、为什么选它、许可证提醒 |
-| [llm-serving.zh.md](docs/llm-serving.zh.md) | Magnitude 35B vs vLLM 7B、prefill / 前缀缓存的坑 |
-| [ocr-gpu.zh.md](docs/ocr-gpu.zh.md) | TensorRT 把 OCR 提速 3.5 倍 |
-| [usage.zh.md](docs/usage.zh.md) | 界面操作、全部参数、状态字段 |
-| [latency.zh.md](docs/latency.zh.md) | 延迟预算、量法、哪些是硬地板 |
-| [testing.zh.md](docs/testing.zh.md) | 离线回归与 A/B 工具 |
-| [troubleshooting.zh.md](docs/troubleshooting.zh.md) | 静默失效类故障合集 |
-| [engineering-log.zh.md](docs/engineering-log.zh.md) | 全部实测数据与被否掉的方案 |
+| [hardware.md](docs/zh/hardware.md) | BOM、接线、必须先修的三个物理问题 |
+| [install.md](docs/zh/install.md) | 从零装一遍 |
+| [models.md](docs/zh/models.md) | 模型清单、为什么选它、许可证提醒 |
+| [llm-serving.md](docs/zh/llm-serving.md) | Magnitude 35B vs vLLM 7B、prefill / 前缀缓存的坑 |
+| [ocr-gpu.md](docs/zh/ocr-gpu.md) | TensorRT 把 OCR 提速 3.5 倍 |
+| [usage.md](docs/zh/usage.md) | 界面操作、全部参数、状态字段 |
+| [latency.md](docs/zh/latency.md) | 延迟预算、量法、哪些是硬地板 |
+| [testing.md](docs/zh/testing.md) | 离线回归与 A/B 工具 |
+| [troubleshooting.md](docs/zh/troubleshooting.md) | 静默失效类故障合集 |
+| [engineering-log.md](docs/zh/engineering-log.md) | 全部实测数据与被否掉的方案 |
 
 ## 测试
 
