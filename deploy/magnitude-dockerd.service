@@ -1,0 +1,23 @@
+[Unit]
+Description=Magnitude 专用的第二个 dockerd（独立 data-root，不碰主 daemon）
+Documentation=https://magnitude.dev
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# 独立 data-root / exec-root / socket，iptables 关、bridge 无，只跑 magnitude 容器。
+# daemon.json 由 scripts/llm-magnitude.sh 生成；数据盘换位置就改下面这一行。
+ExecStart=/usr/bin/dockerd --config-file /opt/meeting-copilot/data/magnitude-data/daemon.json
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutStartSec=180
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

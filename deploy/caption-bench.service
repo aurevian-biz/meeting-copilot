@@ -1,0 +1,27 @@
+[Unit]
+Description=Meeting captions (PipeWire capture -> SenseVoice -> zh/ja subtitle)
+Documentation=https://github.com/__GH_REPO__
+After=network.target sound.target
+# 译文引擎是 Magnitude 容器里的 Qwen3.5-35B-A3B（127.0.0.1:10100）
+After=magnitude.service
+Wants=magnitude.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__HOME__
+EnvironmentFile=-/etc/meeting-copilot/env
+# pw-record 要连 user session 的 PipeWire，缺这个变量会立刻退出
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+# 采集/ASR/翻译三类线程对 SIGTERM 不敏感，默认 90s 才 SIGKILL，重启很拖
+TimeoutStopSec=20
+ExecStart=__HOME__/.venv/bin/python __HOME__/caption_server.py \
+    --port 8096 --threads 4 --monitor \
+    --tr-workers 1 --ctx-lines 1 \
+    --llm-base ${LLM_BASE} --llm-model "${LLM_MODEL}" --llm-key ${LLM_KEY} \
+    --screen-hints --screen-every 15
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

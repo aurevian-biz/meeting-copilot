@@ -1,0 +1,32 @@
+# 运行时依赖（aarch64 / JetPack 6~7 上都能直接 pip 装）
+#
+# 为什么不用 requirements 一把梭把 TensorRT 也列进来：
+# tensorrt / cuda-python 必须和 JetPack 自带的 CUDA 版本严格配套，pip 装一个版本不对的
+# 会静默回退到 CPU（OCR 从 300ms 变成 3s，且不报错）。这两样请用 JetPack 自带的，
+# 只在你确实要 GPU 加速 OCR 时按 docs/ocr-gpu.md 另装。
+
+numpy>=1.26,<3
+scipy>=1.11
+
+# ASR / VAD / 唤醒词：一套 sherpa-onnx 全包了（SenseVoice + Silero + KWS zipformer）
+sherpa-onnx==2.0.1
+
+# OCR（「看一眼屏幕」）
+opencv-python-headless>=4.9
+rapidocr-onnxruntime>=1.3
+
+# TTS
+#   piper-tts 1.8.0 起不再依赖 piper-phonemize，aarch64 有 wheel，直接装
+#   日语音色需要 OpenJTalk 分词：官方 pyopenjtalk 只有源码包，改用 pyopenjtalk-plus
+#   （模块名仍是 pyopenjtalk，drop-in）
+piper-tts>=1.8.0
+pyopenjtalk-plus>=0.4.1 ; platform_machine == "aarch64"
+pyopenjtalk>=0.3 ; platform_machine != "aarch64"
+
+# Web
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9
+
+# 测试
+pytest>=7.4

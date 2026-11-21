@@ -1,0 +1,3 @@
+# 所有文本文件统一 LF。.sh / .service 带 CRLF 在 Linux 上会直接执行失败
+# （/bin/bash^M: bad interpreter），这类事故不值得再排一次。
+* text=auto eol=lf

@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "20"}
+
+      # 1) 全部 Python 能编译（含语法 / 缩进错误）
+      - name: compileall
+        run: python -m compileall -q . && echo ok
+
+      # 2) 内嵌页面的 JS 必须能被浏览器解析。
+      #    这一条是拿事故换来的：PAGE 写成普通字符串时 Python 会把 JS 里的 \n
+      #    变成真换行，整段 <script> 语法错误 → 页面停在「连接中…」而服务端全好。
+      - name: page js syntax
+        run: |
+          python - <<'PY'
+          import re, pathlib, subprocess, sys
+          src = pathlib.Path("caption_server.py").read_text(encoding="utf-8")
+          m = re.search(r'PAGE = r?""".*?<script>(.*?)</script>', src, re.S)
+          assert m, "PAGE 里找不到 <script>"
+          pathlib.Path("/tmp/page.js").write_text(m.group(1), encoding="utf-8")
+          PY
+          node --check /tmp/page.js && echo "page js ok"
+
+      # 3) 公开仓不该出现密钥 / 本机路径
+      - name: no secrets
+        run: |
+          ! grep -rInE "mag-[A-Za-z0-9]{24,}|/media/[a-z]+/[a-z]+/|192\.168\." \
+              --include=*.py --include=*.sh --include=*.service --include=*.md .
